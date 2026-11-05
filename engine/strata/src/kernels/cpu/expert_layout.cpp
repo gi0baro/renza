@@ -101,22 +101,6 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
-bool cpu_avx1_ok() {
-    // AVX (Sandy Bridge, 2011): AVX + OSXSAVE with the OS saving the YMM state; FMA, F16C and AVX2 not needed.
-    // From the Strata_Dirigo fork (rwkeyes).
-    static const bool ok = [] {
-        if (cpu_isa_cap() < 1) return false;
-        unsigned r[4] = {0, 0, 0, 0};
-        __cpuid_count(1, 0, r[0], r[1], r[2], r[3]);
-        if (!((r[2] >> 27) & 1u) || !((r[2] >> 28) & 1u)) return false;   // OSXSAVE, AVX
-        unsigned lo = 0, hi = 0;
-        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-        const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
-        return (xcr0 & 0x6) == 0x6;
-    }();
-    return ok;
-}
-
 namespace {
 void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
     __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
@@ -256,21 +240,18 @@ void cpu_require_expert_support() {
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
-    else if (cpu_avx2_ok()) q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
-    else q2_0_gguf_rows_multi_avx1(w, row_bytes, nblocks, a, nt, out, r0, r1);   // issue #1699: the third rung
+    else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void q2_rows_any_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                         int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
-    else if (cpu_avx2_ok()) q2_0_gguf_rows_multi_avx2_legacy(w, row_bytes, nblocks, a, nt, out, r0, r1);
-    else q2_0_gguf_rows_multi_avx1_legacy(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    else q2_0_gguf_rows_multi_avx2_legacy(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void act_quant_any(const float* x, int n, ActQ& a) {
     if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
-    else if (cpu_avx2_ok()) act_quant_q8_1_avx2(x, n, a);
-    else act_quant_q8_1_avx1(x, n, a);   // issue #1699
+    else act_quant_q8_1_avx2(x, n, a);
 }
 
 #if !defined(STRATA_NATIVE_EXPERTS)
