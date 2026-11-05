@@ -326,14 +326,12 @@ if(STRATA_NATIVE_EXPERTS)
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
-                                           src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp)
+                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
   # the older CPUs' Q2_0 rows and activation quantizer (q2_avx1.cpp, issue #1699): SSE4.2 + AVX with
   # AVX2/FMA/F16C explicitly off, so a -march=native build host cannot leak AVX2 code into the file that
@@ -365,25 +363,11 @@ if(STRATA_NATIVE_EXPERTS)
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
-                src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
-    # NVFP4: W4A8 (default) in mmq_nvfp4_w4a8.cu with the plain architectures; the opt-in W4A4 needs RTX 50's FP4 MMA,
-    # which exists only in the arch-specific target, so its one unit alone is built with 12x -> 12xa (the default
-    # binary is unchanged and runs on sm_121; a card without that image falls back to W4A8 at run time)
-    set(_strata_w4a4_archs ${CMAKE_CUDA_ARCHITECTURES})
-    # (two steps: CMake before 3.29 rejects a \2 whose optional group did not match, "120" alone)
-    list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])$" "\\1a")
-    list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])-(real|virtual)$" "\\1a-\\2")
-    add_library(strata_mmq_w4a4 STATIC src/prefill/mmq_nvfp4_w4a4.cu)
-    set_target_properties(strata_mmq_w4a4 PROPERTIES CUDA_ARCHITECTURES "${_strata_w4a4_archs}")
-    target_include_directories(strata_mmq_w4a4 PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq})
-    target_compile_options(strata_mmq_w4a4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
-    target_link_libraries(strata_mmq_w4a4 PUBLIC ggml-base ${_strata_gpu_runtime_target})
-    target_link_libraries(strata_mmq PRIVATE strata_mmq_w4a4)
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
                                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)

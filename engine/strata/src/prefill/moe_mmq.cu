@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 
 namespace strata::prefill::mmq {
 namespace {
@@ -37,12 +36,11 @@ void ck(cudaError_t e, const char* what) {
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
 
-// ... plus, in the same launch, the expert's 16-byte NVFP4 tail (tail -> tail_dst) and the zeroed MMQ tails after
-// the group's last slot (nz uint4 after ab_dst's and c_dst's copies): one launch per expert instead of a kernel,
-// a 16-byte copy and, per group, two memsets.
+// ... plus, in the same launch, the zeroed MMQ tails after the group's last slot (nz uint4 after ab_dst's and c_dst's
+// copies): one launch per expert instead of a kernel and, per group, two memsets.
 __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uint4* __restrict__ b, int64_t nb,
                               uint4* __restrict__ ab_dst, const uint4* __restrict__ c, int64_t nc, uint4* __restrict__ c_dst,
-                              const uint4* __restrict__ tail, uint4* __restrict__ tail_dst, int64_t nz) {
+                              int64_t nz) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t n = na + nb + nc;
     if (i < na) ab_dst[i] = a[i];
@@ -50,16 +48,15 @@ __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uin
     else if (i < n) c_dst[i - na - nb] = c[i - na - nb];
     else if (i < n + nz) ab_dst[na + nb + (i - n)] = make_uint4(0, 0, 0, 0);
     else if (i < n + 2 * nz) c_dst[nc + (i - n - nz)] = make_uint4(0, 0, 0, 0);
-    else if (i == n + 2 * nz && tail != nullptr) *tail_dst = *tail;
 }
 // copy16_kernel for an MMQ group: blockIdx.y is the expert (first + y); the last one (n - 1) also zeroes nz uint4
-// after its gu and d slots, and each copies its NVFP4 tail (tail_off, in uint4; tail_dst null = none)
+// after its gu and d slots
 struct GroupArgs {
     const uint8_t* blob[kGatherGroupMax];
-    int64_t up_off, down_off, gu_stride, d_stride, tail_off;   // in uint4
+    int64_t up_off, down_off, gu_stride, d_stride;   // in uint4
 };
 __global__ void copy16_group_kernel(GroupArgs ga, int first, int n, int64_t na, int64_t nc, int64_t nz,
-                                    uint4* __restrict__ gu_dst, uint4* __restrict__ d_dst, uint4* __restrict__ tail_dst) {
+                                    uint4* __restrict__ gu_dst, uint4* __restrict__ d_dst) {
     const int q = first + (int) blockIdx.y;
     const uint4* src = (const uint4*) ga.blob[q];
     uint4* ab = gu_dst + (int64_t) q * ga.gu_stride;
@@ -71,7 +68,6 @@ __global__ void copy16_group_kernel(GroupArgs ga, int first, int n, int64_t na, 
     else if (i < m) cd[i - 2 * na] = src[ga.down_off + (i - 2 * na)];
     else if (i < m + nz) { if (q == n - 1) ab[ga.gu_stride + (i - m)] = make_uint4(0, 0, 0, 0); }
     else if (i < m + 2 * nz) { if (q == n - 1) cd[ga.d_stride + (i - m - nz)] = make_uint4(0, 0, 0, 0); }
-    else if (i == m + 2 * nz && tail_dst != nullptr) tail_dst[q] = src[ga.tail_off];
 }
 __global__ void copy1_kernel(const uint8_t* __restrict__ a, int64_t na, const uint8_t* __restrict__ b, int64_t nb,
                              uint8_t* __restrict__ ab_dst, const uint8_t* __restrict__ c, int64_t nc, uint8_t* __restrict__ c_dst) {
@@ -122,29 +118,6 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     h[i] = g / (1.0f + __expf(-g)) * u;
 }
 
-// swiglu_kernel on the MMQ gate/up output with each expert's gate and up scales applied as it is read: the products
-// scale_gu_rows stored, without the pass that stored them
-__global__ void swiglu_scaled_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
-                                     const int32_t* __restrict__ bounds, int n, const float* __restrict__ tails,
-                                     int64_t row0) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * n_ff) return;
-    const int64_t r = i / n_ff, k = i % n_ff, ra = row0 + r;
-    int q = 0;
-    while (q + 1 < n && ra >= bounds[q + 1]) ++q;
-    const float* row = gu + r * 2 * n_ff;
-    const float g = row[k] * tails[4 * q], u = row[n_ff + k] * tails[4 * q + 1];
-    h[i] = g / (1.0f + __expf(-g)) * u;
-}
-__global__ void down_row_scales_kernel(float* __restrict__ sd, const int32_t* __restrict__ bounds, int n,
-                                       const float* __restrict__ tails, int64_t nrows) {
-    const int64_t r = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= nrows) return;
-    int q = 0;
-    while (q + 1 < n && r >= bounds[q + 1]) ++q;
-    sd[r] = tails[4 * q + 2];
-}
-
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = (int32_t) i;
@@ -160,27 +133,7 @@ bool tab_has_type(int) { return false; }
 
 }  // namespace
 
-// mmq_nvfp4_w4a8.cu: mmq.cuh's int8 NVFP4 path, compiled for this GPU with Blackwell's FP4 MMA hidden
-void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
-// mmq_nvfp4_w4a4.cu (the one unit built for 12xa): FP4 x FP4 and its activation quantizer, if this card runs it
-bool w4a4_available();
-void run_nvfp4_w4a4(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
-void quantize_nvfp4_w4a4(const float* x, const int32_t* ids, void* xq, float* yscale, bool aligned, int64_t cols,
-                         int64_t ld, int64_t rows, int64_t padded, cudaStream_t s);
-
 bool built() { return true; }
-
-Nvfp4Mode nvfp4_mode() {
-    static const Nvfp4Mode m = [] {
-        const char* e = std::getenv("STRATA_PREFILL_NVFP4");
-        if (e == nullptr || std::strcmp(e, "w4a8") == 0) return Nvfp4Mode::W4A8;
-        if (std::strcmp(e, "w4a4") == 0) return Nvfp4Mode::W4A4;
-        if (std::strcmp(e, "fp16") == 0) return Nvfp4Mode::FP16;
-        std::fprintf(stderr, "STRATA_PREFILL_NVFP4=%s: expected w4a8, w4a4 or fp16\n", e);
-        std::exit(1);
-    }();
-    return m;
-}
 
 bool supported(int t) {
     switch ((ggml_type) t) {
@@ -197,8 +150,6 @@ bool supported(int t) {
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
             return kq_ok();
 #endif
-        case GGML_TYPE_NVFP4:
-            return nvfp4_mode() != Nvfp4Mode::FP16;
         default:
             return false;
     }
@@ -240,61 +191,8 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
-namespace {
-__global__ void scale_gu_rows_kernel(float* __restrict__ gu, int64_t ld, int64_t n_ff, const int32_t* __restrict__ bounds,
-                                     int n, const float* __restrict__ tails, int64_t row0) {
-    const int64_t r = row0 + blockIdx.x;
-    int q = 0;
-    while (q + 1 < n && r >= bounds[q + 1]) ++q;
-    const float sg = tails[4 * q], su = tails[4 * q + 1];
-    float* row = gu + r * ld;
-    for (int64_t k = threadIdx.x; k < 2 * n_ff; k += blockDim.x) row[k] *= k < n_ff ? sg : su;
-}
-__global__ void scale_down_rows_kernel(float* __restrict__ d, int64_t ld, const int32_t* __restrict__ bounds, int n,
-                                       const float* __restrict__ tails) {
-    const int64_t r = blockIdx.x;
-    int q = 0;
-    while (q + 1 < n && r >= bounds[q + 1]) ++q;
-    const float sd = tails[4 * q + 2];
-    float* row = d + r * ld;
-    for (int64_t k = threadIdx.x; k < ld; k += blockDim.x) row[k] *= sd;
-}
-}  // namespace
-
-bool fp4_activations(int t) {
-    if (t != GGML_TYPE_NVFP4 || nvfp4_mode() != Nvfp4Mode::W4A4) return false;
-    static const bool on = [] {
-        const bool ok = w4a4_available();
-        if (!ok) std::fprintf(stderr, "prefill mmq: STRATA_PREFILL_NVFP4=w4a4 needs an sm_12x card in a 12x build; W4A8\n");
-        return ok;
-    }();
-    return on;
-}
-
-void scale_gu_rows(float* gu, int64_t ld, int64_t n_ff, const int32_t* bounds, int n, const float* tails,
-                   int64_t row0, int64_t nrows, void* stream) {
-    if (nrows <= 0 || n <= 0) return;
-    scale_gu_rows_kernel<<<(unsigned) nrows, 256, 0, (cudaStream_t) stream>>>(gu, ld, n_ff, bounds, n, tails, row0);
-    ck(cudaGetLastError(), "scale_gu_rows");
-}
-
-void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream) {
-    if (nrows <= 0 || n <= 0) return;
-    scale_down_rows_kernel<<<(unsigned) nrows, 256, 0, (cudaStream_t) stream>>>(d, ld, bounds, n, tails);
-    ck(cudaGetLastError(), "scale_down_rows");
-}
-
-void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
-              float* yscale) {
+void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
-    if (fp4_activations(t)) {
-        if (yscale == nullptr) { std::fprintf(stderr, "prefill mmq: NVFP4 activations need a scale buffer\n"); std::exit(1); }
-        const bool aligned = ((uintptr_t) x % 32 == 0) && ((size_t) ld * sizeof(float)) % 32 == 0;
-        quantize_nvfp4_w4a4(x, ids, xq, yscale, aligned, cols, ld, rows, pad512(cols), (cudaStream_t) stream);
-        ck(cudaGetLastError(), "quantize");
-        return;
-    }
-    (void) yscale;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
@@ -324,7 +222,7 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
+    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
@@ -359,10 +257,6 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
 #endif
-        case GGML_TYPE_NVFP4:
-            if (fp4_activations(t)) run_nvfp4_w4a4(ctx, a, s);
-            else run_nvfp4_w4a8(ctx, a, s);
-            break;
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
@@ -457,17 +351,16 @@ void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
-                   void* gu_dst, void* d_dst, void* stream, const void* tail, void* tail_dst, size_t zero_bytes) {
+                   void* gu_dst, void* d_dst, void* stream, size_t zero_bytes) {
     const cudaStream_t s = (cudaStream_t) stream;
     const bool a16 = ((uintptr_t) gate | (uintptr_t) up | (uintptr_t) down | (uintptr_t) gu_dst | (uintptr_t) d_dst |
-                      (uintptr_t) tail | (uintptr_t) tail_dst | gu_half_bytes | d_bytes | zero_bytes) % 16 == 0;
+                      gu_half_bytes | d_bytes | zero_bytes) % 16 == 0;
     if (a16) {
         const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16, nz = (int64_t) zero_bytes / 16;
         copy16_kernel<<<blocks(2 * na + nc + 2 * nz + 1), 256, 0, s>>>(
             (const uint4*) gate, na, (const uint4*) up, na, (uint4*) gu_dst, (const uint4*) down, nc, (uint4*) d_dst,
-            (const uint4*) tail, (uint4*) tail_dst, nz);
+            nz);
     } else {
-        if (tail) cudaMemcpyAsync(tail_dst, tail, 16, cudaMemcpyDeviceToDevice, s);
         if (zero_bytes) {
             cudaMemsetAsync((uint8_t*) gu_dst + 2 * gu_half_bytes, 0, zero_bytes, s);
             cudaMemsetAsync((uint8_t*) d_dst + d_bytes, 0, zero_bytes, s);
@@ -480,12 +373,10 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 }
 
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
-                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream, size_t tail_off,
-                         void* tail_dst, size_t zero_bytes) {
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream, size_t zero_bytes) {
     if (g.first < 0 || g.n <= g.first || g.n > kGatherGroupMax) return false;
-    if (tail_off == 0) tail_dst = nullptr;
     uintptr_t a = (uintptr_t) gu_dst | (uintptr_t) d_dst | up_off | gu_half_bytes | down_off | d_bytes | gu_stride | d_stride |
-                  tail_off | (uintptr_t) tail_dst | zero_bytes;
+                  zero_bytes;
     for (int q = g.first; q < g.n; ++q) a |= (uintptr_t) g.blob[q];
     if (a % 16 != 0) return false;
     GroupArgs ga{};
@@ -494,11 +385,10 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     ga.down_off = (int64_t) down_off / 16;
     ga.gu_stride = (int64_t) gu_stride / 16;
     ga.d_stride = (int64_t) d_stride / 16;
-    ga.tail_off = (int64_t) tail_off / 16;
     const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16, nz = (int64_t) zero_bytes / 16;
-    const int64_t work = 2 * na + nc + 2 * nz + (tail_dst != nullptr ? 1 : 0);
+    const int64_t work = 2 * na + nc + 2 * nz;
     copy16_group_kernel<<<dim3(blocks(work), (unsigned) (g.n - g.first)), 256, 0, (cudaStream_t) stream>>>(
-        ga, g.first, g.n, na, nc, nz, (uint4*) gu_dst, (uint4*) d_dst, (uint4*) tail_dst);
+        ga, g.first, g.n, na, nc, nz, (uint4*) gu_dst, (uint4*) d_dst);
     ck(cudaGetLastError(), "gather_native_group");
     return true;
 }
@@ -507,18 +397,6 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
     strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
     ck(cudaGetLastError(), "gather_strata_q2");
-}
-
-void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n,
-                   const float* tails, int64_t row0, void* stream) {
-    if (rows <= 0) return;
-    swiglu_scaled_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, bounds, n, tails, row0);
-    ck(cudaGetLastError(), "swiglu_scaled");
-}
-void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream) {
-    if (nrows <= 0 || n <= 0) return;
-    down_row_scales_kernel<<<blocks(nrows), 256, 0, (cudaStream_t) stream>>>(sd, bounds, n, tails, nrows);
-    ck(cudaGetLastError(), "down_row_scales");
 }
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {

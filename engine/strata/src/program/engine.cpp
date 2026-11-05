@@ -2199,13 +2199,8 @@ int EngineState::start_up(int argc, char** argv) {
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
     // pack keeps 0.2 as its start value (0.1.43: PcieAuto refines it on CUDA).  `--calibrate` measures it outright.
-    // NVFP4 packs: 0.25. Their 2.76 MB experts cross the link twice as long as the i-quants' the 0.55 was
-    // measured on, and that copy sits on the GPU's critical path while the CPU pool runs beside it: decode
-    // 103 -> 117 tok/s short, 105 -> 124 at 32K (RTX 5090, PCIe 5 x16, 9950X3D; 0.10 and 0.40 both slower).
     if (o.pcie_frac < 0.0) {
-        const auto& lay0 = strata::kernels::cpu::expert_layout();
-        const bool nvfp4_pack = native_pack && !lay0.fmt.empty() && lay0.fmt[0].gu_type == 40;
-        const double base = nvfp4_pack ? 0.25 : native_pack ? 0.55 : 0.2;
+        const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;
         const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
         const bool pf_old = pfd != nullptr && std::strcmp(pfd, "old") == 0;
@@ -4746,19 +4741,8 @@ int EngineState::serve_setup() {
         const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::atof(mcs) / 100.0 : max_cached_default;
         const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
                                        (double) cached_experts >= max_cached * (double) host_res.size();
-        // NVFP4 experts (any layer): no default (sergqwer/strata-nvfp4 c83625c3).  On the fork's qwen-nvfp4-gptq pack the
-        // skip moved the answers by teacher-forced KL 0.035 against it off - as much as the GPTQ quantization's own error
-        // against an all-Q8_0 reference (0.038) - for +11.5% decode (RTX 5090).  STRATA_ROUTE_TAIL_SKIP=7 opts in.
-        bool nvfp4_experts = false;
-        if (native_pack)
-            for (const auto& f : strata::kernels::cpu::expert_layout().fmt)
-                nvfp4_experts = nvfp4_experts || f.gu_type == strata::kernels::cpu::kNvfp4Type ||
-                                f.d_type == strata::kernels::cpu::kNvfp4Type;
         const bool tail_default_path = tse == nullptr && !all_experts_resident && !nearly_all_cached;
-        const bool tail_default_ok = tail_default_path && !nvfp4_experts;
-        if (tail_default_path && nvfp4_experts)
-            std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default with NVFP4 experts (it moved an NVFP4 "
-                                 "pack's answers by about as much as its quantization does); STRATA_ROUTE_TAIL_SKIP=7 turns it on\n");
+        const bool tail_default_ok = tail_default_path;
         if (tse == nullptr && nearly_all_cached)
             std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU cache, so "
                                  "few are missed and skipping them costs more draft acceptance than it saves; "
