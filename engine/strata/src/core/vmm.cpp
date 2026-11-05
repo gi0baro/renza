@@ -1,6 +1,5 @@
 #include "strata/core/vmm.hpp"
 
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -150,21 +149,3 @@ VmmChunk VmmRange::unmap(int64_t i) {
 }
 
 }  // namespace strata::core
-
-#else  // HIP: no virtual memory here; the elastic K/V stays off
-
-namespace strata::core {
-bool vmm_available() { return false; }
-uint64_t vmm_granularity() { return 0; }
-VmmChunk vmm_chunk_new() { return 0; }
-void vmm_chunk_free(VmmChunk) {}
-bool VmmRange::reserve(uint64_t) { return false; }
-void VmmRange::release() {}
-int64_t VmmRange::mapped_count() const { return 0; }
-bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
-bool VmmRange::set_access(int64_t, int64_t) { return false; }
-bool VmmRange::commit_run(int64_t, int64_t) { return false; }
-VmmChunk VmmRange::unmap(int64_t) { return 0; }
-}  // namespace strata::core
-
-#endif

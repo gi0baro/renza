@@ -234,11 +234,6 @@ public:
     }
 
 private:
-#if defined(STRATA_USE_HIP)
-    bool ensure_blocking_staging(std::size_t bytes, std::string& err);
-    uint8_t* blocking_staging_ = nullptr;
-    std::size_t blocking_staging_bytes_ = 0;
-#endif
     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
     bool open_segmented(uint64_t want, std::string& err);
     void release_segmented();

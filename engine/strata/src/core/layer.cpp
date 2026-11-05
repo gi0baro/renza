@@ -40,9 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#ifndef _WIN32
 #include <sys/mman.h>
-#endif
 #include <memory>
 #include <vector>
 namespace strata::core {
@@ -535,9 +533,6 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
         (void) cudaGetLastError();
         return nullptr;
     };
-#ifdef _WIN32
-    return host_alloc(bytes);
-#else
     static const bool register_first = [] {
         const char* e = std::getenv("STRATA_KV_HOST_REGISTER");
         if (e != nullptr && (e[0] == '0' || e[0] == '1')) return e[0] == '1';
@@ -564,7 +559,6 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
     }
     if (uint8_t* h = host_alloc(bytes)) return h;
     return register_anon(bytes);
-#endif
 }
 
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it

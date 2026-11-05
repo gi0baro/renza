@@ -6,9 +6,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
-#include "moe_mmq_tab.hpp"   // declarations only: the tab kernels live in the per-type mmq-tab-*.cu TUs
-#endif
 
 #include "strata/prefill/mmq_kq_abi.hpp"
 
@@ -18,25 +15,16 @@
 #include <cstring>
 
 namespace strata::prefill::mmq {
-#if defined(STRATA_KQ_DSO)
-namespace kq {
-int abi_args_size() { return (int) sizeof(mmq_args); }
-}  // namespace kq
-#endif
 namespace {
 #if defined(STRATA_MMQ_KQUANTS)
 // MODEL-UPDATE Phase 1: the K-quant products through MMQ are opt-in at run time (STRATA_MMQ_KQ=1); on CUDA their
-// kernels are the strata_kq library (mmq_kq_loader.cpp), opened only then
+// kernels are the strata_kq library, opened only then
 bool kq_ok() {
-#if defined(STRATA_KQ_DSO)
-    return kq::available();
-#else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MMQ_KQ");
         return v != nullptr && v[0] == '1';
     }();
     return on;
-#endif
 }
 #endif
 
@@ -162,73 +150,13 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
-#if defined(__HIPCC__)   // #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two
-__global__ void f16_to_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __half2float(__ushort_as_half(x[i]));
-}
-
-__global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
-    d[0] = 0;
-    d[1] = rows;
-}
-
-#endif
-
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
-// STRATA_MMQ_DIRECT: a group's guards (y < g.n, byte stores) and its two zero tails (y == g.n: gate/up, y == g.n + 1:
-// down; uint4 stores when `tail16`, which the host checked: both pointers and the size 16-byte aligned).  Only in a
-// STRATA_MMQ_TAB build: the engine loads every kernel at start (EAGER), so a build without it keeps today's image.
-__global__ void prep_group_kernel(GuardTab g, int64_t guard, uint8_t* tail_gu, uint8_t* tail_d, int64_t tail, bool tail16) {
-    const int y = (int) blockIdx.y;
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (y < g.n) {
-        if (i < guard) g.p[y][i] = 0;
-        return;
-    }
-    uint8_t* t = y == g.n ? tail_gu : tail_d;
-    if (t == nullptr) return;
-    if (tail16) {
-        if (i < tail / 16) ((uint4*) t)[i] = make_uint4(0, 0, 0, 0);
-    } else if (i < tail) {
-        t[i] = 0;
-    }
-}
-
-// the pointer-table MMQ per type: the native packs' nine types (CMake's _strata_mmq_tab_types, all of them checked
-// bit for bit by prefill_mmq_tab_test).  false: no instance - the optional Q5_0 and K-quant experts keep the gather
-bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab* tab, cudaStream_t s) {
-    const ggml_type t = a ? a->type_x : GGML_TYPE_COUNT;
-#define STRATA_TAB_CASE(T) case T: return ctx == nullptr || mul_mat_q_tab_case<T>(*ctx, *a, *tab, s)
-    switch (t) {
-        STRATA_TAB_CASE(GGML_TYPE_Q2_0);
-        STRATA_TAB_CASE(GGML_TYPE_IQ2_XXS);
-        STRATA_TAB_CASE(GGML_TYPE_IQ2_XS);
-        STRATA_TAB_CASE(GGML_TYPE_IQ2_S);
-        STRATA_TAB_CASE(GGML_TYPE_IQ3_XXS);
-        STRATA_TAB_CASE(GGML_TYPE_IQ3_S);
-        STRATA_TAB_CASE(GGML_TYPE_IQ4_NL);
-        STRATA_TAB_CASE(GGML_TYPE_IQ4_XS);
-        STRATA_TAB_CASE(GGML_TYPE_Q8_0);
-        default: return false;
-    }
-#undef STRATA_TAB_CASE
-}
-// whether run_tab has an instance for type t (no launch)
-bool tab_has_type(int t) {
-    mmq_args a{};
-    a.type_x = (ggml_type) t;
-    return run_tab(nullptr, &a, nullptr, nullptr);
-}
-#else
 bool run_tab(ggml_backend_cuda_context*, const mmq_args*, const void*, cudaStream_t) {
     std::fprintf(stderr, "prefill mmq: this build has no pointer-table MMQ (STRATA_MMQ_TAB)\n");
     std::exit(1);
 }
 bool tab_has_type(int) { return false; }
-#endif
 
 }  // namespace
 
@@ -269,10 +197,8 @@ bool supported(int t) {
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
             return kq_ok();
 #endif
-#if !defined(GGML_USE_HIP)
         case GGML_TYPE_NVFP4:
             return nvfp4_mode() != Nvfp4Mode::FP16;
-#endif
         default:
             return false;
     }
@@ -336,10 +262,6 @@ __global__ void scale_down_rows_kernel(float* __restrict__ d, int64_t ld, const 
 }  // namespace
 
 bool fp4_activations(int t) {
-#if defined(GGML_USE_HIP)   // no NVFP4 MMQ on HIP (and no W4A4 unit)
-    (void) t;
-    return false;
-#else
     if (t != GGML_TYPE_NVFP4 || nvfp4_mode() != Nvfp4Mode::W4A4) return false;
     static const bool on = [] {
         const bool ok = w4a4_available();
@@ -347,7 +269,6 @@ bool fp4_activations(int t) {
         return ok;
     }();
     return on;
-#endif
 }
 
 void scale_gu_rows(float* gu, int64_t ld, int64_t n_ff, const int32_t* bounds, int n, const float* tails,
@@ -366,7 +287,6 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
               float* yscale) {
     if (rows <= 0) return;
-#if !defined(GGML_USE_HIP)
     if (fp4_activations(t)) {
         if (yscale == nullptr) { std::fprintf(stderr, "prefill mmq: NVFP4 activations need a scale buffer\n"); std::exit(1); }
         const bool aligned = ((uintptr_t) x % 32 == 0) && ((size_t) ld * sizeof(float)) % 32 == 0;
@@ -374,7 +294,6 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
         ck(cudaGetLastError(), "quantize");
         return;
     }
-#endif
     (void) yscale;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
@@ -417,17 +336,7 @@ void Context::run(const Product& p, void* stream) {
             std::fprintf(stderr, "prefill mmq: a pointer table holds at most %d experts (got %d)\n", kGatherGroupMax, p.n);
             std::exit(1);
         }
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
-        mmq_x_tab tab{};
-        for (int z = 0; z < p.n; ++z) tab.p[z] = (const char*) p.tab->p[z];
-        if (!run_tab(&ctx, &a, &tab, s)) {
-            std::fprintf(stderr, "prefill mmq: no pointer-table MMQ for %s with %lld rows\n", ggml_type_name(t),
-                         (long long) p.w_rows);
-            std::exit(1);
-        }
-#else
         run_tab(&ctx, &a, nullptr, s);
-#endif
         ck(cudaGetLastError(), "mul_mat_q (pointer table)");
         return;
     }
@@ -444,27 +353,16 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
         case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
         case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
-#if defined(STRATA_MMQ_KQUANTS) && defined(STRATA_KQ_DSO)
-        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q5_1: {
-            const int e = kq::run((int) t, &a, s);
-            if (e != 0) {
-                std::fprintf(stderr, "prefill mmq: the K-quant library failed on type %d (error %d)\n", (int) t, e);
-                std::exit(1);
-            }
-            break;
-        }
-#elif defined(STRATA_MMQ_KQUANTS)
+#if defined(STRATA_MMQ_KQUANTS)
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
 #endif
-#if !defined(GGML_USE_HIP)   // NVFP4: CUDA only (no HIP instance, no W4A8 unit)
         case GGML_TYPE_NVFP4:
             if (fp4_activations(t)) run_nvfp4_w4a4(ctx, a, s);
             else run_nvfp4_w4a8(ctx, a, s);
             break;
-#endif
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
@@ -474,11 +372,7 @@ void Context::run(const Product& p, void* stream) {
 
 // ---- STRATA_MMQ_DIRECT ----
 bool tab_built() {
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
-    return true;
-#else
     return false;
-#endif
 }
 
 bool tab_fits(int t, int64_t w_rows) {
@@ -556,24 +450,10 @@ int direct_mode() {
 size_t direct_slot_guard() { return direct_mode() != 0 ? kSlotGuard : 0; }
 
 void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream) {
-#if !defined(STRATA_MMQ_TAB) || defined(__HIPCC__)
     // never reached: only a direct group calls it, and direct_mode() is 0 without the pointer-table MMQ
     (void) g; (void) guard_bytes; (void) tail_gu; (void) tail_d; (void) tail_bytes; (void) stream;
     std::fprintf(stderr, "prefill mmq: this build has no pointer-table MMQ (STRATA_MMQ_TAB)\n");
     std::exit(1);
-#else
-    const int n = g.n > 0 ? std::min(g.n, kGatherGroupMax) : 0;
-    const size_t guard = n > 0 ? guard_bytes : 0;
-    const size_t tail = tail_gu || tail_d ? tail_bytes : 0;
-    if (guard == 0 && tail == 0) return;
-    GuardTab gt = g;
-    gt.n = guard > 0 ? n : 0;
-    const bool tail16 = ((uintptr_t) tail_gu | (uintptr_t) tail_d | tail_bytes) % 16 == 0;
-    const size_t span = std::max(guard, tail);
-    prep_group_kernel<<<dim3(blocks((int64_t) span), (unsigned) (gt.n + 2)), 256, 0, (cudaStream_t) stream>>>(
-        gt, (int64_t) guard, (uint8_t*) tail_gu, (uint8_t*) tail_d, (int64_t) tail, tail16);
-    ck(cudaGetLastError(), "prep_group");
-#endif
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
@@ -652,18 +532,5 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     iota_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(dst, n);
     ck(cudaGetLastError(), "iota");
 }
-
-#if defined(__HIPCC__)
-void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
-    if (n <= 0) return;
-    f16_to_f32_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
-    ck(cudaGetLastError(), "f16_to_f32");
-}
-
-void set_bounds(int32_t* dst, int32_t rows, void* stream) {
-    set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, rows);
-    ck(cudaGetLastError(), "set_bounds");
-}
-#endif
 
 }  // namespace strata::prefill::mmq

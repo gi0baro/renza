@@ -17,23 +17,11 @@
 #include <random>
 #include <string>
 #include <system_error>
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <malloc.h>
-#include <process.h>
-#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
-#endif
 
 // Format v1 stores integers and floats as this machine holds them in memory; it is defined as little-endian with
 // IEEE-754 floats, so a build where that is not the memory layout is refused rather than writing another format.
@@ -81,25 +69,15 @@ uint64_t load64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v;
 // (tmpfs, a filesystem that refuses an aligned direct transfer, or STRATA_SESSION_BUFFERED=1).  Windows and other
 // systems: ordinary buffered I/O, same blocks.
 constexpr size_t kAlign = 4096, kBlock = 16u << 20;
-#ifdef _WIN32
-struct AlignedFree { void operator()(uint8_t* p) const { _aligned_free(p); } };
-using Aligned = std::unique_ptr<uint8_t, AlignedFree>;
-Aligned aligned_block() { return Aligned(static_cast<uint8_t*>(_aligned_malloc(kBlock, kAlign))); }
-#else
 struct AlignedFree { void operator()(uint8_t* p) const { std::free(p); } };
 using Aligned = std::unique_ptr<uint8_t, AlignedFree>;
 Aligned aligned_block() { return Aligned(static_cast<uint8_t*>(std::aligned_alloc(kAlign, kBlock))); }
-#endif
 
 uint64_t random64() {
     std::random_device rd;
     uint64_t r = (uint64_t(rd()) << 32) ^ rd();
     r ^= (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count() * P1;
-#ifdef _WIN32
-    r ^= (uint64_t) _getpid() * P2;
-#else
     r ^= (uint64_t) ::getpid() * P2;
-#endif
     return r;
 }
 
@@ -120,11 +98,7 @@ int injected(const std::function<int(const char*)>* fault, const char* step) {
 
 bool split_path(const std::string& path, std::string& dir, std::string& leaf, std::string& error) {
     const size_t cut = path.find_last_of(
-#ifdef _WIN32
-        "/\\"
-#else
         "/"
-#endif
     );
     dir = cut == std::string::npos ? std::string() : path.substr(0, cut == 0 ? 1 : cut);
     leaf = cut == std::string::npos ? path : path.substr(cut + 1);
@@ -132,206 +106,6 @@ bool split_path(const std::string& path, std::string& dir, std::string& leaf, st
     return true;
 }
 
-#ifdef _WIN32
-// paths reach the engine as UTF-8 (the server writes its commands as UTF-8); invalid UTF-8 is refused, not replaced
-bool wide(const std::string& s, std::wstring& w) {
-    w.clear();
-    if (s.empty()) return true;
-    if (s.size() > (size_t) INT_MAX) return false;
-    const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), nullptr, 0);
-    if (n <= 0) return false;
-    w.assign((size_t) n, L'\0');
-    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), w.data(), n) == n;
-}
-
-SessionError win_kind(DWORD code) {
-    switch (code) {
-        case ERROR_DISK_FULL: case ERROR_HANDLE_DISK_FULL: case ERROR_FILE_TOO_LARGE: return SessionError::storage;
-        case ERROR_NOT_ENOUGH_MEMORY: case ERROR_OUTOFMEMORY: return SessionError::memory;
-        default: return SessionError::io;
-    }
-}
-
-std::string last_error(DWORD code = GetLastError()) {
-    char msg[256] = {};
-    const DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, 0, msg,
-                                   sizeof msg, nullptr);
-    std::string s(msg, n);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '.')) s.pop_back();
-    return s.empty() ? "error " + std::to_string(code) : s;
-}
-
-class RawFile {
-public:
-    ~RawFile() { close(); }
-    // a new file that did not exist (CREATE_NEW: never an existing file or link)
-    bool create_new(const std::wstring& path) {
-        h_ = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (h_ == INVALID_HANDLE_VALUE) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
-        return true;
-    }
-    // a session to restore: the name itself is opened, never what a link or reparse point there points to; it must be
-    // an ordinary disk file with one name
-    bool open_session(const std::string& path, uint64_t& size) {
-        std::wstring w;
-        if (!wide(path, w)) { refused_ = true; error_ = "the path is not valid UTF-8"; return false; }
-        h_ = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (h_ == INVALID_HANDLE_VALUE) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
-        BY_HANDLE_FILE_INFORMATION info{};
-        if (!GetFileInformationByHandle(h_, &info)) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
-        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { refused_ = true; error_ = "a link or reparse point, not a file"; return false; }
-        if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || GetFileType(h_) != FILE_TYPE_DISK) {
-            refused_ = true;
-            error_ = "not a regular file";
-            return false;
-        }
-        if (info.nNumberOfLinks != 1) { refused_ = true; error_ = "the file has more than one name (hard link)"; return false; }
-        size = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-        return true;
-    }
-    // a model input: links followed (model folders are often linked)
-    bool open_model(const std::string& path, uint64_t& size) {
-        std::wstring w;
-        if (!wide(path, w)) { refused_ = true; error_ = "the path is not valid UTF-8"; return false; }
-        h_ = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                         nullptr);
-        if (h_ == INVALID_HANDLE_VALUE) {
-            const DWORD code = GetLastError();
-            missing_ = code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND;
-            kind_ = win_kind(code); error_ = last_error(code);
-            return false;
-        }
-        LARGE_INTEGER s{};
-        if (!GetFileSizeEx(h_, &s)) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
-        size = (uint64_t) s.QuadPart;
-        return true;
-    }
-    bool is_open() const { return h_ != INVALID_HANDLE_VALUE; }
-    bool direct() const { return false; }
-    bool write_all(const uint8_t* p, size_t n) {
-        while (n) {
-            DWORD w = 0;
-            const DWORD want = (DWORD) std::min<size_t>(n, size_t(1) << 30);
-            if (!WriteFile(h_, p, want, &w, nullptr) || w == 0) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
-            p += w; n -= w;
-        }
-        return true;
-    }
-    // bytes read, 0 at the end of the file, -1 on error
-    long long read_some(uint8_t* p, size_t n) {
-        DWORD r = 0;
-        if (!ReadFile(h_, p, (DWORD) std::min<size_t>(n, size_t(1) << 30), &r, nullptr)) {
-            { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
-            return -1;
-        }
-        return (long long) r;
-    }
-    bool read_at(uint64_t offset, uint8_t* p, size_t n) {
-        LARGE_INTEGER at{};
-        at.QuadPart = (LONGLONG) offset;
-        if (!SetFilePointerEx(h_, at, nullptr, FILE_BEGIN)) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
-        while (n) {
-            const long long r = read_some(p, n);
-            if (r <= 0) { if (r == 0) error_ = "file ends early"; return false; }
-            p += r; n -= (size_t) r;
-        }
-        return true;
-    }
-    bool truncate(uint64_t n) {
-        LARGE_INTEGER at{};
-        at.QuadPart = (LONGLONG) n;
-        if (SetFilePointerEx(h_, at, nullptr, FILE_BEGIN) && SetEndOfFile(h_)) return true;
-        { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
-        return false;
-    }
-    bool sync() {
-        if (FlushFileBuffers(h_)) return true;
-        { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
-        return false;
-    }
-    bool close() {
-        if (h_ == INVALID_HANDLE_VALUE) return true;
-        const bool ok = CloseHandle(h_) != 0;
-        if (!ok) { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
-        h_ = INVALID_HANDLE_VALUE;
-        return ok;
-    }
-    const std::string& error() const { return error_; }
-    bool missing() const { return missing_; }
-    SessionError kind() const { return kind_; }
-    // a validation refusal (a link, not a regular file, ...): bad input, not an I/O failure
-    bool refused() const { return refused_; }
-private:
-    HANDLE h_ = INVALID_HANDLE_VALUE;
-    SessionError kind_ = SessionError::io;
-    bool refused_ = false;
-    bool missing_ = false;
-    std::string error_;
-};
-
-// Where the file is published.  MoveFileExW replaces an existing destination (std::rename does not on Windows); the
-// replacement is a rename on one volume, but Windows promises no transaction on every filesystem.  A directory cannot
-// be flushed on Windows: the file's data was flushed (FlushFileBuffers) before the move, and the move is write-through.
-class Publisher {
-public:
-    bool open(const std::string& path, std::string& error) {
-        std::string dir, leaf;
-        if (!split_path(path, dir, leaf, error)) return false;
-        std::wstring wdir, wleaf;
-        if (!wide(dir, wdir) || !wide(leaf, wleaf)) { error = "session file: the path is not valid UTF-8"; return false; }
-        prefix_ = wdir.empty() ? std::wstring() : (wdir.back() == L'\\' || wdir.back() == L'/' ? wdir : wdir + L"\\");
-        final_ = prefix_ + wleaf;
-        leaf_ = leaf;
-        return true;
-    }
-    bool create_temp(RawFile& f, std::string& error) {
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            std::wstring name;
-            wide(temp_name(leaf_), name);
-            temp_ = prefix_ + name;
-            if (f.create_new(temp_)) { own_ = true; return true; }
-            if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) break;
-        }
-        error = f.error();
-        return false;
-    }
-    bool publish(std::string& error, bool, SessionStatus& st, const std::function<int(const char*)>* fault) {
-        if (const int e = injected(fault, "rename")) { error = std::strerror(e); st.error = errno_kind(e); return false; }
-        if (MoveFileExW(temp_.c_str(), final_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            own_ = false;
-            st.published = true;
-            // Windows has no folder flush; a test can still make this step fail after the move
-            if (const int e = injected(fault, "dir_flush")) {
-                error = std::string("flushing the directory: ") + std::strerror(e);
-                st.error = errno_kind(e);
-                return false;
-            }
-            return true;
-        }
-        const DWORD c = GetLastError();
-        st.error = win_kind(c);
-        error = last_error(c);
-        return false;
-    }
-    SessionError kind() const { return SessionError::io; }
-    ~Publisher() { if (own_) DeleteFileW(temp_.c_str()); }   // only the temporary file this call created
-private:
-    std::wstring prefix_, final_, temp_;
-    std::string leaf_;
-    bool own_ = false;
-};
-
-bool free_space(const std::string& path, uint64_t& out) {
-    std::wstring w;
-    if (!wide(session_free_space_dir(path, true), w)) return false;
-    ULARGE_INTEGER avail{};
-    if (!GetDiskFreeSpaceExW(w.empty() ? nullptr : w.c_str(), &avail, nullptr, nullptr)) return false;
-    out = avail.QuadPart;
-    return true;
-}
-#else
 #ifndef O_DIRECT
 #define O_DIRECT 0            // not offered by this system: buffered I/O
 #endif
@@ -523,7 +297,6 @@ bool free_space(const std::string& path, uint64_t& out) {
     out = (uint64_t) s.f_bavail * (uint64_t) s.f_frsize;
     return true;
 }
-#endif
 
 class FileSink {
 public:

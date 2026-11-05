@@ -11,20 +11,8 @@
 
 namespace strata::kernels::s26ts {
 
-#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)   // (permlanex16 / DPP row_xmask: gfx10+ only)
-__device__ __forceinline__ float xmov16(float v) {
-    return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u,
-                                                       false, false));
-}
-template <int O>
-__device__ __forceinline__ float xmov(float v) {
-    if constexpr (O == 16) return xmov16(v);
-    else return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x160 + O, 0xf, 0xf, false));
-}
-#else
 template <int O>
 __device__ __forceinline__ float xmov(float v) { return __shfl_xor_sync(0xffffffffu, v, O); }
-#endif
 
 __host__ __device__ constexpr int pow2_ceil(int t) { return t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : t <= 8 ? 8 : t <= 16 ? 16 : 32; }
 __host__ __device__ constexpr int log2c(int p) { return p <= 1 ? 0 : p == 2 ? 1 : p == 4 ? 2 : p == 8 ? 3 : p == 16 ? 4 : 5; }

@@ -45,18 +45,6 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
-#if defined(STRATA_HIP_GFX906)
-    // AMD: llama.cpp's HIP lookup (vecdotq.cuh) - v_perm_b32 takes 3-bit byte indices, so the low and high halves
-    // of the table are looked up and the index MSB picks between them: 4 perms per 8 values.
-    const uint32_t* v32 = reinterpret_cast<const uint32_t*>(table);
-    const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
-    const uint32_t el = __builtin_amdgcn_perm(v32[1], v32[0], q_even & 0x07070707u);
-    const uint32_t ol = __builtin_amdgcn_perm(v32[1], v32[0], q_odd & 0x07070707u);
-    const uint32_t eh = __builtin_amdgcn_perm(v32[3], v32[2], q_even & 0x07070707u);
-    const uint32_t oh = __builtin_amdgcn_perm(v32[3], v32[2], q_odd & 0x07070707u);
-    return make_int2((int) __builtin_amdgcn_perm(eh, el, 0x03020100u | ((q_even & 0x08080808u) >> 1)),
-                     (int) __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((q_odd & 0x08080808u) >> 1)));
-#else
     const uint32_t* table32 = (const uint32_t*) table;
     uint32_t tmp[2];
     const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
@@ -68,7 +56,6 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
         tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
     }
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
-#endif
 }
 #define ggml_cuda_dp4a(a, b, c) STRATA_DP4A((a), (b), (c))
 
@@ -1341,11 +1328,7 @@ struct IqGridWords {
 // column c.
 // #778: `__shared__ alignas(16)` does not compile for gfx1030 (HIP); the attribute after the declarator does, but nvcc
 // with MSVC as host does not take it.  Same layout either way.
-#if defined(__HIPCC__)
-#define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ uint32_t name[__VA_ARGS__] __attribute__((aligned(16)))
-#else
 #define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ alignas(16) uint32_t name[__VA_ARGS__]
-#endif
 template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>, bool EXACT_N = false>
 __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                          const block_q8_1* __restrict__ x, float* __restrict__ y,
@@ -2118,18 +2101,11 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
                                                                   block_q8_1* __restrict__ hq) {
-#if defined(__HIPCC__)
-#pragma clang fp contract(off)
-#endif
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
         const float g = gate[i];
-#if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
-#else
         const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
-#endif
         q8_1_store(h, hq, i);
     }
 }
@@ -2278,17 +2254,6 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) {
         const int i = part * 8 + j;
         const int code = (x[b].qs[i / 4] >> ((i % 4) * 2)) & 3;
-#if defined(__HIPCC__)
-        // HIP compilers fold the half path's negative scale times +0 to +0 (HIP 5.7 on gfx1012, gfx1151 on ROCm
-        // 7.13 - PR #895, gfx1200/gfx1201 on ROCm 7.10 - #1474); the gating arch list only ever chased the newest
-        // report (#1540).  Preserve the scale's sign, as the FP32/CPU paths do: value-identical where the fold never happens.
-        if constexpr (std::is_same_v<dst_t, __half>) {
-            if (code == 1) {
-                yy[b * 64 + i] = __ushort_as_half(__half_as_ushort(x[b].d) & 0x8000u);
-                continue;
-            }
-        }
-#endif
         yy[b * 64 + i] = cvt<dst_t>(d * (float) (code - 1));
     }
 }
@@ -2610,11 +2575,7 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
 // Bitwise equal to native_gu_multi_kernel / native_down_multi_kernel (S26 harness, real UD-IQ4_XS expert blobs, T 1-3,
 // memcmp of every output): each row's lane sums and warp_sum are the same; a warp interleaves RPW rows (more loads in
 // flight) and reads the chunk's activation rows from LDS and, for IQ3_S, the grid table from LDS (the same values).
-#if defined(__HIPCC__)
-#define STRATA_NT_LOAD(p) __builtin_nontemporal_load(p)
-#else   // (opt-in S26 kernels, AMD-tuned: a CUDA build compiles them with plain loads)
 #define STRATA_NT_LOAD(p) (*(p))
-#endif
 template<bool NT> __device__ __forceinline__ int ld16i(const uint16_t* p) {
     if constexpr (NT) return (int) STRATA_NT_LOAD(p); else return (int) *p;
 }
@@ -3564,21 +3525,9 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 
 // The AMD layouts below (STRATA_EXP_MODE) also build for CUDA: Volta takes mode 8 by default (exp_mode), every
 // other CUDA card keeps mode 0, the CUDA layout above.
-#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__)
-#define STRATA_EXP_LAYOUTS 1
-#else
-#define STRATA_EXP_LAYOUTS 0
-#endif
-#if defined(STRATA_HIP_GFX906)
-constexpr int kExpModeDefault = 7;
-constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
-constexpr bool kExpLds16 = false; // IQ2_XXS gate/up: R2 as measured on gfx906
-#else
 constexpr int kExpModeDefault = 0;
 constexpr int kExpFallback = 0;   // ... the CUDA layout (V100, IQ2_XXS gate/up: R2 183 us vs 113)
 constexpr bool kExpLds16 = true;  // IQ2_XXS gate/up in LDS too
-#endif
-#if STRATA_EXP_LAYOUTS
 // ---- AMD layouts for the grouped native experts (STRATA_EXP_MODE; 0 = the CUDA one above).
 // 1 (W64): a row per 64-lane wavefront - 4x the wavefronts, ~1-2 calls per lane, a 64-lane butterfly.
 // 2 (R2):  a 32-lane logical warp computes TWO rows in one loop - two independent load chains in flight.
@@ -3592,11 +3541,7 @@ __device__ __forceinline__ float row_dot64(const uint8_t* row, const block_q8_1*
         s += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
     }
 #pragma unroll
-#if defined(__HIPCC__)
-    for (int o = 32; o > 0; o >>= 1) s += __shfl_xor(s, o, 64);
-#else
     __trap();   // a 64-lane wavefront: mode 1 is gfx906's only
-#endif
     return s;
 }
 template<int TY>
@@ -4157,9 +4102,6 @@ int exp_mode() {
     static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : -1; }();
     if (g_exp_mode >= 0) return g_exp_mode;
     if (m >= 0) return m;
-#if defined(STRATA_HIP_GFX906)
-    return kExpModeDefault;
-#else
     // Volta (sm_70): mode 8, the grid and the group's activations in shared memory with SwiGLU + q8_1 fused
     // (V100-SXM2, a verify window's VRAM call: 227 -> 159 us); every other CUDA card keeps the CUDA layout
     static int per_dev[64];   // 0 unknown, else mode + 1
@@ -4187,11 +4129,8 @@ int exp_mode() {
         per_dev[dev] = 1 + ((major == 7 && minor == 0 && sm70 != nullptr && std::atoi(sm70) != 0) || p100 || p40 ? 8 : turing ? 4 : kExpModeDefault);
     }
     return per_dev[dev] - 1;
-#endif
 }
-#endif
 int g_exp_phase = 0;   // the bench: 0 all, 1 gate/up + swiglu + quantize only, 2 down only
-#if STRATA_EXP_LAYOUTS && !defined(__HIPCC__)
 // The down projection's mode on Turing's default: mode 4 is slower than the CUDA layout once groups have 3+ entries
 // (12 x 3: 36.5 -> 40.8 us, 16 x 4: 56.9 -> 68.9) - windows of 4+ tokens (cap_groups > 30) keep mode 0 there.
 int sm75_down_em(int em0, int64_t cap_groups) {
@@ -4202,16 +4141,9 @@ int sm75_down_em(int em0, int64_t cap_groups) {
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
     return strata::is_sm75(major, minor) ? 0 : em0;
 }
-#else
-int sm75_down_em(int em0, int64_t) { return em0; }
-#endif
 
 void native_expert_set_mode(int mode, int phase) {
-#if STRATA_EXP_LAYOUTS
     g_exp_mode = mode;
-#else
-    (void) mode;
-#endif
     g_exp_phase = phase;
 }
 
@@ -4284,16 +4216,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     static const bool v2k = [] {
         const char* v = std::getenv("STRATA_EXPERT_V2K");
         if (v != nullptr && v[0] != '\0') return v[0] == '1';
-#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-        int dev = 0;
-        cudaDeviceProp p;
-        const bool g12 = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-                         strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
-        (void) cudaGetLastError();
-        return g12;
-#else
         return false;
-#endif
     }();
     // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
     const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
@@ -4324,16 +4247,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type)) ? 16 : GU_ROWS;
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
-#if STRATA_EXP_LAYOUTS
-#if defined(STRATA_HIP_GFX906)
-    const int em0 = exp_mode();
-#else
     // CUDA: the AMD layouts launch a block row per possible group, so a call that strides (a verify window's PCIe
     // call, grid_groups 1..cap) keeps the CUDA layout: V100, 0 groups 11.3 vs 6.5 us, 1 group of 2 29.6 vs 21.3
     const int em0 = (grid_groups > 0 && grid_groups < cap_groups) ? 0 : exp_mode();
-#endif
-#endif
-#if STRATA_EXP_LAYOUTS
     const bool fused_gu = em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
@@ -4349,10 +4265,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         check("native_expert_grouped/gu fused");
     }
     if (g_exp_phase != 2 && !fused_gu) {
-#else
-    if (g_exp_phase != 2) {
-#endif
-#if STRATA_EXP_LAYOUTS
     const bool lds_gu = (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
     if (lds_gu) {
         const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
@@ -4381,7 +4293,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
     } else
 #undef STRATA_GU_AMD
-#endif
     if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -4389,19 +4300,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #undef STRATA_GU
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
-#if STRATA_EXP_LAYOUTS
     }
-#endif
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
-#if defined(STRATA_HIP_GFX906)
-    // gfx906: the separate SwiGLU and q8_1 passes stay the default (the A/B baseline); the RDNA one-pass
-    // kernel (bitwise the same) with STRATA_HIP_SWIGLU_FUSED=1
-    static const bool sw_fused = env_on("STRATA_HIP_SWIGLU_FUSED");
-    const bool sw_v1 = v1 || !sw_fused;
-#else
     const bool sw_v1 = v1;
-#endif
     if (sw_v1) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
@@ -4414,7 +4316,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (g_exp_phase == 1) return;
     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
-#if STRATA_EXP_LAYOUTS
     const int em0d = sm75_down_em(em0, cap_groups);
     if ((em0d == 7 || em0d == 8) && (L.d_type == 20 || L.d_type == 42)) {
         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
@@ -4438,7 +4339,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
     } else
 #undef STRATA_D_AMD
-#endif
     if (!expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out))   // STRATA_EXPDEC=1
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

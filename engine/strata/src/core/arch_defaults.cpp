@@ -63,11 +63,7 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch) {
     std::vector<std::string> set;
     for (const auto& kv : arch_default_env(gcn_arch)) {
         if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
-#if defined(_WIN32)
-        _putenv_s(kv.first.c_str(), kv.second.c_str());
-#else
         setenv(kv.first.c_str(), kv.second.c_str(), 0);
-#endif
         set.push_back(kv.first);
     }
     if (!set.empty()) {

@@ -28,19 +28,14 @@ set(STRATA_BUILD_CONVERSATION_TESTS ${RENZA_BUILD_STRATA_TESTS})
 # Child directories snapshot the original C flags here, before ds4's overrides below.
 add_subdirectory(engine/strata engine/strata EXCLUDE_FROM_ALL)
 
-# Strata registers GPU tests even with STRATA_BUILD_TESTS=OFF and no GPU is assumed
-# here, so ctest ignores every Strata test except the CPU-only ones. Their
-# executables are EXCLUDE_FROM_ALL: a setup test builds them first.
+# Strata's CPU tests renza runs; their executables are EXCLUDE_FROM_ALL: a setup test builds them first.
 set(strata_cpu_tests
     message_boundary_test conv_cache_test draft_kv_plan_test
     suffix_drafter_test controller_test draft_policy_test
     coupled_draft_test spec_prob_test conversation_cache_test
     conversation_memory_test conversation_file_test session_save_reclaim_test
     conversation_split_failure_test)
-get_directory_property(strata_tests DIRECTORY engine/strata TESTS)
-set(strata_ignored_tests ${strata_tests})
 if(RENZA_BUILD_STRATA_TESTS)
-    list(REMOVE_ITEM strata_ignored_tests ${strata_cpu_tests})
     set_tests_properties(${strata_cpu_tests} DIRECTORY engine/strata
         PROPERTIES FIXTURES_REQUIRED strata_cpu_tests TIMEOUT 120)
     add_custom_target(renza-strata-tests DEPENDS ${strata_cpu_tests})
@@ -48,9 +43,6 @@ if(RENZA_BUILD_STRATA_TESTS)
         COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target renza-strata-tests)
     set_tests_properties(strata-cpu-tests-build PROPERTIES FIXTURES_SETUP strata_cpu_tests TIMEOUT 600)
 endif()
-list(JOIN strata_ignored_tests "\n    " strata_ignored_lines)
-file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
-    "set(CTEST_CUSTOM_TESTS_IGNORE\n    ${strata_ignored_lines})\n")
 
 # ds4's Makefile flags on Linux; -O3 and -g are set here, so the build-type
 # defaults are cleared to keep them from adding -DNDEBUG or another -O level.

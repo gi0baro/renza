@@ -18,8 +18,6 @@
 //   * the EOS cut propagates FORWARD: an EOS at any position replaces that position AND every older one.
 //   * a missing predecessor is `LLAMA_TOKEN_NULL = -1`, tested as `t < 0`.  Token id 0 is a REAL token.
 //   * the token's OWN eos does not cut its own context - only the predecessors are examined.
-//
-// All of those are asserted observable in `ple_parity.cpp` rather than trusted.
 #pragma once
 
 #include <cstdint>

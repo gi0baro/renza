@@ -1,7 +1,7 @@
 // include/strata/core/family_layout.hpp - per model family: the geometry read from a GGUF's metadata, and the
 // tensor layout table (every tensor of a layer, by name and GGUF shape) checked against a model file's directory.
 //
-// Header-only and GPU-free: the engine, the tools and the unit tests (tests/core/model_family_test.cpp) share it.
+// Header-only and GPU-free: the engine, the tools and the unit tests share it.
 //
 //   * geometry_from_gguf: fills core::ModelGeometry from "<arch>.*" keys.  For qwen4exp the keys a file does not
 //     carry keep Flash-Next's values (the struct defaults, which every published qwen4exp file matches); for

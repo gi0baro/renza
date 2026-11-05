@@ -104,7 +104,7 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
         const int pair = tid;
         float a = (scale * x_tid) * gamma[pair];
         float b = (scale * x_hi) * gamma[pair + half_rot];
-#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDA_ARCH__)
         asm volatile("mov.f32 %0, %1;" : "=f"(a) : "f"(a));
         asm volatile("mov.f32 %0, %1;" : "=f"(b) : "f"(b));
 #endif
@@ -115,7 +115,7 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
         }
         float bs = b * s;
         float bc = b * c;
-#if defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDA_ARCH__)
         asm volatile("mov.f32 %0, %1;" : "=f"(bs) : "f"(bs));
         asm volatile("mov.f32 %0, %1;" : "=f"(bc) : "f"(bc));
 #endif
@@ -176,12 +176,7 @@ bool native_norm_rope_usable(int head_dim, int n_rot) {
     static const bool on = [] {
         const char* off = std::getenv("STRATA_NO_NORM_ROPE");
         if (off != nullptr && off[0] != '\0' && off[0] != '0') return false;
-#if defined(__HIPCC__)
-        const char* v = std::getenv("STRATA_NORM_ROPE");   // AMD: opt in until rope_parity check 6 passes there
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-#else
         return true;
-#endif
     }();
     return on && (head_dim == 128 || head_dim == 256) && n_rot == 64;
 }

@@ -30,9 +30,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "s26_tsum.cuh"
-#if !defined(__HIPCC__)
 #include "q8_1_il.cuh"
-#endif
 #include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -451,17 +449,6 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
 };
 
 __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
-#if defined(STRATA_HIP_GFX906)
-    // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
-    const uint32_t* v32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
-    const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
-    const uint32_t el = __builtin_amdgcn_perm(v32[1], v32[0], q_even & 0x07070707u);
-    const uint32_t ol = __builtin_amdgcn_perm(v32[1], v32[0], q_odd & 0x07070707u);
-    const uint32_t eh = __builtin_amdgcn_perm(v32[3], v32[2], q_even & 0x07070707u);
-    const uint32_t oh = __builtin_amdgcn_perm(v32[3], v32[2], q_odd & 0x07070707u);
-    return make_int2((int) __builtin_amdgcn_perm(eh, el, 0x03020100u | ((q_even & 0x08080808u) >> 1)),
-                     (int) __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((q_odd & 0x08080808u) >> 1)));
-#else
     const uint32_t* table32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
     uint32_t tmp[2];
     const uint32_t low_high_selection_indices = 0x32103210 | ((q4 & 0x88888888) >> 1);
@@ -473,7 +460,6 @@ __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
         tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
     }
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
-#endif
 }
 
 // Exact pinned vec_dot_iq4_xs_q8_1: a lane consumes one 32-element subblock,
@@ -1276,15 +1262,10 @@ int dev_class() {   // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 0;
     if (cls[dev] == 0) {
         int c = 0;
-#if defined(__HIPCC__)
-        cudaDeviceProp p;
-        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName)) c = 1;
-#else
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && major == 8 && minor == 6)
             c = 2;
-#endif
         (void) cudaGetLastError();
         cls[dev] = c + 1;
     }
@@ -1518,7 +1499,6 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
     }
 }
 
-#if !defined(__HIPCC__)   // CUDA only: the HIP paths keep native_mmvq's kernels
 // ============================ ncols = 2..4 from interleaved activations (fork F4, Eddoursul) ============================
 //
 // `native_quantize_q8_1_il` also writes the columns interleaved (native_mmvq.hpp), so one load reads the same int of
@@ -1784,8 +1764,6 @@ __global__ void native_quantize_q8_1_il_kernel(const float* __restrict__ x, Q81B
     if (lane == 0) dl[std::size_t(b) * cp + c] = __low2float(ds);
 }
 
-#endif  // !__HIPCC__
-
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
@@ -1808,75 +1786,7 @@ void launch_check() {
 }
 
 
-#if defined(STRATA_HIP_GFX906)
-// ---- AMD (wave64) layout: one wavefront per R rows, four wavefronts per block, the row's blocks strided over the
-// 64 lanes exactly as the CUDA kernels stride them over a block (kbx = lane / T, stride 64 / T), and a 64-lane
-// butterfly instead of the LDS partials and __syncthreads of the one-block-per-row layout: on gfx906 a block per
-// 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
-// column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
-bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
-template<typename F, int NCOLS, int R>
-__launch_bounds__(256)
-__global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
-    constexpr int BPIW = 64 / F::T;
-    static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
-    const int lane = int(threadIdx.x) & 63;
-    const int row0 = (int(blockIdx.x) * 4 + (int(threadIdx.x) >> 6)) * R;
-    if (row0 >= n_out) return;
-    const int blocks_per_row = n_in / F::DIV;
-    const int x_stride = n_in / Q8K;
-    const int kqs = F::kqs(lane);
-    float tmp[NCOLS][R] = {};
-    for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += BPIW) {
-        const int kby = kbx * F::KBY;
-#pragma unroll
-        for (int i = 0; i < R; ++i) {
-            if (row0 + i < n_out) {
-                const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
-#pragma unroll
-                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
-            }
-        }
-    }
-#pragma unroll
-    for (int j = 0; j < NCOLS; ++j)
-#pragma unroll
-        for (int i = 0; i < R; ++i) {
-            float v = tmp[j][i];
-#pragma unroll
-            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
-            if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
-        }
-}
-template<typename F, int NCOLS>
-void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    constexpr int R = 1;
-    const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
-    native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
-}
-template<typename F>
-void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    const auto s = static_cast<cudaStream_t>(stream);
-    switch (ncols) {
-        case 1: wave_launch_n<F, 1>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 2: wave_launch_n<F, 2>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 3: wave_launch_n<F, 3>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 4: wave_launch_n<F, 4>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 5: wave_launch_n<F, 5>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 6: wave_launch_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 7: wave_launch_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 8: wave_launch_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
-    }
-}
-#define STRATA_WAVE_MMVQ(...) \
-    if (!g_wave_off) { wave_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
-#else
 #define STRATA_WAVE_MMVQ(...)
-#endif
 
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
@@ -1933,11 +1843,7 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
 // partial buffers). Measured on gfx1151 (S26, 8 real UD-IQ4_XS layers per shape, paired, 1-5 columns): 2560 ->
 // 6144/10240/12288 +10-12% per call (engine trace: -10.7% on those calls). 6144 -> 2560 (one workgroup per row)
 // was +2-4% standalone but -3% in the engine, and rows < 2048 lose: neither is packed.
-#if defined(__HIPCC__)
-#define STRATA_Q8P_LOAD(p) __builtin_nontemporal_load(p)
-#else
 #define STRATA_Q8P_LOAD(p) __ldcs(p)
-#endif
 constexpr int Q8P_PERSIST_GRID = 640;
 constexpr int Q8P_PERSIST_MAX_IN = 4096;
 
@@ -2499,7 +2405,6 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     STRATA_WAVE_MMVQ(Q20Traits)
-#if !defined(__HIPCC__)
     // one column always (bitwise the single-column kernel); two to four only where the exact layout is the one in use
     if (ncols <= 4 && (ncols == 1 || g_multi_exact) && q2_0_warp_rows_on()) {
         const auto* w = static_cast<const Q20Block*>(weights);
@@ -2516,7 +2421,6 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         launch_check();
         return;
     }
-#endif
     if (ncols > 1) {
         launch_multi<Q20Traits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -2841,7 +2745,6 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
-#if !defined(__HIPCC__)
 std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);
     return std::size_t(n_in / Q8K) * std::size_t(native_q8_1_il_cp(ncols)) * (16 * sizeof(int) + sizeof(float));
@@ -3111,22 +3014,5 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
     }
     launch_check();
 }
-
-#else  // HIP: no interleaved path
-std::size_t native_q8_1_il_bytes(int n_in, int ncols) { return native_q8_1_bytes(n_in, ncols) * 2; }
-void native_quantize_q8_1_il(const float*, void*, void*, int, int, void*) {
-    throw std::invalid_argument("native_quantize_q8_1_il is CUDA only");
-}
-void native_q8_1_interleave(const void*, void*, int, int, void*) {
-    throw std::invalid_argument("native_q8_1_interleave is CUDA only");
-}
-bool native_mmvq_il_supported(int, int, int) { return false; }
-int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
-void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
-                    int ncols, void* stream) {
-    native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-void native_mmvq_il_tune(int) {}
-#endif  // !__HIPCC__
 
 } // namespace strata::kernels

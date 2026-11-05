@@ -6,11 +6,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
 #include <cpuid.h>
-#endif
 
 #include <cmath>
 #include <atomic>

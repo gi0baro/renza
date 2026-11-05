@@ -45,25 +45,7 @@ __device__ __forceinline__ uint16_t hf(float f) { return __half_as_ushort(__floa
 // A SwiGLU product for an FP16 GEMM: saturated, so a token with a massive activation cannot turn into inf and then
 // NaN in the down projection (decode's q8_1 has room to ~8e6; FP16 ends at 65504).  A NaN stays NaN (fminf/fmaxf
 // would make it -65504 and hide where it came from); finite values below 65504 round exactly as before.
-// STRATA_F16_RANGE=1 (set_f16_range): what reaches FP16's range on this device - the largest |value| the activation
-// images converted (hf_sat is their one funnel) and how many were beyond 65504 or NaN; W and Y are counted in gemm.cu.
-// Off, the cost is one flag read per value.  The max is kept as float bits (positive floats order as unsigned ints),
-// and a thread takes the atomic only when it beats the value it read, so the atomics stop once the max has settled.
-#if defined(__HIPCC__)   // HIP only: the CUDA kernels stay exactly as they were (no flag read in hf_sat)
-__device__ int g_f16_range_on = 0;
-__device__ unsigned g_f16_range_max = 0;
-__device__ unsigned long long g_f16_range_over = 0;
-__device__ __forceinline__ void f16_range_note(float f) {
-    const float a = fabsf(f);
-    const unsigned bits = __float_as_uint(a);
-    if (bits > g_f16_range_max) atomicMax(&g_f16_range_max, bits);
-    if (a > 65504.0f || isnan(f)) atomicAdd(&g_f16_range_over, 1ull);
-}
-#endif
 __device__ __forceinline__ uint16_t hf_sat(float f) {
-#if defined(__HIPCC__)
-    if (g_f16_range_on) f16_range_note(f);
-#endif
     return hf(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f));
 }
 
@@ -77,12 +59,7 @@ __device__ __forceinline__ uint16_t bf_to_hf_conv(uint16_t b) {
 }
 // The prompt path's 16-bit activation image for the BF16-weight GEMMs: BF16, or FP16 where the GEMM library is fast
 // only in FP16 (prompt_f16() in gemm.cu: rocBLAS on gfx103x).  Set once per device before the first prompt.
-#if defined(__HIPCC__)   // HIP only (#835): the CUDA kernels stay exactly as they were, they never read the flag
-__device__ int g_act_f16 = 0;
-__device__ __forceinline__ uint16_t act16(float f) { return g_act_f16 ? hf_sat(f) : bf(f); }
-#else
 __device__ __forceinline__ uint16_t act16(float f) { return bf(f); }
-#endif
 // block-wide sum for blockDim.x <= 1024, result broadcast
 __device__ float block_sum(float v, float* sh) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -581,7 +558,6 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
-#if !defined(__HIPCC__)
 // The recurrence with one thread for the three value heads that share a key head (head % HK): column c of heads
 // qh, qh + 16 and qh + 32, row group rg.  gdn_rec_cols_pipe_kernel spends its time in shared memory, not in
 // arithmetic: every thread of a warp needs the same 32 q and k values per token (the k twice), and a warp receives one
@@ -591,36 +567,19 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
 // and the two cross-row-group sums have their own arrays, so a token needs 2 __syncthreads instead of 5: the second
 // one of a token orders every read of rkv before the next token's writes, the next token's first one every read of ro
 // before the writes after it.  64 blocks instead of 192.  Per value head and column the same arithmetic in the same
-// order: the same bits (src/prefill/gdn_rec_parity.cu checks them and times the variants: 1.41x on a 4080 Super).
+// order: the same bits.
 // sm_80+ cards that hold its 64 blocks at once (gdn_keyhead_ok); STRATA_GDN_KEYHEAD=0: gdn_rec_cols_pipe_kernel.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-#define STRATA_GDN_CP_ASYNC 0   // Turing builds: plain copies (never launched there, see gdn_keyhead_ok)
-#else
-#define STRATA_GDN_CP_ASYNC 1
-#endif
 __device__ __forceinline__ void gdn_cp4(float* smem, const float* gmem) {
-#if STRATA_GDN_CP_ASYNC
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
-#else
-    *smem = *gmem;
-#endif
 }
 __device__ __forceinline__ void gdn_cp16(float* smem, const float* gmem) {
-#if STRATA_GDN_CP_ASYNC
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
-#else
-    *reinterpret_cast<float4*>(smem) = *reinterpret_cast<const float4*>(gmem);
-#endif
 }
 __device__ __forceinline__ void gdn_cp_commit() {
-#if STRATA_GDN_CP_ASYNC
     asm volatile("cp.async.commit_group;\n" ::);
-#endif
 }
 __device__ __forceinline__ void gdn_cp_wait_prev() {   // every group but the newest has landed
-#if STRATA_GDN_CP_ASYNC
     asm volatile("cp.async.wait_group 1;\n" ::);
-#endif
 }
 constexpr int GDN_TB = 8, VPK = HV / HK;   // tokens per staged block, value heads per key head
 __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__ state, const float* __restrict__ h,
@@ -857,9 +816,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep_kernel(const float* __rest
 
 __device__ __forceinline__ void gdn_pf_l2(const float* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 __device__ __forceinline__ void gdn_cp_wait_all() {
-#if STRATA_GDN_CP_ASYNC
     asm volatile("cp.async.wait_all;\n" ::);
-#endif
 }
 // A block per (key head, 16 value columns): 128 threads for each of the key head's three value heads, which share the
 // staged k and q rows.  128 blocks, one an SM, in one wave (each walks every chunk: a second wave would double the
@@ -1091,749 +1048,6 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
     }
     return cudaSuccess;   // launch errors surface at the caller's check; an error above means nothing ran
 }
-#endif
-#if defined(__HIPCC__)   // the Aurora (gfx11) recurrence kernels: AMD builds only
-// Aurora (S23): the recurrence with the column-split grid of gdn_rec_cols_pipe_kernel (four 32-column blocks per value
-// head) but FOUR LANES per column, lane g holding the column's state rows 32g .. 32g + 31 in registers - exactly the
-// row group the old kernel's thread (col, rg = g) held - so a token needs no __syncthreads: the four kv / o partials
-// meet through wave shuffles and are added in the old order red[0] + red[1] + red[2] + red[3] (the same bits;
-// tests/hip/gdn_rec_head.cpp).  The q/k rows, v, gate and beta are staged in LDS HT tokens at a time, the next chunk
-// loaded into registers while this one computes, and a token's k and q rows are read into registers before its
-// products (one LDS latency per token, not one per load).  The old kernels took ~4 barriers per token and ~3.5 us
-// per token and layer on the Radeon 8060S; the output norm runs after it in gdn_out_norm_warp_kernel.
-// STRATA_GDN_HEAD=0: the old kernels.
-constexpr int HT = 4;                           // tokens per staged chunk (LDS ~10 KB: all 192 blocks resident)
-constexpr int QCB = 32;                         // columns per block
-constexpr int QTH = QCB * 4;                    // threads per block: 4 lanes per column
-constexpr int QRS = 36;                         // staged row-group stride (32 rows + 4 pad: the 4 groups' reads
-                                                // land in different LDS banks)
-constexpr int QPF = HT * 2 * S / 4 / QTH;       // float4 of q/k each thread prefetches per chunk (2)
-__global__ void __launch_bounds__(QTH) gdn_rec_quad_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                           const float* __restrict__ gate, const float* __restrict__ beta,
-                                                           float* __restrict__ oc_out, int64_t T) {
-    __shared__ __align__(16) float sqk[2][HT][2][4 * QRS];   // [buffer][token][q | k][group][row (padded)]
-    __shared__ float sgb[2][2][HT];                         // [buffer][gate | beta][token]
-    __shared__ float sv[2][HT][QCB];                        // [buffer][token][column] v
-    const int head = blockIdx.x / (S / QCB), cb = blockIdx.x % (S / QCB);
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-    const int g = lane >> 3, cl = wave * 8 + (lane & 7), col = cb * QCB + cl;   // row group, column in block / head
-    const int qh = head % HK;
-    float s[32];
-    {
-        const float* base = state + ((size_t) (g * 32) * HV + head) * S + col;
-#pragma unroll
-        for (int r = 0; r < 32; ++r) s[r] = base[(size_t) r * HV * S];
-    }
-    float4 pf[QPF];
-    float pv[HT], pgb = 0.0f;
-    // chunk c's inputs into registers: q/k (float4 i of the chunk's [token][q|k][S/4] block), the column's v (lanes of
-    // group 0) and gate (threads 0..HT-1) / beta (HT..2HT-1) of token `tid % HT`
-    auto fetch = [&](int64_t c) {
-        const int64_t t0 = c * HT;
-#pragma unroll
-        for (int u = 0; u < QPF; ++u) {
-            const int i = tid + u * QTH;
-            const int tt = i / (2 * S / 4), rem = i % (2 * S / 4), part = rem / (S / 4), r4 = rem % (S / 4);
-            const int64_t t = t0 + tt;
-            pf[u] = t < T ? *reinterpret_cast<const float4*>(h + t * C + part * HK * S + qh * S + r4 * 4)
-                          : make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        if (g == 0) {
-#pragma unroll
-            for (int tt = 0; tt < HT; ++tt) {
-                const int64_t t = t0 + tt;
-                pv[tt] = t < T ? h[t * C + 2 * HK * S + head * S + col] : 0.0f;
-            }
-        }
-        if (tid < 2 * HT) {
-            const int64_t t = t0 + (tid % HT);
-            pgb = t < T ? (tid < HT ? gate : beta)[t * HV + head] : 0.0f;
-        }
-    };
-    const float rs_s = rsqrtf((float) S);
-    const int src0 = lane & 7;                       // lane of group 0 for this column; group j is src0 + 8 j
-    const int64_t nch = (T + HT - 1) / HT;
-    if (nch > 0) fetch(0);
-    for (int64_t c = 0; c < nch; ++c) {
-        const int b = (int) (c & 1);
-        if (g == 0) {
-#pragma unroll
-            for (int tt = 0; tt < HT; ++tt) sv[b][tt][cl] = pv[tt];
-        }
-#pragma unroll
-        for (int u = 0; u < QPF; ++u) {
-            const int i = tid + u * QTH;
-            const int tt = i / (2 * S / 4), rem = i % (2 * S / 4), part = rem / (S / 4), r4 = rem % (S / 4);
-            const int row = r4 * 4;
-            *reinterpret_cast<float4*>(&sqk[b][tt][part][(row >> 5) * QRS + (row & 31)]) = pf[u];
-        }
-        if (tid < 2 * HT) sgb[b][tid / HT][tid % HT] = pgb;
-        __syncthreads();                               // chunk c staged (buffer b was last read two chunks ago)
-        if (c + 1 < nch) fetch(c + 1);
-        const int64_t t0 = c * HT;
-        const int nt = (int) (T - t0 < HT ? T - t0 : HT);
-        for (int tt = 0; tt < nt; ++tt) {
-            float k[32], q[32];
-            {
-                const float4* k4 = reinterpret_cast<const float4*>(&sqk[b][tt][1][g * QRS]);
-                const float4* q4 = reinterpret_cast<const float4*>(&sqk[b][tt][0][g * QRS]);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float4 kk = k4[j], qq = q4[j];
-                    k[4 * j] = kk.x; k[4 * j + 1] = kk.y; k[4 * j + 2] = kk.z; k[4 * j + 3] = kk.w;
-                    q[4 * j] = qq.x; q[4 * j + 1] = qq.y; q[4 * j + 2] = qq.z; q[4 * j + 3] = qq.w;
-                }
-            }
-            const float g_exp = __expf(sgb[b][0][tt]);
-            float kv = 0.0f;
-#pragma unroll
-            for (int r = 0; r < 32; ++r) kv = fmaf(s[r], k[r], kv);
-            const float p0 = __shfl_sync(0xffffffffu, kv, src0), p1 = __shfl_sync(0xffffffffu, kv, src0 + 8),
-                        p2 = __shfl_sync(0xffffffffu, kv, src0 + 16), p3 = __shfl_sync(0xffffffffu, kv, src0 + 24);
-            const float kv_col = p0 + p1 + p2 + p3;
-            const float cvt = sv[b][tt][cl], cbt = sgb[b][1][tt];
-            const float delta = (cvt - g_exp * kv_col) * cbt;
-            float o = 0.0f;
-#pragma unroll
-            for (int r = 0; r < 32; ++r) {
-                s[r] = fmaf(g_exp, s[r], k[r] * delta);
-                o = fmaf(s[r], q[r], o);
-            }
-            const float o0 = __shfl_sync(0xffffffffu, o, src0), o1 = __shfl_sync(0xffffffffu, o, src0 + 8),
-                        o2 = __shfl_sync(0xffffffffu, o, src0 + 16), o3 = __shfl_sync(0xffffffffu, o, src0 + 24);
-            if (g == 0) oc_out[(t0 + tt) * HV * S + head * S + col] = (o0 + o1 + o2 + o3) * rs_s;
-        }
-    }
-    {
-        float* base = state + ((size_t) (g * 32) * HV + head) * S + col;
-#pragma unroll
-        for (int r = 0; r < 32; ++r) base[(size_t) r * HV * S] = s[r];
-    }
-}
-// Aurora (S23, opt-in STRATA_GDN_PP=1): gdn_rec_quad_kernel with the same arithmetic in the same order, two changes in
-// how it is compiled.  (1) The VGPR count: the 32 state-row addresses of the first loads were kept live across the
-// whole walk to be reused by the final stores (64 VGPRs, 196 in all = 7 waves a SIMD for the 192 blocks of 4 waves
-// that need 9.6): the stores' lane offset goes through an asm so the addresses are made again, 133 VGPRs, all blocks
-// resident.  (2) A full chunk's four tokens run with the state alternating between two register sets (the update
-// writes the other set), so the compiler emits no 32 register copies after the update.
-__global__ void __launch_bounds__(QTH) gdn_rec_quad_pp_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                           const float* __restrict__ gate, const float* __restrict__ beta,
-                                                           float* __restrict__ oc_out, int64_t T) {
-    __shared__ __align__(16) float sqk[2][HT][2][4 * QRS];   // [buffer][token][q | k][group][row (padded)]
-    __shared__ float sgb[2][2][HT];                         // [buffer][gate | beta][token]
-    __shared__ float sv[2][HT][QCB];                        // [buffer][token][column] v
-    const int head = blockIdx.x / (S / QCB), cb = blockIdx.x % (S / QCB);
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-    const int g = lane >> 3, cl = wave * 8 + (lane & 7), col = cb * QCB + cl;   // row group, column in block / head
-    const int qh = head % HK;
-    float s[32];
-    {
-        const float* sb = state + (size_t) head * S;
-        const uint32_t voff = (uint32_t) ((g * 32) * HV * S + col);
-#pragma unroll
-        for (int r = 0; r < 32; ++r) s[r] = sb[(size_t) r * HV * S + voff];
-    }
-    float4 pf[QPF];
-    float pv[HT], pgb = 0.0f;
-    // chunk c's inputs into registers: q/k (float4 i of the chunk's [token][q|k][S/4] block), the column's v (lanes of
-    // group 0) and gate (threads 0..HT-1) / beta (HT..2HT-1) of token `tid % HT`
-    auto fetch = [&](int64_t c) {
-        const int64_t t0 = c * HT;
-#pragma unroll
-        for (int u = 0; u < QPF; ++u) {
-            const int i = tid + u * QTH;
-            const int tt = i / (2 * S / 4), rem = i % (2 * S / 4), part = rem / (S / 4), r4 = rem % (S / 4);
-            const int64_t t = t0 + tt;
-            pf[u] = t < T ? *reinterpret_cast<const float4*>(h + t * C + part * HK * S + qh * S + r4 * 4)
-                          : make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        if (g == 0) {
-#pragma unroll
-            for (int tt = 0; tt < HT; ++tt) {
-                const int64_t t = t0 + tt;
-                pv[tt] = t < T ? h[t * C + 2 * HK * S + head * S + col] : 0.0f;
-            }
-        }
-        if (tid < 2 * HT) {
-            const int64_t t = t0 + (tid % HT);
-            pgb = t < T ? (tid < HT ? gate : beta)[t * HV + head] : 0.0f;
-        }
-    };
-    const float rs_s = rsqrtf((float) S);
-    const int src0 = lane & 7;                       // lane of group 0 for this column; group j is src0 + 8 j
-    const int64_t nch = (T + HT - 1) / HT;
-    if (nch > 0) fetch(0);
-    for (int64_t c = 0; c < nch; ++c) {
-        const int b = (int) (c & 1);
-        if (g == 0) {
-#pragma unroll
-            for (int tt = 0; tt < HT; ++tt) sv[b][tt][cl] = pv[tt];
-        }
-#pragma unroll
-        for (int u = 0; u < QPF; ++u) {
-            const int i = tid + u * QTH;
-            const int tt = i / (2 * S / 4), rem = i % (2 * S / 4), part = rem / (S / 4), r4 = rem % (S / 4);
-            const int row = r4 * 4;
-            *reinterpret_cast<float4*>(&sqk[b][tt][part][(row >> 5) * QRS + (row & 31)]) = pf[u];
-        }
-        if (tid < 2 * HT) sgb[b][tid / HT][tid % HT] = pgb;
-        __syncthreads();                               // chunk c staged (buffer b was last read two chunks ago)
-        if (c + 1 < nch) fetch(c + 1);
-        const int64_t t0 = c * HT;
-        const int nt = (int) (T - t0 < HT ? T - t0 : HT);
-        auto token = [&](int tt, float (&sin)[32], float (&sout)[32]) {
-            float k[32], q[32];
-            {
-                const float4* k4 = reinterpret_cast<const float4*>(&sqk[b][tt][1][g * QRS]);
-                const float4* q4 = reinterpret_cast<const float4*>(&sqk[b][tt][0][g * QRS]);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float4 kk = k4[j], qq = q4[j];
-                    k[4 * j] = kk.x; k[4 * j + 1] = kk.y; k[4 * j + 2] = kk.z; k[4 * j + 3] = kk.w;
-                    q[4 * j] = qq.x; q[4 * j + 1] = qq.y; q[4 * j + 2] = qq.z; q[4 * j + 3] = qq.w;
-                }
-            }
-            const float g_exp = __expf(sgb[b][0][tt]);
-            float kv = 0.0f;
-#pragma unroll
-            for (int r = 0; r < 32; ++r) kv = fmaf(sin[r], k[r], kv);
-            const float p0 = __shfl_sync(0xffffffffu, kv, src0), p1 = __shfl_sync(0xffffffffu, kv, src0 + 8),
-                        p2 = __shfl_sync(0xffffffffu, kv, src0 + 16), p3 = __shfl_sync(0xffffffffu, kv, src0 + 24);
-            const float kv_col = p0 + p1 + p2 + p3;
-            const float cvt = sv[b][tt][cl], cbt = sgb[b][1][tt];
-            const float delta = (cvt - g_exp * kv_col) * cbt;
-            float o = 0.0f;
-#pragma unroll
-            for (int r = 0; r < 32; ++r) {
-                sout[r] = fmaf(g_exp, sin[r], k[r] * delta);
-                o = fmaf(sout[r], q[r], o);
-            }
-            const float o0 = __shfl_sync(0xffffffffu, o, src0), o1 = __shfl_sync(0xffffffffu, o, src0 + 8),
-                        o2 = __shfl_sync(0xffffffffu, o, src0 + 16), o3 = __shfl_sync(0xffffffffu, o, src0 + 24);
-            if (g == 0) oc_out[(t0 + tt) * HV * S + head * S + col] = (o0 + o1 + o2 + o3) * rs_s;
-        };
-        if (nt == HT) {   // the state alternates between two register sets: no copy after the update
-            float s2[32];
-            token(0, s, s2);
-            token(1, s2, s);
-            token(2, s, s2);
-            token(3, s2, s);
-        } else {
-            for (int tt = 0; tt < nt; ++tt) {
-                float s2[32];
-                token(tt, s, s2);
-#pragma unroll
-                for (int r = 0; r < 32; ++r) s[r] = s2[r];
-            }
-        }
-    }
-    {
-        float* sb = state + (size_t) head * S;
-        uint32_t voff = (uint32_t) ((g * 32) * HV * S + col);
-        asm volatile("" : "+v"(voff));   // (so the loads' 32 addresses are not kept alive across the whole loop)
-#pragma unroll
-        for (int r = 0; r < 32; ++r) sb[(size_t) r * HV * S + voff] = s[r];
-    }
-}
-
-// Aurora (S23, opt-in STRATA_GDN_PP=2): gdn_rec_quad_kernel with two columns per lane (a wave: 4 row groups x 8 lanes x
-// 2 columns = 16 columns; a block of 4 waves 64 columns, 96 blocks).  A lane's two columns share the k / q rows it
-// reads from shared memory (half the LDS reads and shuffles per column, the kernel's limit) and give each wave two
-// independent dependency chains; the 384 waves fit in one round at 230 VGPRs.  Per column the same arithmetic in
-// the same order (the same bits as gdn_rec_quad_kernel).  The store of the state goes through an asm for the reason
-// given at gdn_rec_quad_pp_kernel.
-
-// ---- C2: two columns per lane (a wave: 4 row groups x 8 lanes x 2 columns = 16 columns; a block of 4 waves 64
-// columns).  A lane's two columns share the k / q rows it reads from LDS (half the LDS reads and shuffles per column
-// and two independent dependency chains in each wave).  Per column the same arithmetic in the same order.
-constexpr int C2CB = 64;                          // columns per block
-constexpr int C2PF = HT * 2 * S / 4 / QTH;        // float4 of q/k each thread prefetches per chunk (2)
-__global__ void __launch_bounds__(QTH) gdn_rec_quad2c_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                             const float* __restrict__ gate, const float* __restrict__ beta,
-                                                             float* __restrict__ oc_out, int64_t T) {
-    __shared__ __align__(16) float sqk[2][HT][2][4 * QRS];
-    __shared__ float sgb[2][2][HT];
-    __shared__ float sv[2][HT][C2CB];
-    const int head = blockIdx.x / (S / C2CB), cb = blockIdx.x % (S / C2CB);
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-    const int g = lane >> 3, cl0 = wave * 16 + (lane & 7), cl1 = cl0 + 8;   // the lane's two columns in the block
-    const int col0 = cb * C2CB + cl0, col1 = cb * C2CB + cl1;
-    const int qh = head % HK;
-    float s0[32], s1[32];
-    {
-        const float* sb = state + (size_t) head * S;
-        const uint32_t voff = (uint32_t) ((g * 32) * HV * S);
-#pragma unroll
-        for (int r = 0; r < 32; ++r) { s0[r] = sb[(size_t) r * HV * S + voff + col0]; s1[r] = sb[(size_t) r * HV * S + voff + col1]; }
-    }
-    float4 pf[C2PF];
-    float pv[2][HT], pgb = 0.0f;
-    auto fetch = [&](int64_t c) {
-        const int64_t t0 = c * HT;
-#pragma unroll
-        for (int u = 0; u < C2PF; ++u) {
-            const int i = tid + u * QTH;
-            const int tt = i / (2 * S / 4), rem = i % (2 * S / 4), part = rem / (S / 4), r4 = rem % (S / 4);
-            const int64_t t = t0 + tt;
-            pf[u] = t < T ? *reinterpret_cast<const float4*>(h + t * C + part * HK * S + qh * S + r4 * 4)
-                          : make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        if (g == 0) {
-#pragma unroll
-            for (int tt = 0; tt < HT; ++tt) {
-                const int64_t t = t0 + tt;
-                pv[0][tt] = t < T ? h[t * C + 2 * HK * S + head * S + col0] : 0.0f;
-                pv[1][tt] = t < T ? h[t * C + 2 * HK * S + head * S + col1] : 0.0f;
-            }
-        }
-        if (tid < 2 * HT) {
-            const int64_t t = t0 + (tid % HT);
-            pgb = t < T ? (tid < HT ? gate : beta)[t * HV + head] : 0.0f;
-        }
-    };
-    const float rs_s = rsqrtf((float) S);
-    const int src0 = lane & 7;
-    const int64_t nch = (T + HT - 1) / HT;
-    if (nch > 0) fetch(0);
-    for (int64_t c = 0; c < nch; ++c) {
-        const int b = (int) (c & 1);
-        if (g == 0) {
-#pragma unroll
-            for (int tt = 0; tt < HT; ++tt) { sv[b][tt][cl0] = pv[0][tt]; sv[b][tt][cl1] = pv[1][tt]; }
-        }
-#pragma unroll
-        for (int u = 0; u < C2PF; ++u) {
-            const int i = tid + u * QTH;
-            const int tt = i / (2 * S / 4), rem = i % (2 * S / 4), part = rem / (S / 4), r4 = rem % (S / 4);
-            const int row = r4 * 4;
-            *reinterpret_cast<float4*>(&sqk[b][tt][part][(row >> 5) * QRS + (row & 31)]) = pf[u];
-        }
-        if (tid < 2 * HT) sgb[b][tid / HT][tid % HT] = pgb;
-        __syncthreads();
-        if (c + 1 < nch) fetch(c + 1);
-        const int64_t t0 = c * HT;
-        const int nt = (int) (T - t0 < HT ? T - t0 : HT);
-        for (int tt = 0; tt < nt; ++tt) {
-            float k[32], q[32];
-            {
-                const float4* k4 = reinterpret_cast<const float4*>(&sqk[b][tt][1][g * QRS]);
-                const float4* q4 = reinterpret_cast<const float4*>(&sqk[b][tt][0][g * QRS]);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float4 kk = k4[j], qq = q4[j];
-                    k[4 * j] = kk.x; k[4 * j + 1] = kk.y; k[4 * j + 2] = kk.z; k[4 * j + 3] = kk.w;
-                    q[4 * j] = qq.x; q[4 * j + 1] = qq.y; q[4 * j + 2] = qq.z; q[4 * j + 3] = qq.w;
-                }
-            }
-            const float g_exp = __expf(sgb[b][0][tt]);
-            float kv0 = 0.0f, kv1 = 0.0f;
-#pragma unroll
-            for (int r = 0; r < 32; ++r) { kv0 = fmaf(s0[r], k[r], kv0); kv1 = fmaf(s1[r], k[r], kv1); }
-            const float a0 = __shfl_sync(0xffffffffu, kv0, src0), a1 = __shfl_sync(0xffffffffu, kv0, src0 + 8),
-                        a2 = __shfl_sync(0xffffffffu, kv0, src0 + 16), a3 = __shfl_sync(0xffffffffu, kv0, src0 + 24);
-            const float b0 = __shfl_sync(0xffffffffu, kv1, src0), b1 = __shfl_sync(0xffffffffu, kv1, src0 + 8),
-                        b2 = __shfl_sync(0xffffffffu, kv1, src0 + 16), b3 = __shfl_sync(0xffffffffu, kv1, src0 + 24);
-            const float kvc0 = a0 + a1 + a2 + a3, kvc1 = b0 + b1 + b2 + b3;
-            const float cbt = sgb[b][1][tt];
-            const float d0 = (sv[b][tt][cl0] - g_exp * kvc0) * cbt, d1 = (sv[b][tt][cl1] - g_exp * kvc1) * cbt;
-            float o0 = 0.0f, o1 = 0.0f;
-#pragma unroll
-            for (int r = 0; r < 32; ++r) {
-                s0[r] = fmaf(g_exp, s0[r], k[r] * d0);
-                s1[r] = fmaf(g_exp, s1[r], k[r] * d1);
-                o0 = fmaf(s0[r], q[r], o0);
-                o1 = fmaf(s1[r], q[r], o1);
-            }
-            const float x0 = __shfl_sync(0xffffffffu, o0, src0), x1 = __shfl_sync(0xffffffffu, o0, src0 + 8),
-                        x2 = __shfl_sync(0xffffffffu, o0, src0 + 16), x3 = __shfl_sync(0xffffffffu, o0, src0 + 24);
-            const float y0 = __shfl_sync(0xffffffffu, o1, src0), y1 = __shfl_sync(0xffffffffu, o1, src0 + 8),
-                        y2 = __shfl_sync(0xffffffffu, o1, src0 + 16), y3 = __shfl_sync(0xffffffffu, o1, src0 + 24);
-            if (g == 0) {
-                oc_out[(t0 + tt) * HV * S + head * S + col0] = (x0 + x1 + x2 + x3) * rs_s;
-                oc_out[(t0 + tt) * HV * S + head * S + col1] = (y0 + y1 + y2 + y3) * rs_s;
-            }
-        }
-    }
-    {
-        float* sb = state + (size_t) head * S;
-        uint32_t voff = (uint32_t) ((g * 32) * HV * S);
-        asm volatile("" : "+v"(voff));
-#pragma unroll
-        for (int r = 0; r < 32; ++r) { sb[(size_t) r * HV * S + voff + col0] = s0[r]; sb[(size_t) r * HV * S + voff + col1] = s1[r]; }
-    }
-}
-
-// gdn_out_norm_kernel's body over a grid-stride walk of the (token, head) rows: the old kernel launched a 128-thread
-// block per row (T * 48 blocks; ~45 GB/s on the 8060S).  The same code per row (the same compiled arithmetic: a wave
-// per row with four values per lane rounded differently in its first xor step).
-template <bool WY>
-__global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
-                                                              float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
-                                                              int64_t rows, int64_t ld16) {
-    __shared__ float wsum[4];
-    const int col = threadIdx.x;
-    for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
-        const size_t at = (size_t) row * S + col;
-        const float oc = y[at];
-        // (warp_sum as the compiler built it: the first xor step adds the partner's rounded square to an unrounded own
-        // one, an fma; spelled out so neither instance's contraction can differ)
-        float sp = __fmaf_rn(oc, oc, __shfl_xor_sync(0xffffffffu, __fmul_rn(oc, oc), 16));
-#pragma unroll
-        for (int o = 8; o > 0; o >>= 1) sp = __fadd_rn(sp, __shfl_xor_sync(0xffffffffu, sp, o));
-        __syncthreads();                               // the previous row's sums are read
-        if ((col & 31) == 0) wsum[col >> 5] = sp;
-        __syncthreads();
-        const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-        const float bp = oc * rsqrtf(ss / (float) S + eps) * gamma[col], sg = sigm(z[at]);
-        const size_t o16 = (size_t) (row / HV) * ld16 + (size_t) (row % HV) * S + col;
-        if constexpr (WY) {
-            const float v = bp * sg;
-            y[at] = v;
-            y16[o16] = hf(v);
-        } else {
-            // STRATA_GDN_NOY=1: nothing reads the FP32 result (403 MB per 16K chunk).  The FP16 value is what the
-            // compiler makes of hf(v) next to the store: v_fma_mixlo_f16, the product rounded to FP16 once
-            unsigned r;
-            asm("v_fma_mixlo_f16 %0, %1, %2, 0" : "=v"(r) : "v"(sg), "v"(bp));
-            y16[o16] = (uint16_t) r;
-        }
-    }
-}
-// STRATA_GDN_CHUNKED=1 on the gfx11 matrix cores: the recurrence in chunks of 16 tokens (the WY form of the CUDA
-// chunked path above), FP16 operands and FP32 accumulation, the output norm fused.  Per value head, gamma_t the
-// gate's sum from the chunk's start to t (inclusive; the code's sg) and S0 the state before the chunk:
-//   A[t][i] = beta_t exp(gamma_t - gamma_i) k_t.k_i (i < t),  T = (I + A)^-1,  P[t][i] = exp(gamma_t - gamma_i) q_t.k_i (i <= t),
-//   Y = beta (V - exp(gamma) K S0),  D = T Y,  o = exp(gamma) Q S0 + P D,
-//   S = exp(gamma_last) S0 + K^T (exp(gamma_last - gamma) D).
-// gdn_wmma_prep_kernel computes T and P of every chunk at once (they do not depend on the state); gdn_wmma_scan_kernel
-// walks the chunks, a block per value head and a wave per 16 value columns, the state in the waves' WMMA accumulators
-// (FP32), each product a 16 x 16 x 16 WMMA: k, q, T, P, D and the state as an operand are rounded to FP16 (relative
-// 2^-11), so the output differs from the FP32 kernels by more than their rounding (tests/hip/gdn_chunked.cpp holds it
-// to the bounds of its Error::ok).  The norm and the z gate run in the scan.
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
-#define STRATA_GDN_WMMA 1   // device pass with the gfx11 WMMA intrinsic (the list of gfx_arch_is_gfx11_wmma)
-#endif
-constexpr int GW_CK = 16;          // tokens per chunk (a WMMA tile)
-constexpr int GW_NW = S / 16;      // the scan's waves per block: one per 16 value columns
-constexpr int GW_VPK = HV / HK;    // value heads per key head: the prep's waves per block
-constexpr int GW_KP = S + 8;       // the scan's padded FP16 k / q rows
-constexpr int GW_AHEAD = 3;        // the scan warms the cache this many chunks ahead
-constexpr int64_t kGdnWmmaMin = 64;   // STRATA_GDN_CHUNKED=1 takes prompt chunks of this many tokens and more
-typedef _Float16 gw_h16 __attribute__((ext_vector_type(16)));
-typedef _Float16 gw_h8 __attribute__((ext_vector_type(8)));
-typedef _Float16 gw_h2 __attribute__((ext_vector_type(2)));
-typedef float gw_f8 __attribute__((ext_vector_type(8)));
-typedef float gw_f4 __attribute__((ext_vector_type(4)));   // (HIP's float4 copies through memcpy, which kept a staged
-                                                           // copy in scratch: a store that waits for the load)
-__device__ __forceinline__ gw_f8 gw_mma(gw_h16 a, gw_h16 b, gw_f8 c) {
-#if defined(STRATA_GDN_WMMA)
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
-#else
-    (void) a; (void) b; (void) c;
-    __builtin_trap();   // not a gfx11 device pass: the runtime gate never launches it
-#endif
-}
-// An accumulator tile (lane l: rows 2v + (l >> 4) for v = 0..7, column l & 15) as a B operand (lane l: column l & 15,
-// rows 0..15, both halves of the wave alike): pairs of rows rounded to FP16 and packed, the other half's pairs fetched
-// across (permlanex16), then interleaved by a byte permute whose selector depends on the lane's half (gw_sel).
-struct GwSel { unsigned even, odd; };
-__device__ __forceinline__ GwSel gw_sel(int hi) { return hi ? GwSel{0x01000504u, 0x03020706u} : GwSel{0x05040100u, 0x07060302u}; }
-__device__ __forceinline__ gw_h16 gw_acc_to_b(gw_f8 x, GwSel ps) {
-    unsigned wd[8];
-#pragma unroll
-    for (int m = 0; m < 4; ++m) {
-        const gw_h2 p = {(_Float16) x[2 * m], (_Float16) x[2 * m + 1]};
-        const unsigned own = __builtin_bit_cast(unsigned, p);
-#if defined(STRATA_GDN_WMMA)
-        const unsigned other = __builtin_amdgcn_permlanex16(own, own, 0x76543210u, 0xfedcba98u, false, false);
-#else
-        const unsigned other = own;
-#endif
-        wd[2 * m] = __builtin_amdgcn_perm(other, own, ps.even);
-        wd[2 * m + 1] = __builtin_amdgcn_perm(other, own, ps.odd);
-    }
-    return __builtin_bit_cast(gw_h16, wd);
-}
-__device__ __forceinline__ gw_h16 gw_ld(const _Float16* p) {   // 32 bytes of LDS, 16-byte aligned
-    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
-    const uint4 ab[2] = {a, b};
-    return __builtin_bit_cast(gw_h16, ab);
-}
-// The wave's own LDS writes complete (read back across its lanes).  A gfx11 instruction: gfx12 device passes never run these kernels.
-__device__ __forceinline__ void gw_lds_wait() {
-#if defined(STRATA_GDN_WMMA)
-    __asm__ volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-#endif
-}
-// A barrier over LDS only.  __syncthreads() is a workgroup fence over all memory, which on gfx11 also waits for every
-// global load in flight: the scan's loads of the next chunk would have to land before each barrier.
-__device__ __forceinline__ void gw_lds_barrier() {
-#if defined(STRATA_GDN_WMMA)
-    __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
-#else
-    __syncthreads();   // the gfx11-only instruction must not reach a gfx12 device pass
-#endif
-}
-
-// A block per (key head, chunk) - the grid's x the key head, so the blocks in flight read the same token rows (blocks
-// that walked the key heads' slices of far-apart rows took 14 ms against 2.2 ms for 16K tokens on gfx1151) - and a wave per value head of the key head.
-// T then P, FP16 row-major (1 KB), at tp[(chunk * HV + value head) * 512].
-__global__ void __launch_bounds__(32 * GW_VPK) gdn_wmma_prep_kernel(const float* __restrict__ h, const float* __restrict__ gate,
-                                                                 const float* __restrict__ beta, _Float16* __restrict__ tp,
-                                                                 int64_t T) {
-    __shared__ float sa[GW_VPK][GW_CK * GW_CK], sg[GW_VPK][GW_CK], sb[GW_VPK][GW_CK];
-    const int qh = blockIdx.x, ch = blockIdx.y, w = threadIdx.x >> 5, l = threadIdx.x & 31, c = l & 15, hi = l >> 4;
-    const int vh = qh + w * HK;
-    const int64_t t0 = (int64_t) ch * GW_CK;
-    gw_f8 kk = {}, qk = {};   // k_t.k_i and q_t.k_i (lane: column i = c, rows t = 2v + hi)
-    {
-        const bool ok = t0 + c < T;   // past the end: zero rows
-        const float* ht = h + (ok ? t0 + c : 0) * C;
-#pragma unroll
-        for (int j = 0; j < S / 16; ++j) {
-            gw_h16 ka, qa;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const gw_f4 k4 = *reinterpret_cast<const gw_f4*>(ht + HK * S + qh * S + 16 * j + 4 * i);
-                const gw_f4 q4 = *reinterpret_cast<const gw_f4*>(ht + qh * S + 16 * j + 4 * i);
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    ka[4 * i + e] = (_Float16) (ok ? k4[e] : 0.0f);
-                    qa[4 * i + e] = (_Float16) (ok ? q4[e] : 0.0f);
-                }
-            }
-            kk = gw_mma(ka, ka, kk);   // B = K^T: lane i holds column i of K^T, row i of K - the A operand itself
-            qk = gw_mma(qa, ka, qk);
-        }
-    }
-    if (l < GW_CK) {   // past the end: gate 0, beta 0
-        const bool ok = t0 + l < T;
-        float g = ok ? gate[(t0 + l) * HV + vh] : 0.0f;
-#pragma unroll
-        for (int o = 1; o < GW_CK; o <<= 1) {
-            const float u = __shfl_up(g, o, GW_CK);
-            if (l >= o) g += u;
-        }
-        sg[w][l] = g;
-        sb[w][l] = ok ? beta[(t0 + l) * HV + vh] : 0.0f;
-    }
-    gw_lds_wait();   // the wave's own LDS writes, read across its lanes
-    _Float16* out = tp + ((int64_t) ch * HV + vh) * (2 * GW_CK * GW_CK);
-#pragma unroll
-    for (int v = 0; v < 8; ++v) {
-        const int t = 2 * v + hi;
-        sa[w][t * GW_CK + c] = c < t ? sb[w][t] * __expf(sg[w][t] - sg[w][c]) * kk[v] : 0.0f;
-        out[GW_CK * GW_CK + t * GW_CK + c] = (_Float16) (c <= t ? __expf(sg[w][t] - sg[w][c]) * qk[v] : 0.0f);
-    }
-    gw_lds_wait();
-    if (l < GW_CK) {   // lane c: column c of T = (I + A)^-1 by forward substitution
-        float tc[GW_CK];
-#pragma unroll
-        for (int t = 0; t < GW_CK; ++t) {
-            float v = t == c ? 1.0f : 0.0f;
-#pragma unroll
-            for (int k = 0; k < t; ++k) v = fmaf(-sa[w][t * GW_CK + k], tc[k], v);
-            tc[t] = v;
-            out[t * GW_CK + c] = (_Float16) v;
-        }
-    }
-}
-
-// A thread's slice of a chunk in the scan (token threadIdx / 16, columns (threadIdx % 16) * 8 .. + 7): k, q and v,
-// loaded a chunk ahead, and one word of the chunk's T and P; lanes 0..15 of wave 0 also gate and beta of token l.
-// Rows past the end read the last row (finite: their gate and beta become 0 at staging, which keeps them out of the
-// state, of the real rows' products and of the output) - no select on the loaded values, which would wait for them.
-struct GwChunk {
-    gw_f4 k0, k1, q0, q1, v0, v1;
-    float g, b;
-    unsigned tp;
-};
-__device__ __forceinline__ void gw_load(GwChunk& in, const float* __restrict__ h, const float* __restrict__ gate,
-                                        const float* __restrict__ beta, const unsigned* __restrict__ tp, int64_t t0,
-                                        int64_t T, int vh, int qh) {
-    const int t = threadIdx.x >> 4, r = (threadIdx.x & 15) * 8;
-    const float* ht = h + std::min<int64_t>(t0 + t, T - 1) * C;
-    in.tp = tp[((t0 / GW_CK) * HV + vh) * (GW_CK * GW_CK) + threadIdx.x];
-    in.k0 = *reinterpret_cast<const gw_f4*>(ht + HK * S + qh * S + r);
-    in.k1 = *reinterpret_cast<const gw_f4*>(ht + HK * S + qh * S + r + 4);
-    in.q0 = *reinterpret_cast<const gw_f4*>(ht + qh * S + r);
-    in.q1 = *reinterpret_cast<const gw_f4*>(ht + qh * S + r + 4);
-    in.v0 = *reinterpret_cast<const gw_f4*>(ht + 2 * HK * S + vh * S + r);
-    in.v1 = *reinterpret_cast<const gw_f4*>(ht + 2 * HK * S + vh * S + r + 4);
-    if (threadIdx.x < GW_CK) {
-        const int64_t tl = std::min<int64_t>(t0 + threadIdx.x, T - 1);
-        in.g = gate[tl * HV + vh];
-        in.b = beta[tl * HV + vh];
-    }
-}
-// Brings a later chunk's lines (this block's k, q, v and z rows: 256 lines of 128 bytes, one a thread) into the cache
-// with a load whose result is not used, so the real loads of that chunk hit the cache.  An ordinary load: the compiler
-// tracks it, and the result is consumed (by an empty asm) one chunk later, after the store of the previous chunk's output
-// rows, where the wait for the loads issued before that point also covers it.
-__device__ __forceinline__ unsigned gw_touch(const float* __restrict__ h, const float* __restrict__ z, int64_t t0,
-                                             int64_t T, int vh, int qh) {
-    const int t = threadIdx.x >> 4, part = threadIdx.x & 15, kind = part >> 2;
-    if (t0 + t >= T) return 0u;
-    const float* p = kind == 0 ? h + (t0 + t) * C + HK * S + qh * S
-                   : kind == 1 ? h + (t0 + t) * C + qh * S
-                   : kind == 2 ? h + (t0 + t) * C + 2 * HK * S + vh * S
-                               : z + (t0 + t) * HV * S + vh * S;
-    return __float_as_uint(p[32 * (part & 3)]);
-}
-// Per chunk: stage it (k / q FP16, k also transposed, v, the gate's running sum, beta, T and P); barrier (1); store
-// the previous chunk's output rows (the z gate on its normed output, 16 bytes a thread); X = K S0, QS = Q S0; Y, D,
-// o and the wave's sums of o^2; the state update; barrier (2); the norm.  LDS is single-buffered: an array written in
-// the staging of chunk c + 1 or after its barrier (2) was last read before that wave reached barrier (1) of c + 1.
-__global__ void __launch_bounds__(GW_NW * 32) gdn_wmma_scan_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                                   const float* __restrict__ gate, const float* __restrict__ beta,
-                                                                   const float* __restrict__ z, const float* __restrict__ gamma,
-                                                                   const unsigned* __restrict__ tp, float eps,
-                                                                   uint16_t* __restrict__ y16, int64_t T, int64_t ld16) {
-    __shared__ __attribute__((aligned(16))) _Float16 sk[GW_CK * GW_KP], sq[GW_CK * GW_KP], skt[S * GW_CK],
-        stp[2 * GW_CK * GW_CK];
-    __shared__ __attribute__((aligned(16))) float sv[GW_CK * S], so[GW_CK * S], sn[GW_CK * GW_NW];
-    __shared__ float sg[GW_CK], sb[GW_CK], sgam[S];
-    const _Float16 *st_ = stp, *sp_ = stp + GW_CK * GW_CK;   // T, P
-    const int vh = blockIdx.x, qh = vh % HK, w = threadIdx.x >> 5, l = threadIdx.x & 31, c = l & 15, hi = l >> 4;
-    const int col = 16 * w + c;                                       // this lane's column in the products
-    const int st = threadIdx.x >> 4, sr = (threadIdx.x & 15) * 8;    // this thread's staging slice
-    const size_t rs = (size_t) HV * S;
-    const GwSel ps = gw_sel(hi);
-    gw_f8 s[S / 16];   // the state: rows 16j + 2v + hi, column col
-#pragma unroll
-    for (int j = 0; j < S / 16; ++j)
-#pragma unroll
-        for (int v = 0; v < 8; ++v) s[j][v] = state[(size_t) (16 * j + 2 * v + hi) * rs + (size_t) vh * S + col];
-    if (threadIdx.x < S) sgam[threadIdx.x] = gamma[threadIdx.x];
-    const float out_scale = rsqrtf((float) S);
-    GwChunk cur;
-    gw_load(cur, h, gate, beta, tp, 0, T, vh, qh);
-    unsigned touched = 0;
-    gw_f4 z0 = {}, z1 = {};   // the z slice of the chunk whose output rows are stored next
-    auto store_rows = [&](int64_t c0) {   // the output rows of the chunk at c0 (its norm in so): z gate, FP16
-        if (c0 + st >= T) return;
-        const float* o = &so[st * S + sr];
-        gw_h8 r;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) r[i] = (_Float16) (o[i] * sigm(i < 4 ? z0[i] : z1[i - 4]));
-        *reinterpret_cast<uint4*>(y16 + (c0 + st) * ld16 + vh * S + sr) = __builtin_bit_cast(uint4, r);
-    };
-    for (int64_t t0 = 0; t0 < T; t0 += GW_CK) {
-        {   // stage this chunk
-            gw_h8 kh, qq;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                kh[i] = (_Float16) (i < 4 ? cur.k0[i] : cur.k1[i - 4]);
-                qq[i] = (_Float16) (i < 4 ? cur.q0[i] : cur.q1[i - 4]);
-                skt[(sr + i) * GW_CK + st] = kh[i];
-            }
-            *reinterpret_cast<uint4*>(&sk[st * GW_KP + sr]) = __builtin_bit_cast(uint4, kh);
-            *reinterpret_cast<uint4*>(&sq[st * GW_KP + sr]) = __builtin_bit_cast(uint4, qq);
-            *reinterpret_cast<gw_f4*>(&sv[st * S + sr]) = cur.v0;
-            *reinterpret_cast<gw_f4*>(&sv[st * S + sr + 4]) = cur.v1;
-            reinterpret_cast<unsigned*>(stp)[threadIdx.x] = cur.tp;
-            if (threadIdx.x < GW_CK) {   // past the end: gate 0, beta 0
-                const bool ok = t0 + l < T;
-                float g = ok ? cur.g : 0.0f;
-#pragma unroll
-                for (int o = 1; o < GW_CK; o <<= 1) {
-                    const float u = __shfl_up(g, o, GW_CK);
-                    if (l >= o) g += u;
-                }
-                sg[l] = g;
-                sb[l] = ok ? cur.b : 0.0f;
-            }
-        }
-        if (t0 + GW_CK < T) gw_load(cur, h, gate, beta, tp, t0 + GW_CK, T, vh, qh);   // lands during this chunk
-        const unsigned touch_now = gw_touch(h, z, t0 + GW_AHEAD * GW_CK, T, vh, qh);
-        gw_lds_barrier();   // (1) this chunk staged; the previous chunk's norm in so
-        if (t0 > 0) store_rows(t0 - GW_CK);
-        __asm__ volatile("" ::"v"(touched));   // the previous touch, consumed here
-        touched = touch_now;
-        {   // this chunk's z slice, for its output rows after barrier (1) of the next chunk
-            const int64_t tz = std::min<int64_t>(t0 + st, T - 1);
-            z0 = *reinterpret_cast<const gw_f4*>(z + tz * HV * S + vh * S + sr);
-            z1 = *reinterpret_cast<const gw_f4*>(z + tz * HV * S + vh * S + sr + 4);
-        }
-        gw_f8 x = {}, qs = {};   // K S0 and Q S0, this wave's columns
-#pragma unroll
-        for (int j = 0; j < S / 16; ++j) {
-            const gw_h16 b = gw_acc_to_b(s[j], ps);
-            x = gw_mma(gw_ld(sk + c * GW_KP + 16 * j), b, x);
-            qs = gw_mma(gw_ld(sq + c * GW_KP + 16 * j), b, qs);
-        }
-        gw_f8 y;
-#pragma unroll
-        for (int v = 0; v < 8; ++v) {
-            const int t = 2 * v + hi;
-            y[v] = sb[t] * (sv[t * S + col] - __expf(sg[t]) * x[v]);
-        }
-        const gw_f8 d = gw_mma(gw_ld(st_ + c * GW_CK), gw_acc_to_b(y, ps), gw_f8{});
-        gw_f8 o;
-#pragma unroll
-        for (int v = 0; v < 8; ++v) o[v] = __expf(sg[2 * v + hi]) * qs[v];
-        o = gw_mma(gw_ld(sp_ + c * GW_CK), gw_acc_to_b(d, ps), o);
-#pragma unroll
-        for (int v = 0; v < 8; ++v) {   // the wave's 16 columns of o^2 per token, then the 8 waves' through LDS
-            o[v] *= out_scale;
-            float p = o[v] * o[v];
-#pragma unroll
-            for (int m = 1; m < 16; m <<= 1) p += __shfl_xor(p, m);
-            if (c == 0) sn[(2 * v + hi) * GW_NW + w] = p;
-        }
-        const float gl = sg[GW_CK - 1];
-        gw_f8 dd;
-#pragma unroll
-        for (int v = 0; v < 8; ++v) dd[v] = __expf(gl - sg[2 * v + hi]) * d[v];
-        const gw_h16 db = gw_acc_to_b(dd, ps);
-        const float eg = __expf(gl);
-#pragma unroll
-        for (int j = 0; j < S / 16; ++j) s[j] = gw_mma(gw_ld(skt + (16 * j + c) * GW_CK), db, s[j] * eg);
-        gw_lds_barrier();   // (2) the sums of o^2
-        const float g_col = sgam[col];
-#pragma unroll
-        for (int v = 0; v < 8; ++v) {
-            const int t = 2 * v + hi;
-            const gw_f4 n0 = *reinterpret_cast<const gw_f4*>(&sn[t * GW_NW]), n1 = *reinterpret_cast<const gw_f4*>(&sn[t * GW_NW + 4]);
-            const float ss = n0[0] + n0[1] + n0[2] + n0[3] + n1[0] + n1[1] + n1[2] + n1[3];
-            so[t * S + col] = o[v] * rsqrtf(ss * (1.0f / S) + eps) * g_col;
-        }
-    }
-    __asm__ volatile("" ::"v"(touched));
-    gw_lds_barrier();
-    store_rows((T - 1) / GW_CK * GW_CK);
-    __asm__ volatile("" : "+s"(state));   // the state's addresses recomputed here, not kept (spilled) since the start
-#pragma unroll
-    for (int j = 0; j < S / 16; ++j)
-#pragma unroll
-        for (int v = 0; v < 8; ++v) state[(size_t) (16 * j + 2 * v + hi) * rs + (size_t) vh * S + col] = s[j][v];
-}
-// The opt-in chunked recurrence on gfx11 (STRATA_GDN_CHUNKED=1): false (nothing launched) on another part.  y, the
-// FP32 scratch of the other kernels (T x 6144 floats), holds T and P (1 KB per chunk and value head: T x 3 KB).
-bool gdn_rec_wmma(float* state, const float* h, const float* gate, const float* beta, const float* z, const float* gamma,
-                  float eps, float* y, uint16_t* y16, int64_t T, cudaStream_t s, int64_t ld16) {
-    if (T < kGdnWmmaMin || ld16 % 8 != 0) return false;   // the rows are stored 16 bytes at a time
-    // A layer-split worker can change devices: a process-wide answer for the first card can launch a trapping
-    // gfx11 kernel on a later gfx12 card.  Cache only the current thread's last device, as properties are not cheap.
-    static thread_local int last_device = -1;
-    static thread_local bool gfx11 = false;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return false;
-    if (dev != last_device) {
-        cudaDeviceProp p{};
-        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
-        gfx11 = strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
-        last_device = dev;
-    }
-    if (!gfx11) return false;
-    const int64_t nch = (T + GW_CK - 1) / GW_CK;
-    _Float16* tp = reinterpret_cast<_Float16*>(y);
-    gdn_wmma_prep_kernel<<<dim3(HK, (unsigned) nch), 32 * GW_VPK, 0, s>>>(h, gate, beta, tp, T);
-    gdn_wmma_scan_kernel<<<HV, GW_NW * 32, 0, s>>>(state, h, gate, beta, z, gamma, reinterpret_cast<const unsigned*>(tp),
-                                                   eps, y16, T, ld16);
-    return true;
-}
-#endif   // __HIPCC__
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                          float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
                                                          int64_t ld16) {
@@ -2082,11 +1296,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
 }
 __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
-#if defined(__HIPCC__)
-        y[i] = hf_sat(x[i]);   // saturated and counted like every other FP16 image (the hc / embedding image on gfx103x)
-#else
         y[i] = hf(x[i]);       // CUDA: as it was
-#endif
 }
 __global__ void round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
@@ -2101,78 +1311,6 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
     }
 }
 
-// S23 (opt-in STRATA_HC_UPMIX=1, gfx11): the hyper-connection read's up projection with gr_mix_r as its epilogue.  The
-// up GEMM's FP32 output `gated` (T x 10240: 671 MB per 16K chunk) is never written or read back: a block computes a
-// tile of 64 tokens x 64 columns for all 4 streams on the matrix cores (BF16 in, FP32 accumulate over K = 320; the
-// lo16 and w_up tiles staged in LDS), and each lane already holds the 4 streams' values of its (token, column) - the
-// mix (x_c = R * rs * w, sum of x_c * sigmoid(gated_c), / 4) runs in registers, in gr_mix_r_kernel's order.  The
-// GEMM sums K in another order than hipBLASLt: rounding-level, hence opt-in and quality-gated.
-#if defined(__HIPCC__)
-typedef __bf16 um_b16 __attribute__((ext_vector_type(16)));
-typedef float um_f8 __attribute__((ext_vector_type(8)));
-__device__ __forceinline__ um_f8 um_wmma(um_b16 a, um_b16 b, um_f8 c) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
-#else
-    (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
-#endif
-}
-constexpr int UM_T = 128, UM_D = 16, UM_LD = LR + 8;   // a block: 128 tokens x 16 columns x the 4 streams
-__device__ __forceinline__ um_b16 um_frag(const uint16_t* p) {   // 16 BF16 (32 bytes, 16-byte aligned)
-    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
-    const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-    return __builtin_bit_cast(um_b16, w);
-}
-// The block's w_up rows (16 columns x 4 streams x all 320 k) are staged in LDS once; each wave streams its own 16
-// tokens' lo16 rows from global memory (every A fragment feeds the 4 streams' WMMAs) - one barrier per block.
-__global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restrict__ lo16, const uint16_t* __restrict__ wu,
-                                                       const float* __restrict__ R, const float* __restrict__ rs,
-                                                       const float* __restrict__ w, float* __restrict__ mixed,
-                                                       uint16_t* __restrict__ mixed16, uint16_t* __restrict__ mixed_h,
-                                                       int64_t T) {
-    __shared__ __align__(16) uint16_t sB[HC * UM_D][UM_LD];
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
-    // blocks ordered column-tile fastest: the blocks in flight share a token tile, so the epilogue's R reads run
-    // along rows (token-tile fastest scattered them over 512 rows x 40 KB per block: 28 ms instead of 3.7 at 8K)
-    const int64_t t0 = (int64_t) blockIdx.y * UM_T + 16 * wave;
-    const int d0 = blockIdx.x * UM_D;
-    for (int i = tid; i < HC * UM_D * (LR / 8); i += 256) {
-        const int rr = i / (LR / 8), q = i % (LR / 8);
-        const int c = rr / UM_D, dd = rr % UM_D;
-        *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = *reinterpret_cast<const uint4*>(wu + (size_t) (c * N + d0 + dd) * LR + 8 * q);
-    }
-    __syncthreads();
-    if (t0 >= T) return;
-    const int64_t ta = t0 + l16 < T ? t0 + l16 : T - 1;
-    const uint16_t* arow = lo16 + ta * LR;
-    um_f8 acc[HC];
-#pragma unroll
-    for (int c = 0; c < HC; ++c) acc[c] = um_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-    for (int ks = 0; ks < LR; ks += 16) {
-        const um_b16 a = um_frag(arow + ks);
-#pragma unroll
-        for (int c = 0; c < HC; ++c) acc[c] = um_wmma(a, um_frag(&sB[c * UM_D + l16][ks]), acc[c]);
-    }
-    const int d = d0 + l16;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int64_t t = t0 + 2 * i + hi;
-        if (t >= T) continue;
-        float s = 0.0f;
-#pragma unroll
-        for (int c = 0; c < HC; ++c) {
-            const float x = R[t * D + c * N + d] * rs[t * HC + c] * w[c * N + d];   // gr_mix_r_kernel's order
-            s = fmaf(x, sigm(acc[c][i]), s);
-        }
-        s /= (float) HC;
-        mixed[t * N + d] = s;
-        if (mixed16) mixed16[t * N + d] = act16(s);
-        if (mixed_h) mixed_h[t * N + d] = hf(s);
-    }
-}
-#endif
-#if !defined(__HIPCC__)
 // S23 on CUDA (sm_80+; opt-in STRATA_HC_UPMIX=1, see hc_upmix in prefill.cpp): the hyper-connection read's up
 // projection (lo16 x w_up^T, BF16 in, FP32 accumulate over K = 320) with gr_mix_r as its epilogue, so `gated`
 // (T x 10240 FP32, 336 MB for an 8,192-token chunk) is neither written by the GEMM nor read back by the mix - gr_mix_r
@@ -2184,7 +1322,6 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
 // summing K in the same order (CUDA 13.3 on an RTX 5090 from 33 tokens: gr_upmix_parity) `mixed` is the default pair's
 // bits.
 constexpr int UC_BM = 128, UC_BD = 32;   // tokens, columns a stream
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800   // cp.async, bf16 mma: the kernel is empty before sm_80
 constexpr int UC_KC = 32, UC_LD = UC_KC + 8;   // k a slice, a staged row
 __device__ __forceinline__ void uc_pf_l2(const float* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 __device__ __forceinline__ void uc_cp16(void* s, const void* g) {
@@ -2201,7 +1338,6 @@ __device__ __forceinline__ void uc_mma(float (&d)[4], const unsigned (&a)[4], un
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
-#endif
 __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* __restrict__ lo16,
                                                               const uint16_t* __restrict__ wu,
                                                               const float* __restrict__ R, const float* __restrict__ rs,
@@ -2303,7 +1439,6 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
         }
 #endif
 }
-#endif
 }  // namespace
 
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
@@ -2316,43 +1451,15 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
     check("kv_append");
 }
 void set_act_f16(bool on) {
-#if !defined(__HIPCC__)
     (void) on;   // CUDA: the activation image is always BF16
     return;
-#else
-    const int v = on ? 1 : 0;
-    if (cudaMemcpyToSymbol(g_act_f16, &v, sizeof v) != cudaSuccess) {
-        std::fprintf(stderr, "prefill: setting the FP16 activation image failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-        std::exit(1);
-    }
-#endif
 }
 void set_f16_range(bool on) {
-#if defined(__HIPCC__)
-    const int v = on ? 1 : 0;
-    if (cudaMemcpyToSymbol(g_f16_range_on, &v, sizeof v) != cudaSuccess) {
-        std::fprintf(stderr, "prefill: setting the FP16 range check failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-        std::exit(1);
-    }
-#else
     (void) on;
-#endif
 }
 bool f16_range_read(float& max_abs, unsigned long long& over, bool reset) {
-#if !defined(__HIPCC__)
     (void) max_abs; (void) over; (void) reset;
     return false;
-#else
-    unsigned bits = 0; unsigned long long o = 0;
-    if (cudaMemcpyFromSymbol(&bits, g_f16_range_max, sizeof bits) != cudaSuccess ||
-        cudaMemcpyFromSymbol(&o, g_f16_range_over, sizeof o) != cudaSuccess) { cudaGetLastError(); return false; }
-    union { unsigned u; float f; } c; c.u = bits; max_abs = c.f; over = o;
-    if (reset) {
-        const unsigned z = 0; const unsigned long long zz = 0;
-        cudaMemcpyToSymbol(g_f16_range_max, &z, sizeof z); cudaMemcpyToSymbol(g_f16_range_over, &zz, sizeof zz);
-    }
-    return true;
-#endif
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -2389,19 +1496,6 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
-#if defined(__HIPCC__)
-    static const bool gfx11 = [] {
-        int dev = 0;
-        cudaDeviceProp p;
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
-        return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
-    }();
-    if (!gfx11 || T <= 0) return false;
-    gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 256, 0, (cudaStream_t) stream>>>(
-        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
-    check("gr_upmix");
-    return true;
-#else
     static int ok_dev[64] = {};   // per device: 0 not asked yet, 1 sm_80+, 2 no
     int dev = 0;
     if (T <= 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -2416,7 +1510,6 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
         lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
     check("gr_upmix");
     return true;
-#endif
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
@@ -2478,63 +1571,11 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                             void* stream, int64_t ld16) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
-#if defined(__HIPCC__)
-    if (variant == 0 || variant == 1) {
-        // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on the gfx11 matrix cores, FP16 operands (other bits;
-        // a shorter chunk or another part takes the kernels below)
-        static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
-        if (chunked && !serial && gdn_rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, (cudaStream_t) stream, ld16)) {
-            check("gdn_recurrence (chunked, WMMA)");
-            return;
-        }
-    }
-    if (variant == 3) {   // diagnostics: the quad recurrence + the old norm kernel
-        if (T > 0) {
-            gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
-        }
-        return;
-    }
-    if (variant == 4 || variant == 5) {   // diagnostics: the quad recurrence's PP / two-column kernels + the norm
-        if (T > 0) {
-            if (variant == 5)
-                gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            else
-                gdn_rec_quad_pp_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
-                z, gamma, eps, y, y16, T * HV, ld16);
-        }
-        check("gdn_recurrence (quad pp)");
-        return;
-    }
-    if (variant == 1) {
-        if (T > 0) {
-            static const int pp = [] { const char* v = std::getenv("STRATA_GDN_PP"); return v ? std::atoi(v) : 0; }();
-            if (pp == 2)
-                gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            else if (pp)
-                gdn_rec_quad_pp_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            else
-                gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
-            if (noy)
-                gdn_out_norm_loop_kernel<false><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
-                    z, gamma, eps, y, y16, T * HV, ld16);
-            else
-                gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
-                    z, gamma, eps, y, y16, T * HV, ld16);
-        }
-        check("gdn_recurrence (quad)");
-        return;
-    }
-#else
     (void) variant;   // the quad recurrence kernels are AMD-only
-#endif
     if (serial || T <= 0 || variant == 2) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
-#if !defined(__HIPCC__)
         // STRATA_GDN_CHUNKED=1 (opt-in): the recurrence in chunks for prompt chunks of kGdnChunkedMin+ tokens (other
         // bits; a shorter chunk, a card it does not fit or a failed scratch allocation takes the kernels below)
         static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
@@ -2542,7 +1583,6 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
         } else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
-#endif
         if (pipe)   // the software-pipelined loads (same bits)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
@@ -2553,7 +1593,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16) {
-    // Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp);
+    // Aurora (S23): four lanes per column + the grid-stride norm, the same bits;
     // STRATA_GDN_HEAD=1 (on by default on gfx1151; off with STRATA_GDN_HEAD=0 or STRATA_GDN_REC_HEADS) takes them
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();

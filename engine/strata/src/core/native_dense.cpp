@@ -51,20 +51,7 @@ bool hc_q8_env() {
         const char* v = std::getenv("STRATA_HC_Q8");
         if (v != nullptr && v[0] == '1') return true;
         if (v != nullptr && v[0] != '\0' && std::strcmp(v, "auto") != 0) return false;
-#if defined(STRATA_USE_HIP)
-        const char* d = std::getenv("STRATA_GFX12_DEFAULTS");
-        if (d != nullptr && d[0] == '0') return false;
-        int dev = 0;
-        cudaDeviceProp p;
-        const bool g12 = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-                         strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
-        (void) cudaGetLastError();
-        if (g12) std::fprintf(stderr, "strata: gfx12 (RDNA4): the hyper-connection projections are read as Q8_0 (quantized at load, "
-                                      "decode faster, answers differ slightly); STRATA_HC_Q8=0 keeps the bf16 read\n");
-        return g12;
-#else
         return false;
-#endif
     }();
     return on;
 }

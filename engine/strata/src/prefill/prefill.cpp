@@ -111,16 +111,6 @@ void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, 
 }  // namespace strata::prefill::fused
 #endif
 
-#if defined(STRATA_GPU_METAL)
-// The Metal backend reads a prompt through its decode window (metal/src/engine/window.cpp): init keeps the chunk, run
-// hands over, draft_kv declines (the MTP hook reads the window's rows itself).
-namespace strata::metal_engine {
-bool window_ensure(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, int64_t max_cells, std::string& err);
-bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
-                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
-}  // namespace strata::metal_engine
-#endif
-
 namespace strata::prefill {
 namespace {
 
@@ -160,11 +150,7 @@ inline bool stager_sleep() {
     static const bool v = [] {
         const char* e = std::getenv("STRATA_STAGER_SLEEP");
         if (e != nullptr && e[0] != '\0') return e[0] != '0';
-#if defined(_WIN32)
-        return false;
-#else
         return true;
-#endif
     }();
     return v;
 }
@@ -306,15 +292,6 @@ inline int ring_budget_slots() {
 }
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
-#if defined(STRATA_USE_HIP)
-    // S6: with the opt-in RDNA4 matrix-core attention (STRATA_HIP_WMMA=1) a 96-slot ring: measured with it, 9070 XT
-    // 4K prompts 718 -> 1,211 tok/s (16K 1,949 -> 2,032), R9700 4K 2,426 -> 2,483 (16K the same)
-    static const bool wmma = [] {
-        const char* e = std::getenv("STRATA_HIP_WMMA");
-        return e != nullptr && e[0] == '1';
-    }();
-    if (!v && g_ring_override <= 0 && wmma) return (int64_t) T >= stream_all_min() ? 96 : STAGE;
-#endif
     // the byte budget as this pack's slots: 1024 fused / 384 not on Q2_0, fewer on a pack with bigger blobs.  The
     // unpinned arm stays a slot count (96): it was measured where the host copies are the limit, and there the ring
     // is not what is competing for VRAM.
@@ -433,11 +410,7 @@ inline bool hc_upmix() {
 // CUDA: the fused read only on chunks of 33+ tokens - below that cuBLAS's up GEMM takes another kernel, rounding-level
 // apart, so short chunks keep the default pair
 inline int64_t hc_upmix_min_t() {
-#if defined(__HIPCC__)
-    return 0;
-#else
     return 33;
-#endif
 }
 inline bool bf16x2_hc(bool f16_io) { return bf16x2_mode(f16_io) == 1; }
 // S23 (opt-in STRATA_CVEC_FUSE=1): a steered layer's FFN write + control vector + the next half's norm in one pass
@@ -1235,12 +1208,6 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) {
     Impl& m = *impl_;
-#if defined(STRATA_GPU_METAL)
-    (void) wt; (void) src; (void) cache; (void) host_res; (void) stream; (void) borrow;
-    (void) borrow_bytes;
-    m.T = chunk > 0 ? chunk : 1;
-    return strata::metal_engine::window_ensure(g, ss, ss.qsa_states[ss.qsa_primary()].max_cells, err);
-#endif
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
@@ -1550,11 +1517,6 @@ int64_t Prefill::chunk() const { return impl_->T; }
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err, const char** why) {
     Impl& m = *impl_;
-#if defined(STRATA_GPU_METAL)
-    (void) m; (void) mtp; (void) R_rows; (void) next_tokens; (void) n; (void) cell0; (void) err;
-    if (why) *why = "the Metal window feeds the draft layer itself";
-    return false;
-#endif
     const core::OnDevice on_device(m.device);   // the stage's own GPU current (a layer split's drafter: the last stage)
     auto decline = [&](const char* reason) { if (why != nullptr) *why = reason; return false; };
     static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
@@ -2226,16 +2188,12 @@ int64_t Prefill::ring_max_slots() {
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
         g_share_default = true;
         std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks below 1024 tokens (the idle CPU "
                              "takes some of the experts the GPU would stream; answers can differ slightly from 0.1.40.3, "
                              "mean KL ~0.004). STRATA_PREFILL_CPU_SHARE=0 turns it off.\n");
     }
-#else
-    (void) by_default;
-#endif
     if (applies && cpu_share_on()) g_stream_min_share = cpu_share_max();
 }
 
@@ -3079,11 +3037,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
                     // first block is complete; past the chunk's last cell nothing is read until a later append writes
                     // it).  CUDA: never.
-#if defined(STRATA_USE_HIP)
-                    static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
-#else
                     constexpr bool kv_host_dma = false;
-#endif
                     const bool host_by_dma = staged && kv_host_dma;
                     const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
@@ -3232,7 +3186,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
                     // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question).
                     // STRATA_QSA_DUMP_LAYER=i: QSA layer i only; STRATA_QSA_DUMP_STEPS=1: each record then ends with the
-                    // T * kStepCount steps too (tests/cuda/pa_bench.cpp replays such a record)
+                    // T * kStepCount steps too
                     if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
                         static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
                                                           ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
@@ -4811,16 +4765,6 @@ bool Prefill::reserve_uploads(int64_t T) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
-#if defined(STRATA_GPU_METAL)
-    {
-        const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = strata::metal_engine::prompt_run(tokens, n, pos0, embd_rows, on_chunk, err);
-        stats_.tokens += n;
-        stats_.chunks += 1;
-        stats_.ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        return ok;
-    }
-#endif
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;

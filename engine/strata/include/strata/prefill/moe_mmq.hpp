@@ -137,8 +137,7 @@ void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
 void set_bounds(int32_t* dst, int32_t rows, void* stream);
 
 // ---- STRATA_MMQ_DIRECT: the prompt MMQ reads resident experts in place (docs/DETAILS.md, "STRATA_MMQ_DIRECT") ----
-/// This build has the pointer-table MMQ (CUDA, the build option STRATA_MMQ_TAB on - off by default - and the
-/// llama.cpp tree matched the mirrored scheduler's fingerprint).  false under HIP, gfx906, SYCL and builds without MMQ.
+/// This build has the pointer-table MMQ.  false under HIP, gfx906, SYCL and builds without MMQ.
 bool tab_built();
 /// `tab_built`, `fits`, rows a multiple of 128 (no fallback tiles) and a pointer-table instance for the type (the
 /// native packs' nine: Q2_0 IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS Q8_0; not Q5_0 or the K-quants).

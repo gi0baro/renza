@@ -4,9 +4,6 @@
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
-#if defined(STRATA_HIP_GFX906)
-#include "strata/kernels/gfx_arch.hpp"
-#endif
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -326,7 +323,6 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
                                                   part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
 }
 
-#if !defined(__HIPCC__)
 // Turing (INT8 pools): attn_chunk_kernel<1> bit for bit, rearranged for the SM's shared-memory pipe, which the
 // default kernel saturates (its time grew with the queries even with the SMs half empty).  Three changes, none to an
 // operand or the order of an operation:
@@ -449,7 +445,6 @@ bool attn_v3_on() {
     }
     return on[dev] > 0;
 }
-#endif
 
 // PR #540 (sskver): the same attention with fewer shuffles and less shared-memory traffic, bit for bit the kernel
 // above (same operands, same order); +7% prompt speed on a V100, where this kernel reads every prompt chunk.  It
@@ -462,21 +457,10 @@ bool attn_v3_on() {
 // no DPP it is the Daily's (be4cf1c) attn_chunk_kernel line for line - the same reduce12 scores, the same cell-major
 // probabilities and the same four-cell value fold - except that `spt` shares `sq`'s storage here (no arithmetic
 // change).  Without the variable nothing selects it on a card at or above sm_75.
-#if defined(STRATA_EXPERIMENTAL_SM60) || !defined(__HIPCC__) || !defined(STRATA_HIP_GFX906)
-#define STRATA_ATTN_PRE75_BUILT 1
-#endif
-#if defined(STRATA_ATTN_PRE75_BUILT)
 // A butterfly step's lane exchange, `M` = 1, 2, 4, 8 or 16.  DPP (HIP, wave32): in registers - DPP row_xmask within a
 // 16-lane row, v_permlanex16 across the two rows - instead of ds_bpermute; the same value moves, so every sum is
 // unchanged bit for bit.
 template <bool DPP, int M> __device__ __forceinline__ float shfl_x(float v) {
-#if defined(__HIPCC__)
-    if constexpr (DPP) {
-        const int x = __float_as_int(v);
-        if constexpr (M == 16) return __int_as_float(__builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false));
-        else return __int_as_float(__builtin_amdgcn_mov_dpp(x, 0x160 | M, 0xF, 0xF, false));   // row_xmask:M
-    }
-#endif
     return __shfl_xor_sync(0xffffffffu, v, M);
 }
 // warp_sum / warp_max with the same pairing order (xor 16, 8, 4, 2, 1)
@@ -693,7 +677,6 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
 #pragma unroll
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
-#endif  // STRATA_ATTN_PRE75_BUILT
 
 __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict__ part_acc,
                                                         const float* __restrict__ part_m,
@@ -800,51 +783,18 @@ __global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restri
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
-#if defined(STRATA_HIP_GFX906)
-// The compat backend can target other architectures. Check the calling thread's current device,
-// caching only its last ordinal so a layer split or another thread cannot reuse the wrong answer.
-bool query_swizzle_gfx906_device() {
-    static thread_local int cached_device = -1;
-    static thread_local bool cached_supported = false;
-    int device = -1;
-    if (hipGetDevice(&device) != hipSuccess || device < 0) {
-        cached_device = -1;
-        cached_supported = false;
-        (void) hipGetLastError();
-        return false;
-    }
-    if (device != cached_device) {
-        cached_device = -1;
-        cached_supported = false;
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
-            (void) hipGetLastError();
-            return false;
-        }
-        cached_supported = gfx_arch_is(prop.gcnArchName, "gfx906") && prop.warpSize == 64;
-        cached_device = device;
-    }
-    return cached_supported;
-}
-#endif
-
 // Fork (lab/upsync): STRATA_ATTN_DAILY=1 runs the Daily's (be4cf1c) decode attention on every CUDA card: the chunk
 // pass on PR #540's kernel (attn_chunk_kernel_pre75<M, 2, false>, the Daily's attn_chunk_kernel), bit for bit the
 // default kernel's partials.  CUDA only; unset or anything but "1" keeps upstream 0.1.42's kernels.
 // STRATA_ATTN_PRE75=0 still turns the chunk kernel off (A/B).
 [[maybe_unused]] bool daily_attn() {
-#if defined(__HIPCC__)
-    return false;
-#else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_ATTN_DAILY");
         return v != nullptr && v[0] == '1' && v[1] == '\0';
     }();
     return on;
-#endif
 }
 
-#if defined(STRATA_ATTN_PRE75_BUILT)
 // CUDA: the current device is below sm_75 (experimental build) or STRATA_ATTN_DAILY=1 (any card); HIP: it is gfx103x
 // (per device: a layer split can mix cards).
 // STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
@@ -854,47 +804,11 @@ bool pre75_attn() {
         return e == nullptr ? -1 : e[0] == '0' ? 0 : e[0] == '1' ? 1 : -1;
     }();
     if (env == 0) return false;
-#if !defined(__HIPCC__) && !defined(STRATA_EXPERIMENTAL_SM60)
     return daily_attn();   // the ready-made engine: upstream's attn_chunk_kernel unless STRATA_ATTN_DAILY=1
-#else
-#if !defined(__HIPCC__)
-    if (daily_attn()) return true;
-#endif
-    static int cc[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-#if defined(__HIPCC__)
-    if (cc[dev] == 0) {   // 2: gfx103x, 1: another card
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
-        cc[dev] = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 2 : 1;
-    }
-    return env == 1 || cc[dev] == 2;
-#else
-    if (cc[dev] == 0) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        cc[dev] = 10 * major + minor;
-    }
-    return cc[dev] < 75;
-#endif
-#endif  // ready-made CUDA engine
 }
 // `PRE` picks PR #540's kernel; the environment's choice is STRATA_ATTN_CHUNK.
-#if defined(__HIPCC__)
-#define STRATA_ATTN_CHUNK_SEL(M, PRE) ((PRE) ? attn_chunk_kernel_pre75<M, 8, true> : attn_chunk_kernel<M>)
-#else
 #define STRATA_ATTN_CHUNK_SEL(M, PRE) ((PRE) ? attn_chunk_kernel_pre75<M> : attn_chunk_kernel<M>)
-#endif
 #define STRATA_ATTN_CHUNK(M) STRATA_ATTN_CHUNK_SEL(M, pre75_attn())
-#else
-#define STRATA_ATTN_CHUNK_SEL(M, PRE) attn_chunk_kernel<M>
-#define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
-#endif
 
 // S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
 bool lane_cell_attn() {
@@ -944,25 +858,9 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-#if defined(STRATA_ATTN_PRE75_BUILT)
     const bool pre = kernel < 0 ? pre75_attn() : kernel == 1;
-#endif
     // S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
     const bool lane_cell = kernel < 0 && lane_cell_attn();
-#if defined(STRATA_HIP_GFX906)
-    static const bool query_swizzle = [] {
-        const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
-    }();
-    const bool use_query_swizzle = kernel < 0 && query_swizzle && !lane_cell && kv_mode == 1 &&
-                                   query_swizzle_gfx906_device();
-    static const bool query_swizzle_trace = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE_TRACE") != nullptr;
-    static thread_local bool query_swizzle_said = false;
-    if (query_swizzle_trace && !query_swizzle_said) {
-        query_swizzle_said = true;
-        std::fprintf(stderr, "strata attn-query-swizzle: active=%d nq=%lld cap=%lld kv_mode=%d lane_cell=%d\n",
-                     use_query_swizzle, (long long) n_q, (long long) cap, kv_mode, lane_cell);
-    }
-#endif
 #define STRATA_ATTN_LC(M) attn_chunk_kernel<M, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
     if (lane_cell) {
         if (kv_mode == 3) STRATA_ATTN_LC(3);
@@ -971,42 +869,10 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
         else STRATA_ATTN_LC(0);
     } else
 #undef STRATA_ATTN_LC
-#if defined(STRATA_HIP_GFX906)
-    // Opt-in INT8 batched attention: prefill, verification and MTP (including n_q=1).
-    // Other pool formats and lane-cell scoring keep their paths; qsa_decode_attn_step is unchanged.
-    // A k8v4 model's MTP drafter uses INT8 pools and can therefore take this path.
-    if (use_query_swizzle) {
-        // use_query_swizzle already requires INT8, warp scoring, and the calling
-        // thread's current device to be exactly gfx906 with a 64-lane wavefront.
-        static const bool reduce12 = [] {
-            const char* v = std::getenv("STRATA_GFX906_ATTN_REDUCE12");
-            return v && v[0] == '1' && v[1] == '\0';
-        }();
-        if (reduce12) {
-            attn_chunk_kernel<1, false, true, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
-                (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
-            static const bool trace = [] {
-                const char* v = std::getenv("STRATA_GFX906_ATTN_REDUCE12_TRACE");
-                return v && v[0] == '1' && v[1] == '\0';
-            }();
-            static thread_local bool said = false;
-            if (trace && !said) {
-                said = true;
-                std::fprintf(stderr, "strata attn-reduce12: selected=1 query_swizzle=1 kv_mode=1 nq=%lld cap=%lld\n",
-                             (long long) n_q, (long long) cap);
-            }
-        } else {
-            attn_chunk_kernel<1, false, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
-                (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
-        }
-    } else
-#endif
-#if !defined(__HIPCC__)
     if (kernel < 0 && kv_mode == 1 && attn_v3_on())   // (the parity harness names its kernel: never the environment)
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                           scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else
-#endif
     if (kv_mode == 3)
         STRATA_ATTN_CHUNK_SEL(3, pre)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
                                                                 (int) s.page_size, scale, part_acc, part_m, part_l,
@@ -1074,15 +940,7 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
     }
     const bool lane_cell = lane_cell_attn();
     // only where qsa_decode_attn_batch runs attn_chunk_kernel; its other variants keep the per-query calls
-#if defined(STRATA_ATTN_PRE75_BUILT)
     if (!lane_cell && pre75_attn()) return false;
-#endif
-#if defined(STRATA_HIP_GFX906)
-    static const bool query_swizzle = [] {
-        const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
-    }();
-    if (query_swizzle && !lane_cell && kv_mode == 1 && query_swizzle_gfx906_device()) return false;
-#endif
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
     float* part_acc = scratch;
@@ -1137,12 +995,7 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     // pre-sm_75 / gfx103x kernel, the gfx906 swizzle): there each row goes through that call, one launch per row.
     static const bool lane_cell_rows = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
     bool per_row = lane_cell_rows;
-#if defined(STRATA_ATTN_PRE75_BUILT)
     per_row = per_row || pre75_attn();
-#endif
-#if defined(STRATA_HIP_GFX906)
-    per_row = true;
-#endif
     if (per_row) {
         for (int64_t r = 0; r < n_q; ++r)
             qsa_decode_attn_batch(q + (size_t) r * s.n_head * HD, rows.p[r], ids + (size_t) r * cap,
@@ -1193,12 +1046,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
-#if !defined(__HIPCC__)
     if (kv_mode == 1 && attn_v3_on())
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                           scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else
-#endif
     if (kv_mode == 3)
         STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);

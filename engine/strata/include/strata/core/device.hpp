@@ -30,7 +30,7 @@ struct DeviceInfo {
 };
 
 // HIP builds: whether GPU `ordinal` can run this binary - its architecture must be one the binary was COMPILED
-// for (STRATA_HIP_ARCHS, set by cmake/hip_backend.cmake) and it must run wave32.  "" when it can (or when there
+// for and it must run wave32.  "" when it can (or when there
 // is no such device: the caller's own device errors apply), else the reason in a sentence.  A binary carried to
 // another card would otherwise fail later with "invalid device function".  CUDA builds: always "".
 std::string gpu_arch_problem(int ordinal);

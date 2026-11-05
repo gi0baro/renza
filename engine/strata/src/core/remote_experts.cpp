@@ -81,11 +81,9 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
     // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
     // before the device's context exists, so first thing; STRATA_REMOTE_SPIN=0 keeps the driver's default.
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
     const char* spin = std::getenv("STRATA_REMOTE_SPIN");
     if (!(spin && spin[0] == '0')) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
     cudaGetLastError();
-#endif
     // HIP has no cudaInitDevice equivalent; retain its default scheduling policy.
     DeviceScope scope(device);
     if (!scope.ok) { err = scope.error(device); return false; }
@@ -345,27 +343,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto w0 = std::chrono::steady_clock::now();
-    // Spin on the stream like PeerExperts::finish instead of the blocking sync: the layer waits for this helper
-    // on the CPU pool's critical path, and a blocking sync's wake-up costs more than the helper's small batch
-    // takes - on HIP especially, where the CUDA branch's cudaInitDevice(ScheduleSpin) does not exist and the
-    // device keeps its default policy.  STRATA_REMOTE_SPIN=0 keeps the blocking sync (the same switch the CUDA
-    // branch reads).
-#if defined(STRATA_USE_HIP)   // HIP only: the CUDA branch's cudaInitDevice(ScheduleSpin) already makes the sync spin
-    static const bool spin = [] {
-        const char* v = std::getenv("STRATA_REMOTE_SPIN");
-        return !(v != nullptr && v[0] == '0');
-    }();
-    if (spin) {
-        cudaError_t e;
-        while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
-        }
-        if (!check(e, "finish", err, device_)) return false;
-    } else if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) {
-        return false;
-    }
-#else
     if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
-#endif
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
     for (size_t i = 0; i < original_row_.size(); ++i)

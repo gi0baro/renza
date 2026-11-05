@@ -771,7 +771,6 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     check("row_top_prob");
 }
 
-#if !defined(__HIPCC__)   // warp-32 kernels: an AMD card keeps the one-block row_top_prob and sampler_greedy_kernel
 namespace {
 
 constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 8;
@@ -907,18 +906,6 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
         logits, n_vocab, ids, probs, (TopRow*) scratch);
     check("row_top_prob_split");
 }
-#else
-uint64_t argmax_rows_scratch_bytes(int) { return 0; }
-void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
-    std::fprintf(stderr, "argmax_rows: not built for this backend\n");
-    std::exit(1);
-}
-uint64_t row_top_prob_scratch_bytes(int) { return 0; }
-void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void*,
-                        void* stream) {
-    row_top_prob(logits, n_rows, n_vocab, ids, probs, stream);
-}
-#endif
 
 namespace {
 // grid (kNonfiniteBlocks, rows): block b of row t scans [b * per_block, +per_block) and writes its own word.  The
@@ -944,21 +931,14 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
 }
 
 bool multi_block_head_ops() {
-#if defined(__HIPCC__)
-    return false;
-#else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
         return v == nullptr || std::atoi(v) != 0;
     }();
     return on;
-#endif
 }
 
 bool argmax_rows_wanted() {
-#if defined(__HIPCC__)
-    return false;
-#else
     // sm_80 to sm_89: sample_tokens' greedy pick there is the one-block kernel (sm_90+ has the cluster kernel)
     static const bool want = [] {
         int dev = 0, major = 0;
@@ -967,7 +947,6 @@ bool argmax_rows_wanted() {
         return major == 8;
     }();
     return want && multi_block_head_ops();
-#endif
 }
 
 namespace {
@@ -1170,13 +1149,7 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
 // the GPU's clock in ns (the same sources as gpu_stamp_kernel)
 __device__ __forceinline__ unsigned long long strata_now_ns() {
     unsigned long long t;
-#if defined(STRATA_HIP_GFX906)
-    t = wall_clock64() * 40ull;
-#elif defined(__HIPCC__)
-    t = wall_clock64() * 10ull;
-#else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-#endif
     return t;
 }
 
@@ -1526,13 +1499,7 @@ __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
         pdl_wait();
     }
     unsigned long long t;
-#if defined(STRATA_HIP_GFX906)
-    t = wall_clock64() * 40ull;   // gfx906: the wall clock runs at 25 MHz (hipDeviceAttributeWallClockRate) -> ns
-#elif defined(__HIPCC__)
-    t = wall_clock64() * 10ull;   // gfx10.3 / gfx11 / gfx12: a constant 100 MHz counter, in ns
-#else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-#endif
     buf[i] = t;
 }
 }  // namespace
@@ -1577,7 +1544,7 @@ bool& pdl_scope() {
 }
 
 bool pdl_supported() {
-#if defined(__HIPCC__) || !defined(CUDART_VERSION) || CUDART_VERSION < 12030
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 12030
     return false;   // HIP; or a CUDA runtime without the capture-dependency query pdl_launch_ok needs
 #else
     // per device (a layer split runs on several): 1 = runs, 2 = does not.  sm_90+ (the card's, or STRATA_EMULATE_CC's),
@@ -1602,7 +1569,6 @@ bool pdl_supported() {
 #endif
 }
 
-#if !defined(__HIPCC__)
 bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12030
     (void) kernel; (void) stream;
@@ -1653,6 +1619,5 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
     return true;
 #endif
 }
-#endif
 
 }  // namespace strata::kernels

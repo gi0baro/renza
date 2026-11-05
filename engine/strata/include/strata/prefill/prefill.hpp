@@ -160,7 +160,7 @@ public:
 
     /// STRATA_MMQ_DIRECT: the guard each sized expert-cache slot keeps after its blob (ExpertCache::set_slot_guard),
     /// so the prompt MMQ can read a resident expert in its slot.  0 unless STRATA_MMQ_DIRECT is 1 or 2 on a CUDA
-    /// build with the pointer-table MMQ (STRATA_MMQ_TAB).
+    /// build with the pointer-table MMQ.
     static size_t slot_guard_bytes();
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest

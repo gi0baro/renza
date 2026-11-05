@@ -1,5 +1,5 @@
 #pragma once
-// src/artifact/dequant.cpp - P1.S3: scalar reference dequantizers, transcribed from ggml.
+// P1.S3: scalar reference dequantizers, transcribed from ggml.
 //
 // P1.S3 asks for every encoding present in the Q2_0 file. This starts with the ones on the critical
 // path (the routed experts are all Q2_0) plus the trivial element types, and is structured so the

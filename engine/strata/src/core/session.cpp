@@ -22,7 +22,7 @@
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
 // spin is just less polite to the pipeline.
-#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define STRATA_SPIN_PAUSE() _mm_pause()
 #else
@@ -137,24 +137,7 @@ void session_release(SessionState& s) {
         }
 }
 
-#if defined(STRATA_GPU_METAL)
-}  // namespace strata::core
-namespace strata::metal_engine {
-void window_reset();   // metal/src/engine/window.cpp: the decode window's running state back to a new sequence's
-}  // namespace strata::metal_engine
-namespace strata::core {
-#endif
-
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
-#if defined(STRATA_GPU_METAL)
-    // the running state lives in the Metal decode window; the session's own device buffers are not read there
-    (void) g; (void) R_init; (void) stream;
-    strata::metal_engine::window_reset();
-    s.ple_prev[0] = -1;
-    s.ple_prev[1] = -1;
-    s.ple_token = -1;
-    return;
-#endif
     cudaStream_t cs = (cudaStream_t) stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.

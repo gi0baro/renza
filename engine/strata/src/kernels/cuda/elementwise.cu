@@ -209,9 +209,6 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
     *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
-#if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
-    __threadfence_system();
-#endif
 }
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
@@ -320,9 +317,6 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
     __syncthreads();
     if (threadIdx.x == 0) {
         *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
-#if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
-        __threadfence_system();
-#endif
     }
 }
 
@@ -344,9 +338,6 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
     __syncthreads();
     if (threadIdx.x == 0) {
         *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
-#if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
-        __threadfence_system();
-#endif
     }
 }
 
@@ -394,7 +385,6 @@ __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const vol
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
-#if !defined(__HIPCC__)
 struct MappedCopies {
     MappedCopy c[8];
 };
@@ -425,20 +415,12 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     copy_from_mapped_multi_kernel<<<dim3(bx < 1 ? 1 : bx, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(a);
     check_launch("copy_from_mapped_multi");
 }
-#endif
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
 }
-
-#if defined(__HIPCC__)   // AMD keeps one copy a launch
-void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
-    for (int i = 0; i < n; ++i)
-        copy_i32_from_mapped((int32_t*) copies[i].dst, (const int32_t*) copies[i].src, copies[i].words, stream);
-}
-#endif
 
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;

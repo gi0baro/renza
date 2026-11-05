@@ -16,24 +16,18 @@
 #include <new>
 #include <utility>
 #include <vector>
-#ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#endif
 
 using namespace strata::core;
 namespace fs = std::filesystem;
 
 namespace {
 void set_env(const char* name, const char* value) {
-#ifdef _WIN32
-    _putenv_s(name, value ? value : "");
-#else
     if (value) setenv(name, value, 1); else unsetenv(name);
-#endif
 }
 int checks = 0;
 void check(bool ok, const char* label) {
@@ -551,7 +545,6 @@ int main() {
             }
             check(no_temp(dir), "fault: no temporary left behind");
         }
-#ifndef _WIN32
         // a filesystem that cannot flush a folder: saved, and said
         spit(p, old);
         SessionWriteOptions opt;
@@ -559,7 +552,6 @@ int main() {
         SessionStatus st;
         check(session_file_write(p.string(), original, id, written, error, opt, &st) && st.dir_flush_unsupported &&
               slurp(p) == image, "fault: EINVAL on the folder flush is not a failure, and is reported");
-#endif
         // the free-space preflight is 'storage'
         SessionWriteOptions big;
         big.min_free_bytes = UINT64_MAX / 2;
@@ -740,7 +732,6 @@ int main() {
         check(session_free_space_dir("/chat.bin", false) == "/", "free space: POSIX root");
         check(session_free_space_dir("chat.bin", false) == ".", "free space: POSIX bare name");
     }
-#ifndef _WIN32
     // what restore will not open: a symbolic link, a hard-linked file, a FIFO, a directory
     {
         const fs::path link = dir / "link.bin";
@@ -767,7 +758,6 @@ int main() {
         struct stat st {};
         check(::stat(link.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "the session file is mode 0600");
     }
-#endif
 
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);

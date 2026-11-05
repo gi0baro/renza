@@ -909,12 +909,7 @@ private:
         const uint8_t* base = nullptr;
         uint64_t bytes = 0;
         bool closed = false;   ///< drop_mapping unmapped the view (base stays for offsets)
-#if defined(_WIN32)
-        void* file = nullptr;
-        void* mapping = nullptr;
-#else
         int fd = -1;
-#endif
     };
     std::vector<Map> maps_;
     std::vector<const uint8_t*> role_ptr_;    ///< 3 x n_layers: gate / up / down of the layer's expert 0
@@ -1021,12 +1016,7 @@ private:
     int64_t exchanges_ = 0;
     std::atomic<int64_t> file_reads_{0};
     std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
-#if defined(_WIN32)
-    void* file_ = nullptr;
-    void* mapping_ = nullptr;
-#else
     int fd_ = -1;
-#endif
     bool unmapped_ = false;   ///< pp-opt: drop_mapping closed the view (base_ stays as the "opened" mark only)
     bool startup_ub_ = false;                 ///< begin_startup_unbuffered: until end_startup_unbuffered
     uint64_t startup_blob_bytes_ = 0, startup_us_ = 0;   ///< the staged reads' counters at its begin (put back at the end)

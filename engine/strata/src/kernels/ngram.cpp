@@ -13,22 +13,13 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#if !defined(_WIN32)
 #include <sys/mman.h>
-#endif
 #include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include <stdexcept>
-
-#if defined(_WIN32)
-// `PrefetchVirtualMemory` (memoryapi.h, Windows 8+) is the whole point of the change in `gather` below.
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#endif
 
 namespace strata::kernels {
 
@@ -331,31 +322,6 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         impl_->n_rows = n_rows;
     }
     if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
-#if defined(_WIN32)
-        // Windows has no mlock: the platform helper raises the process's minimum working set and
-        // VirtualLocks the mapped table instead (ordinary accounts hold the privilege). A failure
-        // falls back to touching the pages, i.e. plain mmap behaviour, with a warning - same as POSIX.
-        // A table that is more than half of the RAM leaves the rest of the process little (the locked pages cannot be
-        // paged out): say so, and go on (recommend, never force).
-        MEMORYSTATUSEX ms;
-        ms.dwLength = sizeof(ms);
-        if (GlobalMemoryStatusEx(&ms) && need > ms.ullTotalPhys / 2)
-            std::fprintf(stderr, "strata: warning: --ple-io ram locks %.1f GiB, more than half of this PC's %.1f GiB of RAM\n",
-                         (double) need / (1ull << 30), (double) ms.ullTotalPhys / (1ull << 30));
-        const strata::platform::LockResult lr =
-            strata::platform::lock_resident((void*) impl_->data, need);
-        if (lr.ok && lr.locked_bytes >= need) {
-            impl_->locked = true;
-        } else {
-            // a partial lock is not a lock: the unlocked rest would fault on the token path, so give it back
-            if (lr.locked_bytes > 0) strata::platform::unlock_resident((void*) impl_->data, lr.locked_bytes);
-            std::fprintf(stderr, "strata: PLE table lock failed (%s): touching its pages instead\n",
-                         lr.note.c_str());
-            volatile uint8_t sink = 0;
-            for (uint64_t off = 0; off < need; off += 4096) sink = sink + impl_->data[off];
-            (void) sink;
-        }
-#else
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
@@ -385,7 +351,6 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             std::fprintf(stderr, "strata: PLE table mlock failed (%s; raise `ulimit -l`): its pages stay faulted in "
                                  "but may be reclaimed\n", std::strerror(errno));
         }
-#endif
     }
     impl_->mode = io.mode;
     return true;
@@ -410,19 +375,6 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
         impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
         return;
     }
-#if defined(_WIN32)
-    if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
-        ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
-            if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
-            ranges[n].NumberOfBytes = impl_->rb;
-            ++n;
-        }
-        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
-    }
-#endif
 }
 
 void PleTable::close() {
@@ -480,19 +432,6 @@ bool PleTable::issue(const uint32_t* rows16) {
         impl_->pending = true;
         return true;
     }
-#if defined(_WIN32)
-    if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
-        ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
-            if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
-            ranges[n].NumberOfBytes = impl_->rb;
-            ++n;
-        }
-        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
-    }
-#endif
     impl_->pending = true;
     return true;
 }
@@ -566,24 +505,12 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     constexpr size_t kWin = 4096;   // rows a window
     auto hint = [&](size_t a, size_t b) {
         if (impl_->data == nullptr || !g_ple_prefetch) return;
-#if defined(_WIN32)
-        WIN32_MEMORY_RANGE_ENTRY ranges[kWin];
-        ULONG_PTR k = 0;
-        for (size_t i = a; i < b; ++i) {
-            if (rows[i] >= impl_->n_rows) continue;
-            ranges[k].VirtualAddress = (PVOID) (impl_->data + (size_t) rows[i] * impl_->rb);
-            ranges[k].NumberOfBytes = impl_->rb;
-            ++k;
-        }
-        if (k > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), k, ranges, 0);
-#else
         for (size_t i = a; i < b; ++i) {
             if (rows[i] >= impl_->n_rows) continue;
             const uintptr_t r0 = (uintptr_t) (impl_->data + (size_t) rows[i] * impl_->rb);
             const uintptr_t p0 = r0 & ~(uintptr_t) 4095;
             (void) madvise((void*) p0, (size_t) (r0 + impl_->rb - p0), MADV_WILLNEED);
         }
-#endif
     };
     hint(0, std::min(n, kWin));
     for (size_t w = 0; w < n; w += kWin) {
@@ -634,24 +561,6 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
     // sixteen different 4 KB pages scattered across 26.8 GB, taken ONE AT A TIME, and on this machine the PLE
     // shard is 26.8 GB against 63 GB of RAM that the 31.6 GB expert arena is also competing for, so they are
     // not in the OS cache.  Sixteen serial NVMe reads at ~150 us is 2.4 ms, which is the measurement.
-    //
-    // `PrefetchVirtualMemory` issues all sixteen in ONE call and lets them complete in parallel.  It is a hint
-    // and cannot change the answer - a range it does not fetch is simply faulted in by the read that follows -
-    // so the only risk is that it does nothing.
-#if defined(_WIN32)
-    if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
-        ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
-            // Out-of-range rows are handled by `read_row` as zeros and have no address to prefetch.
-            if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
-            ranges[n].NumberOfBytes = impl_->rb;
-            ++n;
-        }
-        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
-    }
-#endif
     // HEAD-SLOWEST, which is what `ggml_get_rows` does and what the source's own comment says: head h's 160
     // values occupy [h*160, (h+1)*160).  A head-fastest layout would put element (d, h) at d*16 + h and needs
     // a real transpose - a reshape of the same flat buffer compares equal and would make the check vacuous.
