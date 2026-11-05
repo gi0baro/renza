@@ -1,5 +1,4 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
-#include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
@@ -166,26 +165,6 @@ bool env_on(const char* name) {
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
-// STRATA_BATCH_SELF_COMMIT=1 (opt-in): a batch window whose rows are each another slot's one token keeps them itself,
-// as a one-token window does (record_window): the GDN conv histories and states advance inside the window graph, and
-// no commit graph runs after it.  Such a window's commit is unconditional (each slot keeps its one row), and the rest
-// of the commit graph only repeats what the window wrote: the indexer tails are put back and appended again from the
-// same rows, the PLE histories are put back to the window's own snapshot.
-const bool g_batch_self_commit = env_on("STRATA_BATCH_SELF_COMMIT");
-// STRATA_QSA_SLOTS=1 (opt-in): in a batch window, a QSA layer's block scores, top-k and attention run as one launch
-// each over the window's rows (up to 8 per launch, each row reading its own slot's indexer keys and K/V) instead of
-// one call per row; every row is computed by the same kernel with the same arithmetic as its own call.  Not with a
-// streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
-const bool g_qsa_slots = env_on("STRATA_QSA_SLOTS");
-
-// every row of a batch window is another slot's (no slot has proposal rows)
-bool one_row_per_slot(const int* rows, int S) {
-    for (int i = 0; i < S; ++i)
-        for (int j = i + 1; j < S; ++j)
-            if (rows[i] == rows[j]) return false;
-    return S >= 1;
-}
-bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && one_row_per_slot(rows, S); }
 
 // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
 // overlap pays off on CUDA, where it was added (cfd3b72).  On HIP a cross-stream event dependency costs more than the
@@ -462,16 +441,10 @@ Verifier::~Verifier() {
     for (auto& e : exec_nr_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
-    for (auto& kv : exec_bm_)
-        if (kv.second) cudaGraphExecDestroy(kv.second);
-    for (auto& kv : commit_bm_)
-        if (kv.second) cudaGraphExecDestroy(kv.second);
-    if (arena_b_) cudaFree(arena_b_);
-    if (h_commitb_) cudaFreeHost(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
-    if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
+    if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
@@ -479,9 +452,6 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : {mfork_, mjoin_, pfork_, pjoin_})
         if (e) cudaEventDestroy(e);
     if (commit_done_) cudaEventDestroy(commit_done_);
-    if (ev_done_) cudaEventDestroy(ev_done_);
-    if (ev_commit_) cudaEventDestroy(ev_commit_);
-    if (prof_pin_) cudaFreeHost(prof_pin_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     for (cudaStream_t s : df_side_)
@@ -739,8 +709,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
-    if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (make_stream(&cs_) != cudaSuccess) cs_ = nullptr;
+    if (make_stream(&cs_) != cudaSuccess) cs_ = nullptr;
     if (cs_ == nullptr || make_stream(&sh_cs_) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
@@ -800,8 +769,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        // (not with set_always_publish: the device table may lag the host's while windows are in flight)
-        device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
+        device_plan_ = !all_resident_ && (v != nullptr && std::atoi(v) != 0);
     }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse() || g_qfuse_hc()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
@@ -857,21 +825,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
-    // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    const int G = (split_ && T >= 2) ? 2 : 1;
+    const bool self_commit = T == 1 && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
     const int side_mixer_mode = g_side_mixer();
     const bool side_mixer = side_mixer_mode >= 1;
-    const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
+    const bool side_proj = side_mixer_mode >= 2;   // fork b063c13: the GDN gate projection, the QSA queries
     auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
         if (cudaEventRecord(e, from) == cudaSuccess && cudaStreamWaitEvent(to, e, 0) == cudaSuccess) return true;
         err = std::string("verify: the mixer branch could not ") + what;
         return false;
     };
-    // a batch window's rows each read their own slot's indexer: in line there
-    const bool sidem = side_mixer && !batch_rec_;
+    const bool sidem = side_mixer;
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
@@ -883,7 +849,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
-    if (!batch_rec_) groups_[T] = G;
+    groups_[T] = G;
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
     // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
@@ -895,9 +861,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     } pdl_window(G == 1 && pdl_supported());
     // STRATA_DF_BRANCH: mixer work that reads only the layer's input runs on a side stream inside the graph.  fork(i)
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
-    // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
+    // side i: a branch never races with what came before its fork or after its join.  Not in a split window,
     // nor under the stage profiler (whose stamps are on `cs`).
-    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
+    const bool br = df_branch_ && G == 1 && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
     auto fork = [&](int i) {
         cudaEventRecord(df_fork_, cs);
         cudaStreamWaitEvent(df_side_[i], df_fork_, 0);
@@ -906,13 +872,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         cudaEventRecord(df_join_[i], df_side_[i]);
         cudaStreamWaitEvent(cs, df_join_[i], 0);
     };
-    const int64_t nQall = g.n_qsa_layers();
-    // a batch window: row t is slot t, whose state lives in its own session
-    auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
-    const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
-    // STRATA_BATCH_SELF_COMMIT: the window keeps its rows (no commit graph, nothing to snapshot for one)
-    const bool keep_rows = batch_rec_ && batch_self_commits(brow_, T);
-
     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
@@ -931,11 +890,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
-    const int64_t HB = Verifier::handoff_floats(g);
     if (lb_ > 0) {
-        const float* hin = hand_in_ + (size_t) hrow0 * HB;   // the group's rows: [R][bo][inj] contiguous
+        const float* hin = hand_in_;   // [R][bo][inj] contiguous
         // the overlapped split: this graph was launched before the previous stage finished - wait for its hand-off
-        if (hflag_in_d_ != nullptr && !batch_rec_) wait_handoff(hflag_in_d_, 1u, herr_d_, g_split_wait_ns, cs);
+        if (hflag_in_d_ != nullptr) wait_handoff(hflag_in_d_, 1u, herr_d_, g_split_wait_ns, cs);
         copy_from_mapped(R_, hin, (int64_t) T * HC * N, cs);
         copy_from_mapped(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
         copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
@@ -1039,7 +997,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const char* e = std::getenv("STRATA_DF_PLE");
                 return e != nullptr && std::atoi(e) != 0;
             }();
-            const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
+            const bool ple_post = ple_batch_kv && ple_post_env;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -1066,7 +1024,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 PleOut po;
                 po.normalized = normalized;
                 po.result = Rt(t);
-                float* hist = batch_rec_ ? slot_ss(t).ple_hist : ss.ple.hist;   // the row's own history
+                float* hist = ss.ple.hist;
                 try {
                     if (ple_batch_kv) {
                         ple_block_projected(xn_ + (size_t) t * HC * N, z_ + (size_t) t * N, Rt(t), hist,
@@ -1079,7 +1037,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     err = std::string("verify PLE: ") + e.what();
                     return false;
                 }
-                if (!keep_rows) copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
+                copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
             }
             pending = false;
         }
@@ -1195,21 +1153,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
                                 df_side_[1]);
                 }
-                const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
+                const bool fuse_ab = fuse_convab_on() && !br && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
-                if (batch_rec_) {   // contiguous rows may be proposals for the same slot
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
-                        SessionState& sx = slot_ss(first);
-                        const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
-                                          (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
-                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
-                                          keep_rows);
-                    }
-                } else
                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
                 if (fuse_ab)   // 143-amdk: the conv and the a/b projections in one launch
                     gdn_conv_ab_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, tb, self_commit,
@@ -1241,42 +1187,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                static const bool gdn_groups_on = [] {   // STRATA_BATCH_GDN_GROUPS=1, all slots in one launch
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
-                    strata::kernels::GdnGroups gg;
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
-                        SessionState& sx = slot_ss(first);
-                        gg.state[gg.n] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
-                        gg.first[gg.n] = first;
-                        gg.ntok[gg.n] = t - first;
-                        ++gg.n;
-                    }
-                    strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
-                                                          y_, (int) HK, (int) HV, false, cs);
-                } else
-                if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
-                        SessionState& sx = slot_ss(first);
-                        float* stx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
-                        gdn_step_norm_multi(stx, hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
-                                            beta + (size_t) first * HV, z_ + (size_t) first * ZV,
-                                            (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
-                                            (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
-                    }
-                } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
                 stamp(l, 6, grp);
-                // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
-                // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
-                if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
+                // STRATA_QFUSE: done above by gdn_step_norm_multi
+                if (!g_qfuse()) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
             } else {
@@ -1361,23 +1276,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, ns);
                 };
                 auto idx_snap = [&](cudaStream_t ns) {
-                    if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
-                        for (int t = tb; t < te && !keep_rows; ++t)
-                            if (t == tb || brow_[t] != brow_[t - 1])
-                                copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
-                                                 slot_ss(t).qsa_states[qi].idx_tail, TS, ns);
-                    } else
                     if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
                 };
                 auto idx_append = [&](cudaStream_t ns) {
-                    if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                    if (dec_batch && !g_no_batch_kv) {
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
                                                         n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                         rope_scaling(), ns);
                     } else {
                         for (int t = tb; t < te; ++t) {
-                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                            const QsaState& sx = ss.qsa_states[qi];
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
                             native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
                                                       (const float*) wikn->data, EPS, ib, s, sx.max_cells,
@@ -1474,9 +1383,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 8, grp);
                 if (!sidem) idx_snap(cs);
-                // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
-                // batch's rows each have their own K/V, so that case keeps the loop)
-                if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token
+                if (dec_batch && !g_no_batch_kv) {
                     const int32_t* step_b = step_ + tb * kStepCount;
                     const float* kc_b = kcur_ + tb * NKV * HD;
                     const float* vc_b = vcur_ + tb * NKV * HD;
@@ -1502,7 +1410,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                 } else
                 for (int t = tb; t < te; ++t) {
-                    const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
+                    const QsaState& st = ss.qsa_states[qi];
                     const int32_t* step_t = step_ + t * kStepCount;
                     if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
                         const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
@@ -1530,85 +1438,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (!sidem) idx_query(cs);
                 }
                 stamp(l, 10, grp);
-                bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
-                if (batch_rec_ && g_qsa_slots)
-                    for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
-                // STRATA_BATCH_ATTN_ROWS=1: the window's rows in ONE launch per step - scores with each row's
-                // own indexer keys, the top-k over all rows (row-independent), attention with each row's own pools -
-                // instead of 3-4 one-row launches per row; the same per-row arithmetic.  Not with KV streaming
-                // (qsa_kv_resolve has work per slot then).
-                static const bool attn_rows = [] {
-                    const char* v = std::getenv("STRATA_BATCH_ATTN_ROWS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
-                for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
-                if (rows_ok) {
-                    const int n_rows = te - tb;
-                    strata::kernels::QsaScoreRows sr;
-                    strata::kernels::QsaAttnPoolsRows pr;
-                    sr.n = pr.n = n_rows;
-                    for (int t = tb; t < te; ++t) {
-                        const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        sr.pooled[t - tb] = sx.idx_pooled;
-                        sr.dead[t - tb] = sx.idx_dead;
-                        pr.p[t - tb] = qsa_attn_pools(sx);
-                    }
-                    qsa_block_scores_rows(sr, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n_rows, max_blocks_, s,
-                                          scores_ + (size_t) tb * max_blocks_, cs);
-                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n_rows, max_blocks_, cap_,
-                                   s, sel_ + (size_t) tb * cap_, cs);
-                    qsa_decode_attn_batch_rows(qcur_ + tb * NH * HD, pr, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount,
-                                               cap_, s, attn_scratch_ + (size_t) tb * attn_scratch_floats_,
-                                               attn_ + tb * NH * HD, n_rows, cs);
-                } else
-                if (batch_rec_ && g_qsa_slots && !streamed) {
-                    // the rows' block scores, top-k and attention, up to 8 rows per launch.  The rows only read
-                    // their slots' keys and K/V here and write their own scores/sel/scratch/attn rows, so running
-                    // each step for all rows before the next is the per-row loop's result
-                    for (int t0 = tb; t0 < te; t0 += kQsaAttnMaxSlots) {
-                        const int m = std::min(te - t0, kQsaAttnMaxSlots);
-                        const float* pooled[kQsaAttnMaxSlots];
-                        const float* dead[kQsaAttnMaxSlots];
-                        QsaAttnSlotPools px;
-                        for (int i = 0; i < m; ++i) {
-                            const QsaState& sx = slot_ss(t0 + i).qsa_states[qi];
-                            pooled[i] = sx.idx_pooled;
-                            dead[i] = sx.idx_dead;
-                            px.p[i] = qsa_attn_pools(sx);
-                        }
-                        // a launcher that would not run the per-row call's kernel launches nothing: per-row calls
-                        if (!qsa_block_scores_slots(pooled, dead, qidx_ + t0 * IQ * ID, step_ + t0 * kStepCount, m,
-                                                    max_blocks_, s, scores_ + (size_t) t0 * max_blocks_, cs))
-                            for (int t = t0; t < t0 + m; ++t)
-                                qsa_block_scores(pooled[t - t0], dead[t - t0], qidx_ + t * IQ * ID, step_ + t * kStepCount,
-                                                 1, max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) t0 * max_blocks_, step_ + t0 * kStepCount, m, max_blocks_,
-                                       cap_, s, sel_ + (size_t) t0 * cap_, cs);
-                        if (!qsa_decode_attn_slots(qcur_ + t0 * NH * HD, px, sel_ + (size_t) t0 * cap_,
-                                                   step_ + t0 * kStepCount, cap_, s,
-                                                   attn_scratch_ + (size_t) t0 * attn_scratch_floats_,
-                                                   attn_ + t0 * NH * HD, m, cs))
-                            for (int t = t0; t < t0 + m; ++t)
-                                qsa_decode_attn_batch(qcur_ + t * NH * HD, px.p[t - t0], sel_ + (size_t) t * cap_,
-                                                      step_ + t * kStepCount, cap_, s,
-                                                      attn_scratch_ + (size_t) t * attn_scratch_floats_,
-                                                      attn_ + t * NH * HD, 1, cs);
-                    }
-                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
-                    for (int t = tb; t < te; ++t) {
-                        const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
-                                         max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
-                                       sel_ + (size_t) t * cap_, cs);
-                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
-                        const QsaAttnPools px = qsa_attn_pools(sx);
-                        qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
-                                              cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
-                                              attn_ + t * NH * HD, 1, cs);
-                    }
-                } else {
                 if (!sidem) idx_select(cs);
                 else if (cudaStreamWaitEvent(cs, mjoin_, 0) != cudaSuccess) {
                     err = "verify: the indexer's branch could not join";
@@ -1632,7 +1461,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                           (uint64_t) n * (uint64_t) attn_scratch_floats_, attn_ + tb * NH * HD, n, cs)))
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
-                }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
@@ -1716,15 +1544,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                               (uint32_t) ((l - lb_) * G + grp + 1), cs);
-            // set_always_publish: the rows whatever the device's residency table says (pipelined windows)
-            if (always_publish_)
-                doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                                 m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
-                const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
-                doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
-            }
+            const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+            doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
+                                 m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
             if (sh_fork_late) {
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
@@ -1924,8 +1746,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
-        float* hout = hand_out_ + (size_t) hrow0 * HB;
-        if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
+        float* hout = hand_out_;
+        if (hflag_out_d_ != nullptr) {   // the overlapped split: payload + the next stage's flag
             handoff_publish(hout, R_, (int64_t) T * HC * N, bo_, (int64_t) T * N, inj2_, (int64_t) T * HC, hcount_d_,
                             hflag_out_d_, cs, g_test_drop > 0 ? hdrop_d_ : nullptr);   // the test word only with the hook on
             return true;
@@ -2162,7 +1984,7 @@ bool Verifier::capture(int T, std::string& err) {
                      prog, bad, ge != cudaSuccess ? " (the edge query failed)" : "");
 #endif
     }
-    const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
+    const bool made = instantiate_evicting(exec_t, graph, "verify: instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
@@ -2437,7 +2259,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                    std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
@@ -2774,7 +2595,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr = (unsigned long long*) (base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
-    const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
+    const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
@@ -2890,7 +2711,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    if (last_t_ == 1 && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2949,632 +2770,14 @@ bool Verifier::wait_commit(std::string& err) {
     return next_ == nullptr || next_->wait_commit(err);
 }
 
-
-// ================================ BATCH WINDOWS (see init_slots) ================================
-
-bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
-    const OnDevice on_device(device_);
-    if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
-    if (slots.empty()) {
-        err = "verify: init_slots needs at least one session";
-        return false;
-    }
-    for (SessionState* x : slots) {
-        if (x == nullptr || x->layer_lo != ss_->layer_lo || x->layer_hi != ss_->layer_hi ||
-            x->max_cells != ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
-            err = "verify: a slot's session is not carved like the stage's own (layer range, context)";
-            return false;
-        }
-    }
-    const strata::kernels::QsaShapes s = shapes_of(*g_);
-    const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
-    const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
-    void* d = nullptr;
-    if (!mapped((size_t) (S * CB * 4 + 16), (void**) &h_commitb_, (void**) &m_commitb_)) {
-        err = "verify: the batch commit staging failed";
-        return false;
-    }
-    const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
-    if (cudaMalloc(&d, a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4) != cudaSuccess) {
-        err = "verify: the batch buffers do not fit";
-        return false;
-    }
-    arena_b_ = d;
-    commitb_ = (int32_t*) d;
-    tail_snap_b_ = (float*) ((uint8_t*) d + a);
-    slots_ = slots;
-    slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
-    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
-                 (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
-    return true;
-}
-
-bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
-    cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
-    if (ex != nullptr) return true;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        err = "verify: begin batch capture failed";
-        return false;
-    }
-    batch_rec_ = true;
-    row_base_ = hbase;
-    for (int t = 0; t < S; ++t) brow_[t] = rows[t];
-    std::string rerr;
-    const bool ok = record_window(S, cs_, rerr);
-    batch_rec_ = false;
-    row_base_ = 0;
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
-    if (!ok || ce != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
-        return false;
-    }
-    const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
-    cudaGraphDestroy(graph);
-    if (!made) return false;
-    cudaGraphUpload(ex, cs_);
-    cudaStreamSynchronize(cs_);
-    std::string list;
-    for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
-    std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
-    return true;
-}
-
-bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
-    if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
-    cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
-    if (cex != nullptr) return true;
-    using namespace strata::kernels;
-    const ModelGeometry& g = *g_;
-    const QsaShapes s = shapes_of(g);
-    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
-    const int64_t CB = 2 + MT, nQ = g.n_qsa_layers();
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-    const int64_t TS = (s.idx_block - 1) * ID;
-    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        err = "verify: begin batch commit capture failed";
-        return false;
-    }
-    bool ok = true;
-    try {
-        for (int t = 0; t < S; ++t)
-            if (t == 0 || rows[t] != rows[t - 1])
-                copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
-        int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        for (int64_t l = lb_; l < le_ && ok; ++l) {
-            const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
-                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
-                if (!wnm) { ok = false; break; }
-                // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
-                // in one launch for all slots; the conv commits stay per slot
-                static const bool gdn_groups_on = [] {
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                bool one_row = S <= 8;
-                for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
-                strata::kernels::GdnGroups gg;
-                for (int t = 0; t < S;) {
-                    const int first = t;
-                    while (t < S && rows[t] == rows[first]) ++t;
-                    SessionState& sx = *slots_[(size_t) rows[first]];
-                    const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
-                    float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
-                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C,
-                                    (int) C, keep, cs_);
-                    if (gdn_groups_on && one_row) {
-                        gg.state[gg.n] = state;
-                        gg.keep[gg.n] = keep;
-                        gg.first[gg.n] = first;
-                        gg.ntok[gg.n] = 1;
-                        ++gg.n;
-                        continue;
-                    }
-                    gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, (int) C,
-                                        gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
-                                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
-                                        z_ + (size_t) first * ZV, (const float*) wnm->data, EPS,
-                                        y_dummy_ + (size_t) first * ZV, (int) g.ssm_k_heads,
-                                        (int) HV, t - first, keep, cs_,
-                                        t - first > 1 ? t - first : 0);   // a 1-row group keeps the 0.1.39 kernel
-                }
-                if (gg.n > 0)
-                    gdn_step_norm_groups(gg, h_L_ + (size_t) gdn_index * MT * C, (int) C,
-                                         gate_L_ + (size_t) gdn_index * MT * HV, beta_L_ + (size_t) gdn_index * MT * HV,
-                                         z_, (const float*) wnm->data, EPS, y_dummy_, (int) g.ssm_k_heads, (int) HV, true,
-                                         cs_);
-                ++gdn_index;
-            } else {
-                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
-                if (!wikn) { ok = false; break; }
-                for (int t = 0; t < S;) {
-                    const int first = t;
-                    while (t < S && rows[t] == rows[first]) ++t;
-                    const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
-                    copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS,
-                                     TS, cs_);
-                    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    for (int u = first; u < t; ++u)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
-                                                  commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
-                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                  rope_scaling(), cs_);
-                }
-                ++qsa_index;
-            }
-        }
-        if (ok && ss_->ple.ready() && ple_stage())
-            for (int t = 0; t < S;) {
-                const int first = t;
-                while (t < S && rows[t] == rows[first]) ++t;
-                copy_indexed(slots_[(size_t) rows[first]]->ple_hist, hist_snap_ + (size_t) first * HS,
-                             HS, commitb_ + (size_t) rows[first] * CB + 1, HS, cs_);
-            }
-    } catch (const std::exception& e) {
-        err = std::string("verify batch commit: ") + e.what();
-        ok = false;
-    }
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
-    if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
-        return false;
-    }
-    if (ce != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        err = std::string("verify: batch commit capture: ") + cudaGetErrorString(ce);
-        return false;
-    }
-    const bool made = instantiate_evicting(cex, graph, bkey(rows, S, hbase), "verify: batch commit instantiate: ", err);
-    cudaGraphDestroy(graph);
-    return made;
-}
-
-bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err) {
-    evicted = false;
-    auto old = exec_bm_.end();
-    uint64_t oldest = UINT64_MAX;
-    for (auto it = exec_bm_.begin(); it != exec_bm_.end(); ++it) {
-        if (it->first == keep) continue;
-        const auto u = bm_used_.find(it->first);
-        const uint64_t t = u == bm_used_.end() ? 0 : u->second;
-        if (t < oldest) { oldest = t; old = it; }
-    }
-    if (old == exec_bm_.end()) return true;
-    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
-        err = "verify: synchronizing before batch graph eviction failed";
-        return false;
-    }
-    const auto old_key = old->first;
-    if (old->second) cudaGraphExecDestroy(old->second);
-    exec_bm_.erase(old);
-    bm_used_.erase(old_key);
-    auto commit_old = commit_bm_.find(old_key);
-    if (commit_old != commit_bm_.end()) {
-        if (commit_old->second) cudaGraphExecDestroy(commit_old->second);
-        commit_bm_.erase(commit_old);
-    }
-    evicted = true;
-    return true;
-}
-
-bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key,
-                                   const char* what, std::string& err) {
-    // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
-    // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
-    // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
-    cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
-    int freed = 0;
-    for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
-        (void) cudaGetLastError();
-        if (!evict_batch_graph(key, evicted, err)) return false;
-        if (evicted) {
-            ++freed;
-            ie = cudaGraphInstantiate(&ex, graph, 0);
-        }
-    }
-    if (freed > 0)
-        std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
-                             "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
+bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const char* what, std::string& err) {
+    const cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+    if (ie == cudaErrorMemoryAllocation) (void) cudaGetLastError();
     if (ie != cudaSuccess) {
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
     }
     return true;
-}
-
-bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                           std::string& err) {
-    using namespace strata::kernels;
-    // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
-    // whose hand-off buffers hold kVerifyMaxT rows, or set_handoff_rows' (a stage that hands rows on or takes them)
-    if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
-                                           next_ != nullptr || lb_ > 0, handoff_rows_ > 0 ? handoff_rows_ : kVerifyMaxT)) {
-        err = why;
-        return false;
-    }
-    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
-    const ModelGeometry& g = *g_;
-    for (int t = 0; t < S; ++t)
-        if (pos[t] < 0 || pos[t] + 1 > slots_[(size_t) rows[t]]->max_cells) {
-            err = "verify: slot " + std::to_string(rows[t]) + " runs past its context";
-            return false;
-        }
-    refresh_ar();
-    // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
-    // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
-    const auto key = bkey(rows, S, hbase);
-    bool evicted = false;
-    if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
-        !evict_batch_graph(key, evicted, err))
-        return false;
-    bm_used_[key] = ++bm_tick_;
-    if (!capture_batch(rows, S, hbase, err) || !capture_commit_batch(rows, S, hbase, err)) return false;
-    const Clock::time_point t0 = Clock::now();
-    const QsaShapes s = shapes_of(g);
-    for (int t = 0; t < S; ++t) {
-        h_tok_[t] = tokens[t];
-        qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
-        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
-        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
-    }
-    if (ss_->ple.ready() && ple_stage()) {
-        uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
-        for (int t = 0; t < S; ++t) {
-            const SessionState& sx = *slots_[(size_t) rows[t]];
-            int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
-            if (t > 0 && rows[t] == rows[t - 1]) {
-                prev[0] = t > 1 && rows[t - 2] == rows[t] ? tokens[t - 2] : sx.ple_prev[1];
-                prev[1] = tokens[t - 1];
-            }
-            ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
-        }
-        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
-    }
-    // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
-    // decoding may change the prefix length after comparing the draft with these picks.
-    const int64_t CB = 2 + max_t_;
-    for (int t = 0; t < S;) {
-        const int first = t;
-        while (t < S && rows[t] == rows[first]) ++t;
-        int32_t* c = h_commitb_ + (size_t) rows[first] * CB;
-        c[0] = t - first;
-        c[1] = t - first - 1;
-        for (int64_t j = 0; j < max_t_; ++j)
-            c[2 + j] = j < t - first ? (int32_t) pos[first + j] : -1;
-    }
-    *(volatile uint32_t*) h_seq_ = 0;
-    *(volatile uint32_t*) h_flag_ = 0;
-    *(volatile uint32_t*) h_flagA_ = 0;
-    *(volatile uint32_t*) h_flagB_ = 0;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    last_t_ = S;
-    for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
-    row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
-    last_batch_ = true;
-    for (int t = 0; t < S; ++t) { last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
-    ms_host += ms_since(t0);
-    return true;
-}
-
-bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
-                         std::string& err) {
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
-    return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
-}
-
-bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
-                             void* user, int32_t* out, std::string& err) {
-    using namespace strata::kernels;
-    const OnDevice on_device(device_);
-    const ModelGeometry& g = *g_;
-    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
-    if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
-    const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    volatile uint32_t* const seq = h_seq_;
-    volatile uint32_t* const flag = h_flag_;
-    const int64_t steps = le_ - lb_;
-    // #646: a stage whose every expert is resident plans on the device and raises no host doorbells, so the
-    // per-layer spin below has nothing to wait for: without the PLE flag the graph finishes with the ring silent
-    // ("verify batch: layer K never rang (graph finished)" - K is that stage's first layer), and with it the graph
-    // sits on the PLE wait until the 20 s timeout.  As run() does: raise the PLE flag the graph's first wait reads,
-    // let the graph run to the end, and skip the host's per-layer service (there is nothing to serve).
-    // #646 + #871: the skip is per-window (ar_on), not per-process (all_resident_): a stage that was 100%
-    // resident at init takes the doorbell graph while a prompt loan/shrink/swap is in flight (ar_off_), and that
-    // graph waits on host doorbells the skipped service never raises (GPU at 100%, host in the sync below).
-    if (ar_on()) {
-        if (ss_->ple.ready() && ple_stage()) {
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
-            *flag = 1;
-        }
-        const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-        cudaStreamSynchronize(copy_);
-        if (prof_on_) collect_profile();
-        ++windows;
-        if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
-        if (!sample_rows(S, err)) return false;
-        for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
-        note_nonfinite(S, last_pos_b_);
-        progress_at("decode");
-        progress_beat();
-        return true;
-    }
-    for (int64_t k = 0; k < steps; ++k) {
-        const int64_t l = lb_ + k;
-        const uint32_t want = (uint32_t) (k + 1);
-        const Clock::time_point a = Clock::now();
-        auto last_flush = a;
-        uint32_t spins = 0;
-        progress_at("verify batch: waiting for the GPU to reach layer", l);
-        while (*seq < want) {
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
-            const auto now = Clock::now();
-            if (now - last_flush > std::chrono::microseconds(2000)) {
-                last_flush = now;
-                const cudaError_t q = cudaStreamQuery(cs_);
-                if (q != cudaErrorNotReady && *seq < want) {
-                    err = "verify batch: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
-                    return false;
-                }
-            }
-            if (now - a > std::chrono::seconds(20)) {
-                err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
-                return false;
-            }
-        }
-        const Clock::time_point b = Clock::now();
-        cur_layer_ = want - 1;
-        set_plan_slot(0);
-        progress_at("verify batch: the CPU experts of layer", l);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
-        progress_tick();
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
-            sink_.counts[0] = 0;
-            sink_.counts[1] = 0;
-            sink_.counts[2] = 0;
-            sink_.start[0] = 0;
-            sink_.start2[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
-        }
-        *flag = want;
-        ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_pool += ms_since(b);
-    }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-    cudaStreamSynchronize(copy_);
-    if (prof_on_) collect_profile();
-    ++windows;
-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
-    if (!sample_rows(S, err)) return false;
-    for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
-    note_nonfinite(S, last_pos_b_);
-    progress_at("decode");
-    progress_beat();
-    return true;
-}
-
-bool Verifier::commit_slots(std::string& err) {
-    std::vector<int> keep(slots_.size(), 0);
-    for (int t = 0; t < last_t_; ++t) ++keep[(size_t) last_rows_[t]];
-    return commit_slot_prefixes(keep.data(), err);
-}
-
-bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
-    const OnDevice on_device(device_);
-    if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
-    const int S = last_t_;
-    const Clock::time_point t0 = Clock::now();
-    const int64_t CB = 2 + max_t_;
-    // One prefix per slot: rejected draft rows must not enter recurrent state.
-    for (int t = 0; t < S;) {
-        const int first = t;
-        while (t < S && last_rows_[t] == last_rows_[first]) ++t;
-        const int n = keep[last_rows_[first]];
-        if (n < 1 || n > t - first) {
-            err = "verify: accepted prefix is outside its slot group";
-            return false;
-        }
-        int32_t* c = h_commitb_ + (size_t) last_rows_[first] * CB;
-        c[0] = n;
-        c[1] = n - 1;
-        for (int j = 0; j < max_t_; ++j)
-            c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
-    }
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
-        const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
-        if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
-        const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
-    }
-    if (ple_stage())
-        for (int t = 0; t < S;) {
-            const int first = t;
-            while (t < S && last_rows_[t] == last_rows_[first]) ++t;
-            SessionState& sx = *slots_[(size_t) last_rows_[first]];
-            for (int u = first; u < first + keep[last_rows_[first]]; ++u) {
-                sx.ple_prev[0] = sx.ple_prev[1];
-                sx.ple_prev[1] = last_tokens_[u];
-            }
-        }
-    ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
-}
-
-bool Verifier::sample_rows(int S, std::string& err) {
-    bool any = false;
-    for (int t = 0; t < S; ++t) {
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
-        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
-                                       m_out_ + t, cs_);
-        any = true;
-    }
-    if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
-    return true;
-}
-
-bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
-    const OnDevice on_device(device_);
-    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
-    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
-    if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
-    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
-    if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
-        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
-    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
-        for (int t = 0; t < S; ++t) {
-            SessionState& sx = *slots_[(size_t) rows[t]];
-            sx.ple_prev[0] = sx.ple_prev[1];
-            sx.ple_prev[1] = tokens[t];
-        }
-    b_k_ = 0;
-    b_steps_ = le_ - lb_;
-    ring_now();
-    b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
-    return true;
-}
-
-int Verifier::batch_serve(PoolMultiFn pool, void* user) {
-    if (!b_running_.load(std::memory_order_acquire)) return 1;
-    volatile uint32_t* const seq = h_seq_;
-    // #646: an all-resident stage's graph raises no host doorbells (see run_slot_rows): nothing to serve per layer,
-    // except the PLE flag, which the graph's first wait reads and only the host can raise (the same raise
-    // run_slot_rows makes).  Per-window (ar_on): with a loan in flight the doorbell graph needs the per-layer service.
-    if (ar_on() && ss_->ple.ready() && ple_stage()) {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        *h_flag_ = 1;
-    }
-    for (;;) {
-        // the window's row count is read after the served-layer count: with external serving the window this call
-        // began on can have finished and the next one been launched meanwhile, and batch_launch writes its rows
-        // (stage_batch) before it resets b_k_, so a count that is the new window's comes with the new rows
-        const int64_t k = b_k_.load(std::memory_order_acquire);
-        if (ar_on() || k >= b_steps_) break;
-        const uint32_t want = (uint32_t) (k + 1);
-        if (*seq < want) return 0;
-        const int S = last_t_;
-        const Clock::time_point b = Clock::now();
-        cur_layer_ = want - 1;
-        set_plan_slot(0);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + k);
-        progress_tick();
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
-            sink_.counts[0] = 0;
-            sink_.counts[1] = 0;
-            sink_.counts[2] = 0;
-            sink_.start[0] = 0;
-            sink_.start2[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
-        }
-        *(volatile uint32_t*) h_flag_ = want;
-        ms_pool += ms_since(b);
-        ring_now();
-        b_k_.fetch_add(1, std::memory_order_release);
-    }
-    return 1;
-}
-
-int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
-    if (!b_running_) return 1;
-    // set_external_serve: another thread serves the doorbells (batch_serve) and this one only checks for a window that
-    // will not finish, as below: its graph ended (or failed) with a layer still to ring, or no layer rang for 20 s.
-    // The stream query can wait for the driver's lock while a read's call holds it; the doorbells go on meanwhile.
-    // The served count is read before the query and the ring count after it: a layer served in between rang first.
-    if (ext_serve_.load(std::memory_order_acquire) && !ar_on()) {
-        const int64_t k = b_k_.load(std::memory_order_acquire);
-        if (k < b_steps_) {
-            const auto now = Clock::now();
-            if (now - last_ring() <= std::chrono::milliseconds(2) || now - ext_checked_ < std::chrono::milliseconds(1))
-                return 0;
-            ext_checked_ = now;   // (at most one query a millisecond: pump calls this in a loop)
-            const OnDevice on_device(device_);
-            const cudaError_t q = cudaStreamQuery(cs_);
-            if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (k + 1)) {
-                err = "verify batch: layer " + std::to_string(lb_ + k) + " never rang (" +
-                      (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
-                b_running_ = false;
-                return -1;
-            }
-            if (now - last_ring() > std::chrono::seconds(20)) {
-                err = "verify batch: timed out at layer " + std::to_string(lb_ + k) +
-                      released_note(release_gpu_waits(5000));
-                b_running_ = false;
-                return -1;
-            }
-            return 0;
-        }
-    }
-    const OnDevice on_device(device_);
-    const int S = last_t_;
-    // the layers that have rung so far (batch_serve); with one still to ring: did the graph finish without it, or
-    // has it waited too long?
-    if (!batch_serve(pool, user)) {
-        const auto now = Clock::now();
-        if (now - last_ring() > std::chrono::milliseconds(2)) {
-            const cudaError_t q = cudaStreamQuery(cs_);
-            if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (b_k_ + 1)) {
-                err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (" +
-                      (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
-                b_running_ = false;
-                return -1;
-            }
-            if (now - last_ring() > std::chrono::seconds(20)) {
-                err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) +
-                      released_note(release_gpu_waits(5000));
-                b_running_ = false;
-                return -1;
-            }
-        }
-        return 0;
-    }
-    const cudaError_t q = cudaStreamQuery(cs_);
-    if (q == cudaErrorNotReady) return 0;
-    if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
-    const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
-    if (qc == cudaErrorNotReady) return 0;
-    if (prof_on_) collect_profile();
-    if (last_stage()) {
-        if (!sample_rows(S, err)) { b_running_ = false; return -1; }
-        for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
-        note_nonfinite(S, last_pos_b_);
-    }
-    ++windows;
-    b_running_ = false;
-    progress_beat();
-    return 1;
 }
 
 // #879: STRATA_NAN_GUARD=0 turns the guard off (no kernel is recorded; the graphs are captured once, so it is read once)
@@ -3633,302 +2836,6 @@ bool Verifier::copy_logits(int t, float* host) const {
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
-}
-
-
-// ================================ PIPELINED WINDOWS (see verify.hpp) ================================
-//
-// The window is run()'s, step for step: the same graph, the same staging, the same per-layer service (the PLE rows
-// gathered while layer 0 is served, the zero-doorbell graph's one flag), the same commit graph.  Only the waits are
-// split up: the host polls instead of spinning, so it can serve the other stage's window in between.
-
-namespace {
-double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
-}  // namespace
-
-void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
-    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
-    auto ev = [](cudaEvent_t e) {
-        if (e == nullptr) return "none";
-        const cudaError_t q = cudaEventQuery(e);
-        return q == cudaSuccess ? "done" : q == cudaErrorNotReady ? "PENDING" : "error";
-    };
-    std::fprintf(f, "  %s: %s T=%d pos %lld served %lld/%lld; GPU rang %u, flags served %u A %u B %u; window event %s, "
-                    "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
-                 (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
-                 rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
-}
-
-bool Verifier::capture_all(std::string& err) {
-    const OnDevice on_device(device_);
-    if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
-    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
-    for (int T = 1; T <= max_t_; ++T)
-        if (!capture(T, err)) return false;
-    if (!capture_commit(err)) return false;
-    if ((ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) ||
-        (ev_commit_ == nullptr && cudaEventCreateWithFlags(&ev_commit_, cudaEventDisableTiming) != cudaSuccess)) {
-        err = "verify: event create failed";
-        return false;
-    }
-    if (prof_on_ && prof_pin_ == nullptr &&
-        cudaHostAlloc((void**) &prof_pin_, prof_h_.size() * 8, cudaHostAllocDefault) != cudaSuccess) {
-        prof_pin_ = nullptr;   // the pipelined windows go unprofiled
-        cudaGetLastError();
-    }
-    pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
-    return true;
-}
-
-// The host staging of a pipelined window: run()'s (stage_inputs), and its PLE rows from `ple_prev` with their pages
-// prefetched (they are gathered into the mapped rows when layer 0 is served, as run() does).
-void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]) {
-    using namespace strata::kernels;
-    stage_inputs(T, tokens, pos0);
-    staged_ = false;   // a later run() stages its own window
-    SessionState& ss = *ss_;
-    fl_ple_ = ss.ple.ready() && ple_stage();
-    if (fl_ple_) {
-        int32_t prev[2] = {ple_prev[0], ple_prev[1]};
-        for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, pl_ple_rows_.data() + t * PLE_N_HEADS);
-            prev[0] = prev[1];
-            prev[1] = tokens[t];
-            ss.ple.table->prefetch_rows(pl_ple_rows_.data() + t * PLE_N_HEADS);
-        }
-    }
-    pl_prev_[0] = ple_prev[0];
-    pl_prev_[1] = ple_prev[1];
-}
-
-bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
-    if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
-    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
-    if (pl_ple_rows_.empty()) { err = "verify: pipelined window not prepared (capture_all)"; return false; }
-    const Clock::time_point t0 = Clock::now();
-    pl_stage(T, tokens, pos0, ple_prev);
-    pl_prestaged_ = true;
-    ms_host += ms_since(t0);
-    return true;
-}
-
-bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
-    const OnDevice on_device(device_);
-    if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
-    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
-    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
-    SessionState& ss = *ss_;
-    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
-        err = "verify: pipelined window not prepared (capture_all)";
-        return false;
-    }
-    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
-    const Clock::time_point t0 = Clock::now();
-    last_batch_ = false;
-    bool staged = pl_prestaged_ && last_t_ == T && last_pos0_ == pos0;
-    for (int t = 0; staged && t < T; ++t) staged = last_tokens_[t] == tokens[t];
-    if (staged && ss.ple.ready() && ple_stage())
-        staged = pl_prev_[0] == ss.ple_prev[0] && pl_prev_[1] == ss.ple_prev[1];
-    pl_prestaged_ = false;
-    if (!staged) pl_stage(T, tokens, pos0, ss.ple_prev);
-    const int G = groups_[T] > 0 ? groups_[T] : 1;
-    fl_T_ = T;
-    fl_k_ = 0;
-    fl_total_ = (le_ - lb_) * G;
-    fl_prof_ = prof_on_ && G == 1 && prof_pin_ != nullptr;
-    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
-    ms_host += ms_since(t0);
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
-    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
-    if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
-    (void) cudaStreamQuery(cs_);   // WDDM: submit now
-    fl_active_ = true;
-    fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
-    return true;
-}
-
-int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
-    if (!fl_active_) return 1;
-    if (fl_k_ >= fl_total_) return 1;
-    // Nothing rang yet and neither the WDDM flush nor the timeout below is due: return before any CUDA call.  The
-    // pipelined loop asks both stages' windows this millions of times a second while they wait on their doorbells,
-    // and the device switch (OnDevice: cudaGetDevice and two cudaSetDevice) made that a few driver calls each time:
-    // 919 million passes before the host stalled inside one of those cudaSetDevice calls with both stages waiting
-    // on it (0.1.41, Windows, an RTX 3060 + RTX 5070 Ti split).  The same answer as the loop below gives.
-    if (!ar_on() && *(volatile uint32_t*) h_seq_ < (uint32_t) (fl_k_ + 1)) {
-        const double now = now_ms();
-        if (now - fl_flush_ms_ <= 2.0 && now - fl_since_ms_ <= 20000.0) return 0;
-    }
-    const OnDevice on_device(device_);
-    const ModelGeometry& g = *g_;
-    SessionState& ss = *ss_;
-    const int T = fl_T_;
-    // the PLE rows into the mapped staging (layer 1's pre() copies them once flag 1 is up), as run() does at k == 0
-    auto gather_ple = [&]() -> bool {
-        if (!fl_ple_) return true;
-        const Clock::time_point tp = Clock::now();
-        if (!ss.ple.table->gather_batch(pl_ple_rows_.data(), (size_t) T, h_ple_, err)) return false;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        ms_host += ms_since(tp);
-        return true;
-    };
-    if (ar_on()) {   // the zero-doorbell graph never rings: it waits only for flag 1 (stage 0's PLE rows).
-        // Per-window: with a loan in flight (ar_off_) the doorbell graph needs the per-layer service below.
-        if (!gather_ple()) return -1;
-        *(volatile uint32_t*) h_flag_ = 1;
-        fl_k_ = fl_total_;
-        progress_tick();
-        return 1;
-    }
-    const int G = groups_[T] > 0 ? groups_[T] : 1;
-    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    while (fl_k_ < fl_total_) {
-        const int64_t l = lb_ + fl_k_ / G;
-        const uint32_t want = (uint32_t) (fl_k_ + 1);
-        if (*(volatile uint32_t*) h_seq_ < want) {
-            const double now = now_ms();
-            if (now - fl_flush_ms_ > 2.0) {   // flush WDDM and notice a dead graph, as run() does
-                fl_flush_ms_ = now;
-                const cudaError_t q = cudaEventQuery(ev_done_);
-                if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < want) {
-                    trace_ev("NEVER-RANG", fl_k_, l, (int64_t) q);
-                    err = "verify: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
-                    return -1;
-                }
-                (void) cudaStreamQuery(cs_);
-            }
-            if (now - fl_since_ms_ > 20000.0) {   // #267: no spin kernel may outlive the engine
-                trace_ev("TIMEOUT", fl_k_, l, 0);
-                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
-                return -1;
-            }
-            return 0;
-        }
-        const Clock::time_point b = Clock::now();
-        ms_wait += now_ms() - fl_since_ms_;
-        const int grp = (int) (fl_k_ % G);
-        cur_layer_ = want - 1;
-        set_plan_slot(grp);
-        const int tb = gtb[grp], n = gte[grp] - gtb[grp];
-        progress_at("verify window (pipelined): the CPU experts of layer", l);
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
-        if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
-                              (int64_t) ms_since(b));
-        progress_tick();
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
-            sink_.counts[0] = 0;
-            sink_.counts[1] = 0;
-            sink_.counts[2] = 0;
-            sink_.start[0] = 0;
-            sink_.start2[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
-        }
-        if (fl_k_ == 0 && !gather_ple()) return -1;
-        *(volatile uint32_t*) h_flag_ = want;
-        ++fl_k_;
-        ms_pool += ms_since(b);
-        fl_since_ms_ = fl_flush_ms_ = now_ms();
-    }
-    return 1;
-}
-
-bool Verifier::done(std::string& err) {
-    if (!fl_active_ || fl_k_ < fl_total_) return false;
-    const OnDevice on_device(device_);
-    const cudaError_t q = cudaEventQuery(ev_done_);
-    if (q == cudaErrorNotReady) {
-        const double now = now_ms();
-        if (now - fl_flush_ms_ > 2.0) { fl_flush_ms_ = now; (void) cudaStreamQuery(cs_); }
-        if (now - fl_since_ms_ > 20000.0) {   // every layer served, and the graph still runs: #267 as above
-            err = "verify: the window never finished" + released_note(release_gpu_waits(5000));
-        }
-        return false;
-    }
-    if (q != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(q); return false; }
-    if (copy_used_) {   // no host function of this window may raise flag B in the next one
-        if (cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
-        copy_used_ = false;
-    }
-    return true;
-}
-
-bool Verifier::pl_finish(int32_t* out, std::string& err) {
-    using namespace strata::kernels;
-    const OnDevice on_device(device_);
-    const ModelGeometry& g = *g_;
-    fl_active_ = false;
-    if (fl_prof_) accumulate_profile(prof_pin_);
-    ++windows;
-    trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
-    if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
-    const int T = fl_T_;
-    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
-        SamplerParams sp = sampling_;
-        sp.counter = (uint64_t) last_pos0_;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = "verify: the head sampling failed";
-            return false;
-        }
-    }
-    if (out != nullptr)
-        for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
-    note_nonfinite(T, nullptr);
-    progress_beat();
-    return true;
-}
-
-bool Verifier::pl_commit_async(int n_keep, std::string& err) {
-    const OnDevice on_device(device_);
-    if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
-    if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
-    const Clock::time_point t0 = Clock::now();
-    if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
-        cudaError_t q;
-        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) _mm_pause();
-        if (q != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(q); return false; }
-    }
-    h_commit_[0] = n_keep;
-    h_commit_[1] = n_keep - 1;
-    for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-    if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    if (cudaEventRecord(ev_commit_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
-    (void) cudaStreamQuery(cs_);
-    commit_live_ = true;
-    if (ple_stage())
-        for (int t = 0; t < n_keep; ++t) {
-            ss_->ple_prev[0] = ss_->ple_prev[1];
-            ss_->ple_prev[1] = last_tokens_[t];
-        }
-    ms_commit += ms_since(t0);
-    return true;
-}
-
-void Verifier::absorb_stats(Verifier& o) {
-    ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
-    windows += o.windows;
-    o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;
-    o.windows = 0;
-    for (int k = 0; k < 2; ++k)
-        for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
-    prof_windows_ += o.prof_windows_;
-    o.prof_windows_ = 0;
 }
 
 }  // namespace strata::core

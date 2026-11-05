@@ -294,35 +294,6 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
                                                                  scratch_stride);
 }
 
-// The same blocks for queries of different slots: query blockIdx.z reads its own slot's pools, everything else is
-// attn_chunk_kernel's batched form (qsa_decode_attn_slots).
-template <int KV_MODE, bool LANE_CELL>
-__global__ void __launch_bounds__(THREADS) attn_chunk_slots_kernel(const float* __restrict__ q, QsaAttnSlotPools ps,
-                                                                   const int32_t* __restrict__ ids,
-                                                                   const int32_t* __restrict__ step, int n_kv_heads,
-                                                                   int page_size, float scale,
-                                                                   float* __restrict__ part_acc,
-                                                                   float* __restrict__ part_m,
-                                                                   float* __restrict__ part_l, int n_chunks, int cap,
-                                                                   long long scratch_stride) {
-    attn_chunk_body<KV_MODE, LANE_CELL, false, false>(q, ps.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
-                                                      part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
-}
-
-// Batch windows: query blockIdx.z attends over its own slot's pools (rows.p[z]); the default kernel otherwise.
-template <int KV_MODE>
-__global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* __restrict__ q, QsaAttnPoolsRows rows,
-                                                                  const int32_t* __restrict__ ids,
-                                                                  const int32_t* __restrict__ step, int n_kv_heads,
-                                                                  int page_size, float scale,
-                                                                  float* __restrict__ part_acc,
-                                                                  float* __restrict__ part_m,
-                                                                  float* __restrict__ part_l, int n_chunks, int cap,
-                                                                  long long scratch_stride) {
-    attn_chunk_body<KV_MODE, false, false, false>(q, rows.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
-                                                  part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
-}
-
 // Turing (INT8 pools): attn_chunk_kernel<1> bit for bit, rearranged for the SM's shared-memory pipe, which the
 // default kernel saturates (its time grew with the queries even with the SMs half empty).  Three changes, none to an
 // operand or the order of an operation:
@@ -816,11 +787,6 @@ bool lane_cell_attn() {
     return on;
 }
 
-// 0 fp16, 1 int8, 2 q4_0, 3 int8 K with q4_0 V
-int attn_kv_mode(const QsaAttnPools& p) {
-    return p.k_q4 != nullptr ? 2 : (p.k_q != nullptr && p.v_q4 != nullptr ? 3 : (p.k_q != nullptr ? 1 : 0));
-}
-
 // STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel.  Unset it follows
 // STRATA_ATTN_DAILY (the Daily had it on by default on NVIDIA), so upstream's merger stays the default.
 int attn_merge_v2() {
@@ -918,103 +884,6 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
-
-bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return true;
-    if (n_q > kQsaAttnMaxSlots) return false;
-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps) {
-        std::fprintf(stderr, "qsa_decode_attn_slots: unsupported geometry or missing buffers\n");
-        std::exit(1);
-    }
-    const int kv_mode = attn_kv_mode(pools.p[0]);
-    for (int64_t z = 0; z < n_q; ++z) {
-        if (!pools.p[z].page_table) {
-            std::fprintf(stderr, "qsa_decode_attn_slots: missing page table\n");
-            std::exit(1);
-        }
-        if (attn_kv_mode(pools.p[z]) != kv_mode) return false;
-    }
-    const bool lane_cell = lane_cell_attn();
-    // only where qsa_decode_attn_batch runs attn_chunk_kernel; its other variants keep the per-query calls
-    if (!lane_cell && pre75_attn()) return false;
-    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
-    float* part_acc = scratch;
-    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
-    float* part_l = part_m + (size_t) n_chunks * s.n_head;
-    const float scale = 1.0f / sqrtf((float) HD);
-    const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    cudaStream_t st = (cudaStream_t) stream;
-#define STRATA_ATTN_SLOTS(M, LC) attn_chunk_slots_kernel<M, LC><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
-    if (lane_cell) {
-        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true);
-        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true);
-        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true);
-        else STRATA_ATTN_SLOTS(0, true);
-    } else {
-        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false);
-        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false);
-        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, false);
-        else STRATA_ATTN_SLOTS(0, false);
-    }
-#undef STRATA_ATTN_SLOTS
-    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
-                 (unsigned) n_q, st);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_decode_attn_slots: %s\n", cudaGetErrorString(e));
-        std::exit(1);
-    }
-    return true;
-}
-
-void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
-                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return;
-    const QsaAttnPools& pools = rows.p[0];
-    if (rows.n != n_q || n_q > kAttnRowsMax || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 ||
-        !scratch || !ids || !steps) {
-        std::fprintf(stderr, "qsa_decode_attn_batch_rows: unsupported geometry or missing buffers\n");
-        std::exit(1);
-    }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
-    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
-    float* part_acc = scratch;
-    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
-    float* part_l = part_m + (size_t) n_chunks * s.n_head;
-    const float scale = 1.0f / sqrtf((float) HD);
-    const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    cudaStream_t st = (cudaStream_t) stream;
-    // The plain kernel is what qsa_decode_attn_batch runs unless one of its variants is on (lane-cell scoring, the
-    // pre-sm_75 / gfx103x kernel, the gfx906 swizzle): there each row goes through that call, one launch per row.
-    static const bool lane_cell_rows = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
-    bool per_row = lane_cell_rows;
-    per_row = per_row || pre75_attn();
-    if (per_row) {
-        for (int64_t r = 0; r < n_q; ++r)
-            qsa_decode_attn_batch(q + (size_t) r * s.n_head * HD, rows.p[r], ids + (size_t) r * cap,
-                                  steps + (size_t) r * kStepCount, cap, s, scratch + (size_t) r * stride,
-                                  attn + (size_t) r * s.n_head * HD, 1, stream);
-        return;
-    }
-#define STRATA_ATTN_ROWS(M) attn_chunk_rows_kernel<M><<<grid, THREADS, 0, st>>>(q, rows, ids, steps, (int) s.n_head_kv, \
-        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
-    if (kv_mode == 3) STRATA_ATTN_ROWS(3);
-    else if (kv_mode == 2) STRATA_ATTN_ROWS(2);
-    else if (kv_mode == 1) STRATA_ATTN_ROWS(1);
-    else STRATA_ATTN_ROWS(0);
-#undef STRATA_ATTN_ROWS
-    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
-                 (unsigned) n_q, st);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_decode_attn_batch_rows: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
 }

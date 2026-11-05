@@ -826,29 +826,6 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
 }
 
-// Queries of different slots, each with its own indexer keys: blockIdx.y is the query, and its CTAs run exactly the
-// single-query call of block_scores_multi_kernel (qsa_block_scores_slots).
-struct ScoreSlotKeys {
-    const float* pooled[MQ];
-    const float* dead[MQ];
-};
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(ScoreSlotKeys keys,
-                                                                              const float* __restrict__ q_idx,
-                                                                              const int32_t* __restrict__ steps,
-                                                                              int64_t max_blocks, float* __restrict__ out,
-                                                                              bool early_exit) {
-    const unsigned z = blockIdx.y;
-    // the slot's pointers picked by unrolled selects: indexing the argument array by z would copy it to local memory
-    const float* pooled = keys.pooled[0];
-    const float* dead = keys.dead[0];
-#pragma unroll
-    for (unsigned i = 1; i < MQ; ++i)
-        if (z == i) { pooled = keys.pooled[i]; dead = keys.dead[i]; }
-    block_scores_multi_body(pooled, dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
-                            steps + (size_t) z * kStepCount, 1, max_blocks, out + (size_t) z * max_blocks, early_exit,
-                            QsaScoreRows{});
-}
-
 // QSAROWS (docs/QSAROWS.md, STRATA_QSA_ROWS=1): block_scores_multi_kernel's work for NQ <= 4 queries with less issue
 // pressure per (block, query).  nsys of a 131k decode window (RTX 2080 Ti + RTX 3060): the multi kernel costs ~20 us more a
 // call for every row of the window on both cards - per (block, query) it reads the four query slices from shared memory
@@ -1054,27 +1031,6 @@ bool scores_early_exit() {
 }
 }  // namespace
 
-bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
-                            const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
-                            void* stream) {
-    if (nq <= 0) return true;
-    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) {
-        std::fprintf(stderr, "qsa_block_scores_slots: unsupported indexer geometry\n");
-        std::exit(1);
-    }
-    if (nq > MQ || !scores_multi_on()) return false;   // the single-query call would not run the multi kernel
-    ScoreSlotKeys keys{};
-    for (int64_t z = 0; z < nq; ++z) {
-        keys.pooled[z] = pooled[z];
-        keys.dead[z] = dead[z];
-    }
-    block_scores_slots_kernel<<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
-        keys, q_idx, steps, max_blocks, scores, scores_early_exit());
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slots: %s\n", cudaGetErrorString(e)); std::exit(1); }
-    return true;
-}
-
 // block_scores_multi_kernel with the warp sums as one recursive-halving reduction.  A (query, head) dot is a lane's
 // 4-term product summed over the 32 lanes by an xor butterfly (offsets 16, 8, 4, 2, 1): 5 shuffles per value, 20 per
 // (block, query) - on Turing the decode scorer's time grew with the window's queries (420K cells: 117 / 265 / 509 us
@@ -1274,20 +1230,6 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
     return true;
-}
-
-void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
-                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
-    if (nq <= 0) return;
-    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > MQ || rows.n != nq) {
-        std::fprintf(stderr, "qsa_block_scores_rows: unsupported geometry\n");
-        std::exit(1);
-    }
-    static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
-    block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
-                                                                                 max_blocks, scores, early, rows);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,

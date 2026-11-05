@@ -32,13 +32,6 @@ struct QsaAttnPools {
     const int32_t* page_table = nullptr;
 };
 
-/// Batch windows: every query's own K/V pools - query z reads p[z] (z < n).  n = 0: the call's one `pools`.
-inline constexpr int kAttnRowsMax = 8;
-struct QsaAttnPoolsRows {
-    QsaAttnPools p[kAttnRowsMax];
-    int n = 0;
-};
-
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
@@ -50,20 +43,6 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
-/// Up to this many queries of different slots in one qsa_decode_attn_slots call.
-constexpr int kQsaAttnMaxSlots = 8;
-
-/// One KV pool set per query of a qsa_decode_attn_slots call (passed by value as a kernel argument).
-struct QsaAttnSlotPools {
-    QsaAttnPools p[kQsaAttnMaxSlots];
-};
-
-/// qsa_decode_attn_batch for `n_q` queries that each attend over their OWN pools (`pools.p[i]`, one KV cache per batch
-/// slot): one launch instead of one call per query, every block computing exactly what the per-query call computes.
-/// The pools must all have one KV format. False (nothing launched) where the per-query call would run another kernel
-/// (n_q > kQsaAttnMaxSlots, mixed formats, the pre-sm_75 / gfx103x or gfx906 variants): the caller loops instead.
-bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 /// qsa_decode_attn_batch's two passes apart, whatever the environment
 /// says.  `chunks_only` runs the chunk pass into `scratch` with `daily_chunk` 0: attn_chunk_kernel (upstream's default),
 /// 1: the Daily's (attn_chunk_kernel_pre75, what STRATA_ATTN_DAILY=1 picks on CUDA).  `merge_only` merges those
@@ -75,9 +54,5 @@ void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, cons
                                  void* stream);
 void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
                                 float* attn, int64_t n_q, int v2, void* stream);
-/// qsa_decode_attn_batch for up to kAttnRowsMax queries of DIFFERENT sequences (batch slots), query z attending
-/// over rows.p[z] - one launch instead of one per query, the same per-query arithmetic (bit-identical outputs).
-void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
-                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
 }  // namespace strata::kernels
