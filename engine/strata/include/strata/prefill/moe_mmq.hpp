@@ -60,8 +60,7 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
-    /// set: expert z's matrix starts at tab->p[z] (w and expert_bytes are not used for addressing).  CUDA only,
-    /// and only where `tab_fits` said so.
+    /// set: expert z's matrix starts at tab->p[z] (w and expert_bytes are not used for addressing).
     const WeightTab* tab = nullptr;
 };
 
@@ -106,17 +105,10 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 
-/// y[i] = float(x[i]) for FP16 bits x.
-void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
 /// dst = {0, rows} (the bounds of one matrix; dst on the device).
 void set_bounds(int32_t* dst, int32_t rows, void* stream);
 
 // ---- STRATA_MMQ_DIRECT: the prompt MMQ reads resident experts in place (docs/DETAILS.md, "STRATA_MMQ_DIRECT") ----
-/// This build has the pointer-table MMQ.  false under HIP, gfx906, SYCL and builds without MMQ.
-bool tab_built();
-/// `tab_built`, `fits`, rows a multiple of 128 (no fallback tiles) and a pointer-table instance for the type (the
-/// native packs' nine: Q2_0 IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS Q8_0; not Q5_0 or the K-quants).
-bool tab_fits(int ggml_type, int64_t w_rows);
 /// The bytes past a [rows, cols] matrix that its last row's final K tile reads (the largest over-read of any
 /// config on any visible GPU): 72 for IQ4_NL and 136 for Q8_0 at 640 columns, 0 for IQ3_S at 2560 (sm_86).  0 without MMQ.
 size_t overread_bytes(int ggml_type, int64_t cols);
@@ -128,7 +120,8 @@ constexpr size_t kSlotGuard = 256;
 /// 160 or 320 tiles per column tile on 82 SMs: yes; 108 or 128 SMs: no (stream-k splits the few-tile launches).
 bool whole_tiles(int ggml_type, int64_t w_rows, int n_experts);
 /// STRATA_MMQ_DIRECT, read once: 0 (default) today's gather; 1 the guard layout and resident experts read in
-/// place; 2 the guard layout with today's gather (the bitwise A/B reference).  0 whenever !tab_built().
+/// place; 2 the guard layout with today's gather (the bitwise A/B reference).  Always 0 in this build, which has no
+/// pointer-table MMQ (1 and 2 are reported as ignored).
 int direct_mode();
 /// kSlotGuard when direct_mode() != 0, else 0 (no CUDA call).
 size_t direct_slot_guard();

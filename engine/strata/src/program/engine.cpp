@@ -57,7 +57,6 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
-#include "strata/core/emulate.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include <unistd.h>
@@ -1381,7 +1380,6 @@ struct EngineState {
     bool pcie_given = false;
     const char* kv_rot = nullptr;
     strata::kernels::RopeScaling rope_cfg;   // type filled at the option checks; the rest at the resolution below them
-    const char* isa_floor = nullptr;
     std::string err;
     bool native_pack = false;
     int64_t slot_guard = 0;
@@ -2127,30 +2125,12 @@ int EngineState::start_up(int argc, char** argv) {
     // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
     // chosen above it), and so is ggml-cpu in the release build, which the native pack's layout load initializes
     // next.  Refused here, by name, rather than an illegal instruction in the first expert.
-    // The experimental older-CPU build (STRATA_ISA_FLOOR=avx|none, compiled on that PC; #394 #595 #623) has ggml-cpu
-    // for that floor, so a native pack's experts run there on ggml-cpu (every AVX2 kernel is behind cpu_avx2_ok).
-    isa_floor = strata::kernels::cpu::isa_floor_build();
-    if (!strata::kernels::cpu::cpu_avx2_ok() && isa_floor[0] == '\0') {
+    if (!strata::kernels::cpu::cpu_avx2_ok()) {
         return fail(2, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
                        "CPU expert kernels need; Strata runs on Intel Haswell (2013), AMD Zen (2017) or newer. "
                        "Older CPUs are EXPERIMENTAL and slow: setup compiles an engine for them on this PC "
                        "(STRATA_ISA_FLOOR, see \"Older CPUs\" in docs/INSTALL.md)\n",
                     strata::kernels::cpu::cpu_name().c_str());
-    }
-    if (isa_floor[0] != '\0') {
-        const bool avx_floor = std::strcmp(isa_floor, "avx") == 0;
-        if (avx_floor ? !strata::kernels::cpu::cpu_avx1_ok() : !strata::kernels::cpu::cpu_sse42_ok()) {
-            return fail(2, "strata generate: this engine is the older-CPU build for %s, which this CPU (%s) does "
-                           "not have%s\n", avx_floor ? "AVX" : "SSE4.2 with POPCNT",
-                        strata::kernels::cpu::cpu_name().c_str(),
-                        avx_floor ? "; compile it with STRATA_ISA_FLOOR=none" : "");
-        }
-        if (!strata::kernels::cpu::cpu_avx2_ok())
-            std::fprintf(stderr, "strata generate: EXPERIMENTAL older-CPU build (ggml-cpu for %s): this CPU has no AVX2, "
-                                 "so the CPU's experts run on ggml-cpu's kernels - expect it to be slow\n", isa_floor);
-        else
-            std::fprintf(stderr, "strata generate: this is the older-CPU build (ggml-cpu for %s); this CPU has AVX2, "
-                                 "and the normal build is faster on it\n", isa_floor);
     }
 
     if (!o.native_head_gguf.empty() && !o.stream_token) {
@@ -2819,9 +2799,7 @@ int EngineState::start_up(int argc, char** argv) {
         const bool named = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess;
         if (!named) cudaGetLastError();
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
-        std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n", dev, name,
-                     strata::cc_major_of(p.major), strata::cc_minor_of(p.minor),
-                     strata::emulated_cc() ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)" : "");
+        std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d\n", dev, name, p.major, p.minor);
         {   // #542: a build whose libcudart is older than its headers (a CUDA 13 kit with a dangling libcudart.so that
             // CMake resolved to the system's CUDA 12 one) reads cudaDeviceProp shifted - silently, and slowly
             int rt = 0;

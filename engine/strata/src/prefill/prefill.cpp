@@ -6,7 +6,6 @@
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
 #endif
 #include "mmq_resident_sort.hpp"
-#include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
@@ -78,8 +77,6 @@ bool gather_native_group(const GatherGroup&, size_t, size_t, size_t, size_t, voi
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
-bool tab_built() { return false; }
-bool tab_fits(int, int64_t) { return false; }
 size_t overread_bytes(int, int64_t) { return 0; }
 bool whole_tiles(int, int64_t, int) { return false; }
 int direct_mode() { return 0; }
@@ -906,28 +903,8 @@ const MmqPlan& mmq_plan() {
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
-        // STRATA_MMQ_DIRECT=1: a native layer's resident experts are read in place when the pointer-table MMQ covers
-        // both products, gate/up reads nothing past its matrix, the down over-read fits the slot guard, and the blob
-        // is exactly [gate | up | down] in MMQ's matrix sizes (the bytes a gather would copy)
         p.direct.assign(p.layer.size(), 0);
         p.d_over.assign(p.layer.size(), 0);
-        if (on && lay.native && mmq::direct_mode() == 1) {
-            int64_t nd = 0;
-            for (int64_t l = 0; l < layers; ++l) {
-                if (!p.layer[(size_t) l]) continue;
-                const auto& f = lay.fmt[(size_t) l];
-                const int gt = f.gu_type, dt = f.d_type;
-                if (!mmq::tab_fits(gt, 1280) || !mmq::tab_fits(dt, N)) continue;
-                if (mmq::overread_bytes(gt, N) != 0 || mmq::overread_bytes(dt, 640) > mmq::kSlotGuard) continue;
-                if (f.up_off != mmq::matrix_bytes(gt, 1280, N) / 2 || f.down_off != 2 * f.up_off) continue;
-                if (mmq::matrix_bytes(dt, N, 640) != f.bytes - f.down_off) continue;
-                p.direct[(size_t) l] = 1;
-                p.d_over[(size_t) l] = (uint32_t) mmq::overread_bytes(dt, 640);
-                ++nd;
-            }
-            std::fprintf(stderr, "strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): %lld of %lld "
-                                 "layers\n", (long long) nd, (long long) layers);
-        }
         // the verdict depends only on the layer's formats and the visible GPUs: taken once here, not per chunk
         p.group_sort.assign(p.layer.size(), 0);
         if (on && detail::mmq_group_sort_requested() && !detail::mmq_resident_sort_requested()) {
@@ -2228,22 +2205,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
                 normed = false;
-                bool hcd = false;
                 bool hdown = false;
                 if (wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
                     hdown = wd->kind == core::WeightKind::Bf16InF32 && wd->data && wd->ne0 == D && wd->ne1 == LR &&
                             m.gemm.bf16_hcd_exact(m.xn16, ldx, (const uint16_t*) wd->data, m.lo, T, LR, D);
                 } else if (wd->q8_scale == nullptr && ldx != D) {
-                    if (wd->kind != core::WeightKind::Bf16InF32 || !wd->data || wd->ne0 != D || wd->ne1 != LR ||
-                        wi->kind != core::WeightKind::Bf16InF32 || !wi->data || wi->ne0 != D || wi->ne1 != HC ||
-                        !strata_pf_hcdown_bf16(m.xn16, ldx, (const uint16_t*) wd->data, (const uint16_t*) wi->data, LR,
-                                               HC, m.lo, m.inj, T, D, m.cs)) {
-                        err = "prefill: STRATA_PF_HCDOWN could not run the hyper-connection projections";
-                        return false;
-                    }
-                    hcd = true;
+                    err = "prefill: STRATA_PF_HCDOWN could not run the hyper-connection projections";
+                    return false;
                 }
-                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
@@ -2273,7 +2243,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 if (upmixed) {
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
@@ -2347,14 +2317,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         pt.mark(kPfQsa, cs);
                         pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
                     }
-                    // #579 #613 (HIP, opt-in A/B, STRATA_KV_HOST_DMA=1): the append writes the staging pool and the
-                    // resident slots only, and one DMA copies the chunk's blocks from the staging pool to the host copy
-                    // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
-                    // first block is complete; past the chunk's last cell nothing is read until a later append writes
-                    // it).  CUDA: never.
-                    constexpr bool kv_host_dma = false;
-                    const bool host_by_dma = staged && kv_host_dma;
-                    const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
+                    const strata::kernels::KvHostPools* host_w = &st.host;
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
                         // streamed: each half writes its part of the host copy and of the staging pool
                         strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
@@ -2380,10 +2343,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
                                       host_w, staged ? &m.stage : nullptr);
-                        if (host_by_dma)
-                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
-                                                                core::qsa_kv_format(st), p0 / s.page_size,
-                                                                (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
                     split_q(m.Qf, m.q, T, m.cs);

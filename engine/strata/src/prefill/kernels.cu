@@ -1,9 +1,7 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
-#include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
-#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1023,7 +1021,7 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
         // several waves and is expected to be slower than the default kernel; the architecture and shared-memory
         // tests stay)
         static const bool any_sms = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) >= 2; }();
-        if (strata::cc_major_of(major) < 8 || (!any_sms && sms < HK * (S / GDV)) || (size_t) strata::smem_optin_of(smem) < kChunkScanSmem)
+        if (major < 8 || (!any_sms && sms < HK * (S / GDV)) || (size_t) smem < kChunkScanSmem)
             return cudaErrorNotSupported;
     }
     float* scratch = gdn_chunk_scratch();
@@ -1496,7 +1494,7 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
     if (ok_dev[dev] == 0) {
         int major = 0;
         ok_dev[dev] = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                      strata::cc_major_of(major) >= 8 ? 1 : 2;
+                      major >= 8 ? 1 : 2;
         cudaGetLastError();
     }
     if (ok_dev[dev] != 1) return false;

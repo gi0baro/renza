@@ -27,8 +27,6 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/gfx_arch.hpp"
-#include "strata/core/sm75_series.hpp"
 #include "s26_tsum.cuh"
 #include "q8_1_il.cuh"
 #include "strata/kernels/pdl.hpp"
@@ -152,10 +150,8 @@ __device__ __forceinline__ float warp_max(float x) {
 
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_quantize_q8_1_kernel(const float* x_, Q81Block* y_, int n_in) {
-    const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
-    Q81Block* STRATA_PDL_RESTRICT y = y_;
-    pdl_trigger();   // PDL (pdl.hpp): the projection after this one may start loading its weights
-    pdl_wait();
+    const float* x = x_;
+    Q81Block* y = y_;
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
     const float xi = x[i];
@@ -1157,8 +1153,8 @@ __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
                                          int n_in, int n_out,
                                          const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
-    const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
-    float* STRATA_PDL_RESTRICT y = y_;
+    const Q81Block* x = x_;
+    float* y = y_;
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     int bxi = int(blockIdx.x);
@@ -1170,9 +1166,9 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     const int x_stride = n_in / Q8K;                   // Q8_1 blocks per activation column
     float tmp[NCOLS][ROWS] = {};
     int kbx = tid / F::T;
-    if constexpr (kPdlPrefetch) {
-        // PDL (pdl.hpp): the first block's weights are loaded before waiting for the activations, then that block
-        // is applied exactly as the loop below would apply it (the same rows, columns and order)
+    {
+        // the first block's weights are loaded first, then that block is applied exactly as the loop below would
+        // apply it (the same rows, columns and order)
         typename F::W w0[ROWS];
         const int kqs = F::kqs(tid);
         if (kbx < blocks_per_row) {
@@ -1180,8 +1176,6 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
             for (int i = 0; i < ROWS; ++i)
                 if (row0 + i < n_out) w0[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
         }
-        pdl_trigger();
-        pdl_wait();
         if (kbx < blocks_per_row) {
             const int kby = kbx * F::KBY;
 #pragma unroll
@@ -2380,19 +2374,9 @@ __global__ void __launch_bounds__(WARPS * WARP) q2_0_warp_rows_kernel(const Q20B
         }
 }
 bool q2_0_warp_rows_on() {
-    static int on[16] = {};   // by device ordinal: 0 unknown, 1 yes, -1 no
     static const int env = [] { const char* v = std::getenv("STRATA_Q2_WARP"); return v ? (v[0] == '0' ? 0 : 1) : -1; }();
     if (env >= 0) return env == 1;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
-    if (on[dev] == 0) {
-        int maj = 0, mnr = 0;
-        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                        cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
-        if (!ok) cudaGetLastError();
-        on[dev] = ok && strata::sm75_default(maj, mnr) ? 1 : -1;   // Turing only, with STRATA_SM75_PERF=1
-    }
-    return on[dev] > 0;
+    return false;
 }
 }  // namespace
 
@@ -2802,35 +2786,6 @@ constexpr IlRows kIlRowsShared[] = {   // sm_86 + sm_120, and the fallback for e
 // `mmvq_il_parity --bench --emit-table` on the card (docs/MMVQ_IL_TABLE.md), paste the printed block as a
 // `constexpr IlRows kIlRows_89[]` and add {89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)} below.  Each choice
 // is bitwise the same output, so a table is only speed.  Without a rebuild: STRATA_MMVQ_IL_ROWS (see il_env_rows).
-// Volta (sm_70): read off mmvq_il_parity --bench on a V100-SXM2-32GB (two runs, mean), the same rule - per cell the
-// rows count whose every measured shape takes at least 3% off native_mmvq's time (e.g. the Q5_K head at 3 columns
-// 1094 -> 821 us, Q6_K 12288 rows 68.9 -> 47.9 us), else 0; unmeasured classes take a neighbour's value (PR 1401)
-constexpr IlRows kIlRows_70[] = {
-    {23, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 4, 2, 2, 2}}},   // IQ4_XS
-    {12, {{0, 2, 2, 4, 4}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q4_K
-    {13, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 1, 2, 2, 2}}},   // Q5_K
-    {14, {{0, 1, 1, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
-};
-// Pascal (sm_60), read off mmvq_il_parity --bench --emit-table on a Tesla P100-PCIE-16GB (three runs, identical
-// tables), the same 3% rule.  Pascal has no dp4a (strata_dp4a: four vmad), so the kernels are compute-bound and more rows a
-// warp (weights and activations reused across rows) win 15-35% on the large shapes.  Bitwise equal to native_mmvq.
-constexpr IlRows kIlRows_60[] = {
-    {23, {{0, 4, 4, 4, 4}, {2, 4, 2, 4, 4}, {1, 1, 1, 1, 1}}},   // IQ4_XS
-    {12, {{0, 4, 4, 4, 4}, {0, 2, 2, 2, 2}, {0, 0, 0, 4, 4}}},   // Q4_K
-    {13, {{0, 2, 2, 2, 2}, {0, 4, 2, 2, 4}, {0, 2, 2, 2, 2}}},   // Q5_K
-    {14, {{0, 2, 2, 2, 4}, {0, 0, 0, 4, 4}, {0, 0, 0, 4, 4}}},   // Q6_K
-};
-// Pascal with dp4a (sm_61), read off mmvq_il_parity --bench --emit-table on a Tesla P40 (three runs: a cell is non-zero
-// only where every run picked a rows count that takes at least 3% off native_mmvq's time; where the runs disagreed on
-// the count, the one that won twice).  E.g. IQ4_XS 2560x10240 at 2 columns 112 -> 65 us, Q6_K 12288x2560 at 4
-// columns 189 -> 127 us, the Q5_K head at 3 columns 2545 -> 1766 us.  Bitwise equal to native_mmvq.
-constexpr IlRows kIlRows_61[] = {
-    {23, {{2, 4, 4, 4, 4}, {4, 4, 4, 4, 4}, {2, 2, 2, 2, 2}}},   // IQ4_XS
-    {12, {{2, 0, 4, 4, 4}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q4_K
-    {13, {{2, 0, 4, 4, 4}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q5_K
-    {14, {{0, 0, 2, 2, 2}, {0, 4, 4, 4, 4}, {2, 4, 2, 2, 2}}},   // Q6_K
-    {11, {{2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K
-};
 // RTX 30-series (sm_86), 143-dense: read off mmvq_il_parity --bench --emit-table on an RTX A4000 with the engine's real
 // shapes (the output projections have 6144 inputs, not 4096), per cell the rows count whose worst measured shape is under
 // 0.97 of native_mmvq's time. The four older rows are the shared table's; Q3_K (the Q2_0 pack's main dense type) is new.
@@ -2841,31 +2796,13 @@ constexpr IlRows kIlRows_86[] = {
     {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
     {11, {{1, 2, 2, 2, 2}, {1, 1, 1, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K (two runs; 2560x10240 at 4 columns 120 -> 70 us)
 };
-// Turing (sm_75): read off mmvq_il_parity --bench --emit-table on an RTX 2080 Ti 22 GB (SM 1650 MHz), the same 3% rule.
-// The plain multi-column kernels are bound by dp4a throughput on Turing from 2 columns on (IQ4_XS 2560x10240 at 4
-// columns 81.1 -> 37.4 us, the Q5_K head 1671 -> 1045 us); bitwise equal to native_mmvq.  No one-column table here:
-// the engine's dedicated single-column kernels (native_q3_k_mmvq) sum in another order, and the gain was 0.5%.
-constexpr IlRows kIlRows_75[] = {
-    {23, {{2, 2, 2, 2, 2}, {2, 2, 4, 2, 4}, {2, 2, 2, 2, 2}}},   // IQ4_XS
-    {12, {{0, 4, 2, 4, 4}, {1, 2, 2, 2, 2}, {1, 2, 2, 2, 2}}},   // Q4_K
-    {13, {{0, 4, 2, 2, 4}, {1, 4, 2, 2, 2}, {1, 1, 2, 2, 2}}},   // Q5_K
-    {14, {{0, 0, 1, 2, 1}, {0, 2, 2, 4, 4}, {0, 4, 4, 4, 4}}},   // Q6_K
-    {11, {{1, 2, 4, 4, 4}, {1, 2, 4, 4, 4}, {1, 2, 2, 2, 2}}},   // Q3_K
-};
 // One column: rows a warp by n_out class, 0 = native_mmvq's single-column kernels (STRATA_MMVQ_IL_T1=0 turns this off).
 struct Il1Rows { int type; uint8_t r[5]; };
 constexpr Il1Rows kIl1Rows_86[] = {
     {11, {0, 1, 1, 1, 1}},   // Q3_K: 2560x10240 60 -> 43 us, 6144x2560 30 -> 26 us on the A4000
 };
-// Tesla P40 (sm_61), the same three runs: IQ4_XS 2560x10240 102 -> 58 us, the Q5_K head 1754 -> 1507 us
-constexpr Il1Rows kIl1Rows_61[] = {
-    {23, {2, 2, 4, 4, 4}},   // IQ4_XS
-    {13, {0, 0, 0, 2, 2}},   // Q5_K
-    {11, {0, 0, 2, 2, 2}},   // Q3_K
-};
 struct Il1Arch { int cc; const Il1Rows* t; size_t n; };
 constexpr Il1Arch kIl1Arch[] = {
-    {61, kIl1Rows_61, sizeof(kIl1Rows_61) / sizeof(Il1Rows)},
     {86, kIl1Rows_86, sizeof(kIl1Rows_86) / sizeof(Il1Rows)},
 };
 bool il_env_on(const char* name) {
@@ -2876,10 +2813,6 @@ bool il_t1_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_T1"); return 
 bool il_q3k_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_Q3K"); return on; }
 struct IlArch { int cc; const IlRows* t; size_t n; };
 constexpr IlArch kIlArch[] = {
-    {60, kIlRows_60, sizeof(kIlRows_60) / sizeof(IlRows)},   // Pascal GP100: measured on a Tesla P100
-    {61, kIlRows_61, sizeof(kIlRows_61) / sizeof(IlRows)},   // Pascal with dp4a: measured on a Tesla P40
-    {75, kIlRows_75, sizeof(kIlRows_75) / sizeof(IlRows)},   // Turing: measured on an RTX 2080 Ti
-    {70, kIlRows_70, sizeof(kIlRows_70) / sizeof(IlRows)},   // Volta: PR 1401, measured on a V100-SXM2
     {86, kIlRows_86, sizeof(kIlRows_86) / sizeof(IlRows)},   // 143-dense: RTX A4000 with the real shapes (Q3_K added)
 };
 // STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..." overrides single rows of the table for every card (type = ggml
@@ -2957,29 +2890,15 @@ int g_tune_rows = 0;   // native_mmvq_il_tune (tests, benchmarks): rows a warp f
 void native_mmvq_il_tune(int rows) { g_tune_rows = rows; }
 
 namespace {
-// sm_80 and newer (measured on sm_86 and sm_120), Volta (sm_70) and Pascal (sm_60, sm_61), each with its own table
-// above; Turing keeps native_mmvq's kernels unless STRATA_SM75_PERF=1 (kIlRows_75)
-// Volta (PR 1401): opt-in with STRATA_SM70_TABLE=1 until the author confirms on a V100 with the final code
-bool sm70_opt_in() { const char* v = std::getenv("STRATA_SM70_TABLE"); return v != nullptr && std::atoi(v) != 0; }
-// Pascal (sm_60, GP100): the same interleaved kernels (bitwise equal to native_mmvq's, mmvq_il_parity), its own table
-// kIlRows_60.  STRATA_SM60_TABLE=0 keeps native_mmvq's kernels on a P100; any other value (or unset) uses the table.
-// STRATA_SM75_IL=0 / 1 forces the table off / on; unset it follows STRATA_SM75_PERF=1 (Turing only)
-bool sm75_il_on(int major, int minor) { return strata::sm75_switch("STRATA_SM75_IL", major, minor); }
-bool sm60_table_on() { const char* v = std::getenv("STRATA_SM60_TABLE"); return v == nullptr || std::atoi(v) != 0; }
-// Pascal (sm_61: Tesla P40 / P4, GTX 10 series; native dp4a): the same interleaved kernels (bitwise equal to
-// native_mmvq's, mmvq_il_parity), its own table kIlRows_61.  STRATA_SM61_TABLE=0 keeps native_mmvq's kernels.
-bool sm61_table_on() { const char* v = std::getenv("STRATA_SM61_TABLE"); return v == nullptr || std::atoi(v) != 0; }
+// sm_80 and newer (measured on sm_86 and sm_120), with the tables above
 bool il_arch_ok() {
     static int ok[16] = {};   // 0 unknown, 1 yes, -1 no, by device ordinal
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
     if (ok[dev] == 0) {
         int major = 0;
-        int minor = 0;
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         ok[dev] = (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                   (major >= 8 || (major == 7 && minor == 0 && sm70_opt_in()) || (major == 7 && minor == 5 && sm75_il_on(major, minor)) ||
-                    (major == 6 && minor == 0 && sm60_table_on()) || (major == 6 && minor == 1 && sm61_table_on()))) ? 1 : -1;
+                   major >= 8) ? 1 : -1;
     }
     return ok[dev] > 0;
 }

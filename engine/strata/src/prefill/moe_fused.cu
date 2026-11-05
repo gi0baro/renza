@@ -18,8 +18,6 @@
 // for the k of a half-block: mma k index 16h + 4t + j stands for weight (and activation) 16h + t + 4j.  The
 // activations are stored in it (perm32), and a lane's two B registers (h = 0 and 1) are adjacent: one 8-byte load.
 #include "strata/prefill/moe_fused.hpp"
-#include "strata/kernels/gfx_arch.hpp"
-#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -376,13 +374,11 @@ const DevInfo& dev_info() {
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
     cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
-    d.cc = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);   // STRATA_EMULATE_CC counts (tests)
-    // Turing (sm_75): the same kernels with plain copies and m8n8k16 MMAs, opt-in (STRATA_PF_FUSED_SM75=1)
-    static const bool sm75 = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM75"); return v != nullptr && v[0] == '1'; }();
-    if (d.cc < 75 || (d.cc < 80 && !sm75)) { d.cc = d.cc < 80 ? 0 : d.cc; return d; }
+    d.cc = 10 * major + minor;
+    if (d.cc < 80) { d.cc = 0; return d; }
     // the device code of this card's arch must have the kernels (a build without an sm_75+ target has an empty body)
     cudaFuncAttributes fa{};
-    if (cudaFuncGetAttributes(&fa, expert_kernel<true>) != cudaSuccess || fa.ptxVersion < (d.cc >= 80 ? 80 : 75)) {
+    if (cudaFuncGetAttributes(&fa, expert_kernel<true>) != cudaSuccess || fa.ptxVersion < 80) {
         cudaGetLastError();
         d.cc = 0;
         return d;

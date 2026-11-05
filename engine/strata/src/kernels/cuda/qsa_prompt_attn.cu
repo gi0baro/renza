@@ -1,11 +1,9 @@
 // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
-#include "strata/core/emulate.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_prompt_attn.hpp"
-#include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
@@ -464,19 +462,6 @@ struct Smem2 {
     int8_t kv[2][4][2][CH2][64];   // stage, warp, K/V, cell, 64 dims in 16-byte pieces XOR-swizzled by the cell
     float sc[2][4][2][CH2];        // stage, warp, K/V scale of the cell for the warp's group
     float part[4][16][CH2 + 1];    // q.k per dim group
-    float p[16][CH2 + 1];
-    float qmax[4];
-    float alpha[16];
-    float lsum[16];
-    float mrow[16];
-};
-// Turing (register staging): one stage - the next chunk's pieces wait in registers until this chunk's p.v is done -
-// and the q.k partials of cell group nt (8 cells) in the 512 bytes of the warp's own K slice that held those cells
-// (read by then), so a block takes ~19.7 KB and three fit a Turing SM (one did, at 45.6 KB: four warps on four
-// schedulers, every latency exposed)
-struct Smem2T {
-    int8_t kv[1][4][2][CH2][64];
-    float sc[1][4][2][CH2];
     float p[16][CH2 + 1];
     float qmax[4];
     float alpha[16];
@@ -963,16 +948,10 @@ __global__ void __launch_bounds__(HD) decode_attn_merge_kernel(const float* __re
 bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
     static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs this on several)
-    static int t75[64] = {};     // 1: Turing (the kernel's single-stage layout, Smem2T), 2: not
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) return false;
-    if (!t75[dev]) {
-        int major = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        t75[dev] = strata::cc_major_of(major) < 8 ? 1 : 2;   // STRATA_EMULATE_CC counts
-    }
-    const int bytes = (int) (t75[dev] == 1 ? sizeof(Smem2T) : sizeof(Smem2));
+    const int bytes = (int) sizeof(Smem2);
     if (!attr[dev]) {
         if (cudaFuncSetAttribute(prompt_attn_i8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {
@@ -1368,12 +1347,6 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 }
 
 
-template <int KV_MODE>
-bool launch70(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&, float*,
-              int64_t, cudaStream_t) {
-    return false;
-}
-
 int g_pa_imma = -1;   // STRATA_PROMPT_ATTN_IMMA: -1 not read yet; qsa_prompt_attn_set_imma (tests) overrides it
 }  // namespace
 
@@ -1431,7 +1404,7 @@ void qsa_prompt_attn_set_imma(int on) { g_pa_imma = on < 0 ? -1 : (on ? 1 : 0); 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
-    bool volta = false, turing = false, t75 = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
+    bool turing = false, t75 = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
         // keeps the old kernel.
@@ -1449,12 +1422,10 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             // STRATA_QSA_WARP=1|attn (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
             const char* w = std::getenv("STRATA_QSA_WARP");
             cc[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) ? 75
-                      : 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
+                      : 10 * major + minor;
         }
-        if (cc[dev] < 70) return false;
-        volta = cc[dev] < 75;     // sm_70: the m8n8k4 kernel (STRATA_PA_VOLTA); STRATA_QSA_WARP=1 still forces the old one
         turing = cc[dev] < 80;
-        t75 = cc[dev] == 75;      // a Turing card, or one run as such (STRATA_EMULATE_CC=75, STRATA_QSA_WARP=1)
+        t75 = cc[dev] == 75;      // a Turing card, or one run as such (STRATA_QSA_WARP=1)
     }
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
@@ -1470,12 +1441,11 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4_TC");
             return v != nullptr && v[0] == '1';
         }();
-        if (q4_off || volta || (turing && !q4_tc) || pools.v_q4 == nullptr) return false;
+        if (q4_off || (turing && !q4_tc) || pools.v_q4 == nullptr) return false;
         return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
         if (!pools.k_scale) return false;
-        if (volta) return launch70<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (pools.k_q != nullptr) {
@@ -1484,7 +1454,6 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         // for how far the model amplifies an FP32-level change.  Turing always takes it: v2's cp.async does not
         // exist before sm_80.
         static const bool v1 = std::getenv("STRATA_PROMPT_ATTN_V1") != nullptr;
-        if (volta) return launch70<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
         // Turing: v2 with register staging instead of cp.async, opt-in (STRATA_PA_V2T=1) until measured
         static const bool v2t = [] { const char* e = std::getenv("STRATA_PA_V2T"); return e != nullptr && e[0] == '1'; }();
         if (v1 || (turing && !v2t)) {
@@ -1504,7 +1473,6 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (!pools.k_pool || !pools.v_pool) return false;
-    if (volta) return launch70<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
     return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
 }
 

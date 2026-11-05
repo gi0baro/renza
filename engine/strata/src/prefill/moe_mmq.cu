@@ -125,12 +125,6 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
-bool run_tab(ggml_backend_cuda_context*, const mmq_args*, const void*, cudaStream_t) {
-    std::fprintf(stderr, "prefill mmq: this build has no pointer-table MMQ (STRATA_MMQ_TAB)\n");
-    std::exit(1);
-}
-bool tab_has_type(int) { return false; }
-
 }  // namespace
 
 bool built() { return true; }
@@ -224,20 +218,11 @@ void Context::run(const Product& p, void* stream) {
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
-                        p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
+                        p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
-    if (p.tab) {
-        if (p.n > kGatherGroupMax) {
-            std::fprintf(stderr, "prefill mmq: a pointer table holds at most %d experts (got %d)\n", kGatherGroupMax, p.n);
-            std::exit(1);
-        }
-        run_tab(&ctx, &a, nullptr, s);
-        ck(cudaGetLastError(), "mul_mat_q (pointer table)");
-        return;
-    }
     switch (t) {
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
@@ -265,14 +250,6 @@ void Context::run(const Product& p, void* stream) {
 }
 
 // ---- STRATA_MMQ_DIRECT ----
-bool tab_built() {
-    return false;
-}
-
-bool tab_fits(int t, int64_t w_rows) {
-    return tab_built() && w_rows % 128 == 0 && tab_has_type(t) && fits(t, w_rows);
-}
-
 size_t overread_bytes(int t, int64_t cols) {
     if (!supported(t)) return 0;
     // the K tile's over-read for each (fallback=false) config on any visible GPU, the largest of them: the over-read
@@ -331,12 +308,9 @@ int direct_mode() {
         const char* v = std::getenv("STRATA_MMQ_DIRECT");
         const int m = v ? std::atoi(v) : 0;
         if (m != 1 && m != 2) return 0;
-        if (!tab_built()) {
-            std::fprintf(stderr, "strata: STRATA_MMQ_DIRECT=%d is ignored: this build has no pointer-table MMQ "
-                                 "(CUDA with STRATA_MMQ_TAB only)\n", m);
-            return 0;
-        }
-        return m;
+        std::fprintf(stderr, "strata: STRATA_MMQ_DIRECT=%d is ignored: this build has no pointer-table MMQ "
+                             "(CUDA with STRATA_MMQ_TAB only)\n", m);
+        return 0;
     }();
     return mode;
 }

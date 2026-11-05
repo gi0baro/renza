@@ -20,8 +20,6 @@
 // ldmatrix.  The products are mma.sync m16n8k32 (m16n8k16 for the formats with a scale per 16 values); the epilogues
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
 #include "strata/prefill/moe_fused_iq.hpp"
-#include "strata/kernels/gfx_arch.hpp"
-#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -60,7 +58,6 @@ __host__ __device__ constexpr int tile_rows(int ww) { return 256 / ww; }
 __host__ __device__ constexpr int weight_rows(int ww) { return 64 * ww; }
 constexpr int ASTAGES = 4;              // cp.async depth of the activations (64 values of K a stage)
 constexpr int ASTAGES_DEV = ASTAGES;
-constexpr bool T75_DEV = false;
 constexpr int GU_ROWS_K = 2560, D_ROWS_K = 640;   // K of gate/up (n_embd) and of down (n_ff)
 
 // the formats (ggml type ids)
@@ -501,32 +498,6 @@ native_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_
                 for (int n = 0; n < 2; ++n)
 #pragma unroll
                     for (int cc = 0; cc < 2; ++cc) dx[n][cc] = *(const float2*) (sa + (nb0 + 8 * n + 2 * tig + cc) * AB + 64);
-                if constexpr (WT == T_Q2_0 && T75_DEV) {
-                    // Turing, Q2_0: one d per 64 values, so the stage's two halves share their weight scale - each row's dot
-                    // is d (dx_0 dot_0 + dx_1 dot_1): the activation scales per half, then d once
-                    uint32_t bq0[4], bq1[4];                      // the two halves' {n0 0-15, n0 16-31, n1 0-15, n1 16-31}
-                    ldsm4(bq0, sa + b_off);
-                    ldsm4(bq1, sa + b_off + 32);
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        uint32_t a0[4], a1[4];
-                        ldsm4(a0, W + a_off + 16 * i * WLD);
-                        ldsm4(a1, W + a_off + 16 * i * WLD + 32);
-                        const float wa = S[(64 * wf + 16 * i + g) * 4], wb = S[(64 * wf + 16 * i + 8 + g) * 4];
-#pragma unroll
-                        for (int n = 0; n < 2; ++n) {
-                            if (n == 1 && !on1) break;
-                            int d0[4], d1[4];
-                            mma32(d0, a0, bq0[2 * n], bq0[2 * n + 1]);
-                            mma32(d1, a1, bq1[2 * n], bq1[2 * n + 1]);
-#pragma unroll
-                            for (int q = 0; q < 4; ++q) {
-                                const float t = fmaf(dx[n][q & 1].y, dotf(d1[q]), dx[n][q & 1].x * dotf(d0[q]));
-                                acc[i][n][q] = fmaf(q < 2 ? wa : wb, t, acc[i][n][q]);
-                            }
-                        }
-                    }
-                } else
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {                     // the stage's two 32-value halves
                     uint32_t bq[4];                               // {n0 bytes 0-15, n0 16-31, n1 0-15, n1 16-31}
@@ -626,32 +597,19 @@ unsigned blocks(int64_t n, int per) { return (unsigned) ((n + per - 1) / per); }
 struct DevInfo {
     bool done = false, ok = false;
     bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
-    bool t75 = false;   // Turing (STRATA_PF_FUSED_SM75): the Q2_0 / Q2_0 layers only (what was set up and checked there)
     int sms = 0, occ = 1;
 };
 std::mutex g_mu;
 DevInfo g_dev[32];
 
-// the activation stages of native_kernel on the current device: its ASTAGES_DEV (2 below sm_80)
-int host_astages() {
-    static int per[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return ASTAGES; }
-    if (!per[dev]) {
-        int major = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        per[dev] = strata::cc_major_of(major) < 8 ? 2 : ASTAGES;
-    }
-    return per[dev];
-}
 template <int T, bool GU, int WW> bool setup_ww(int& occ) {
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_kernel<T, GU, WW>) != cudaSuccess || fa.ptxVersion < 75) return false;
     if (cudaFuncSetAttribute(native_kernel<T, GU, WW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int) smem_bytes(T, WW, host_astages())) != cudaSuccess)
+                             (int) smem_bytes(T, WW, ASTAGES)) != cudaSuccess)
         return false;
     int o = 0;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, native_kernel<T, GU, WW>, THREADS, smem_bytes(T, WW, host_astages())) !=
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, native_kernel<T, GU, WW>, THREADS, smem_bytes(T, WW, ASTAGES)) !=
             cudaSuccess || o < 1)
         return false;
     occ = std::min(occ, o);
@@ -666,23 +624,11 @@ const DevInfo& dev_info() {
     DevInfo& d = g_dev[dev & 31];
     if (d.done) return d;
     d.done = true;
-    int major = 0, minor = 0;
+    int major = 0;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-    major = strata::cc_major_of(major);   // STRATA_EMULATE_CC counts (tests)
-    minor = strata::cc_minor_of(minor);
     cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
-    // Turing (sm_75): the same kernels with plain copies and m8n8k16 MMAs, opt-in (STRATA_PF_FUSED_SM75=1)
-    static const bool sm75 = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM75"); return v != nullptr && v[0] == '1'; }();
-    if (major < 8 && !(major == 7 && minor == 5 && sm75)) return d;
+    if (major < 8) return d;
     int occ = 1 << 20;
-    if (major < 8) {   // Turing: the canonical Q2_0 pack's kernels (the codebook formats' do not fit 64 KB at 4 warps a row)
-        d.t75 = true;
-        d.ok = setup_one<T_Q2_0, true>(occ) && setup_one<T_Q2_0, false>(occ);
-        d.occ = d.ok ? occ : 1;
-        cudaGetLastError();
-        return d;
-    }
     d.ok = setup_one<T_IQ2_XXS, true>(occ) && setup_one<T_IQ2_XS, true>(occ) && setup_one<T_IQ2_S, true>(occ) &&
            setup_one<T_IQ3_XXS, true>(occ) && setup_one<T_IQ3_S, true>(occ) && setup_one<T_IQ4_XS, true>(occ) &&
            setup_one<T_Q2_0, false>(occ) && setup_one<T_IQ4_NL, false>(occ);   // (Q2_0 gate/up is the Turing opt-in's only)
@@ -707,7 +653,6 @@ bool f16_gu(int t) {
 bool f16_d(int t) { return t == T_Q2_0 || t == T_IQ4_NL || t == T_Q8_0; }
 bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
-           || (t == T_Q2_0 && dev_info().t75)   // the canonical Q2_0 pack's gate/up: Turing opt-in only (sm_80+ keeps MMQ for it)
         ;
 }
 bool d_covered(int t) {
@@ -727,8 +672,8 @@ void launch(int ww, unsigned grid, const Batch& b, const NativeGeom& g, const Ta
             const int32_t* src, void* out, float* dm, cudaStream_t s) {
     const uint8_t* a = (const uint8_t*) act;
     uint8_t* o = (uint8_t*) out;
-    if (ww == 4) native_kernel<T, GU, 4><<<grid, THREADS, smem_bytes(T, 4, host_astages()), s>>>(b, g, tb, a, src, o, dm);
-    else native_kernel<T, GU, 2><<<grid, THREADS, smem_bytes(T, 2, host_astages()), s>>>(b, g, tb, a, src, o, dm);
+    if (ww == 4) native_kernel<T, GU, 4><<<grid, THREADS, smem_bytes(T, 4, ASTAGES), s>>>(b, g, tb, a, src, o, dm);
+    else native_kernel<T, GU, 2><<<grid, THREADS, smem_bytes(T, 2, ASTAGES), s>>>(b, g, tb, a, src, o, dm);
 }
 
 // The work item's shape for a layer of `n` routed rows over `n_expert` experts: 128 routed rows when an expert has
@@ -767,7 +712,6 @@ bool native_supported(int gu_type, int d_type) {
     if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS) return false;   // default: only these two
     const DevInfo& d = dev_info();
     if (!d.ok || !d_covered_on(d_type, d)) return false;
-    if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
     if (env < 0) return d.w12;
     return requested() || d.w12;
 }

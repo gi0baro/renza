@@ -1,6 +1,5 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/core/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -402,19 +401,9 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
 bool attn_v3_on() {
-    static int on[16] = {};   // by device ordinal: 0 unknown, 1 yes, -1 no
     static const int env = [] { const char* v = std::getenv("STRATA_ATTN_V3"); return v ? (v[0] == '0' ? 0 : 1) : -1; }();
     if (env >= 0) return env == 1;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
-    if (on[dev] == 0) {
-        int maj = 0, mnr = 0;
-        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                        cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
-        if (!ok) cudaGetLastError();
-        on[dev] = ok && strata::sm75_default(maj, mnr) ? 1 : -1;   // Turing only, with STRATA_SM75_PERF=1
-    }
-    return on[dev] > 0;
+    return false;
 }
 
 // PR #540 (sskver): the same attention with fewer shuffles and less shared-memory traffic, bit for bit the kernel

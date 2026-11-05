@@ -44,9 +44,9 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
-// The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
-// sample_tokens' one-block argmax, which takes it unless STRATA_ARGMAX_MULTI=0.  False (nothing launched) where it
-// cannot run: HIP, a card or a build below sm_90.  Device pointers; capturable.
+// The probe left of the sm_90+ cluster argmax: launches nothing and returns false (true when n_tokens or n_vocab is
+// not positive); its first call per device clears the thread's pending CUDA error.  sample_tokens calls it for a greedy
+// pick without penalties or logit bias unless STRATA_ARGMAX_MULTI=0.
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream);
 
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp, STRATA_SPEC_COUPLED=1).  Device pointers

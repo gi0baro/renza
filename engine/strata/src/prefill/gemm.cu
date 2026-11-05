@@ -37,13 +37,6 @@ void ck(cublasStatus_t s, const char* what) {
     }
 }
 
-// #247/#325: on Windows (seen on gfx1201), hipBLAS can return success with the correct BF16/FP16 product for some
-// shapes (hc up once T >= 96, the router) and still leave hipErrorInvalidValue set, which the next kernel's error
-// check turns into an exit. The multiply has finished, so that one stale error is cleared after a GEMM that succeeded;
-// any other error still stops the engine. Windows only: on Linux a stale hipErrorInvalidValue is a real error from
-// an earlier call and keeps being reported. A no-op everywhere else (CUDA compiles none of it).
-#define STRATA_ABSORB_HIPBLAS_STICKY(what) ((void) 0)
-
 // A setup call whose failure the engine survives (the handle keeps its defaults), as before #240 - but said.
 void note(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d (continuing)\n", what, (int) s);
@@ -128,11 +121,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
 // slices, into the instance's own buffers, and the product runs as the FP16 GEMM (fp32 accumulate) on the tensor
 // cores.  Finite values beyond FP16's range are clamped to +-65504 (#540) instead of becoming Inf.  A beta = 1
 // product (STRATA_PREFILL_BF16X2's remainder, ~2^-9 of the original, deep in FP16's subnormal band) keeps cuBLAS.
-//   Default: on for compute capability 7.0 - 7.4 (Volta: only the experimental STRATA_EXPERIMENTAL_SM60 build runs
-//   there), OFF for 7.5 (RTX 20 in the ready-made engine: the sums round differently, so it is opt-in until it has
-//   been gated).  STRATA_BF16_TC=1 / =0 turns it on / off on any 7.x card (=2, a test mode: on any card).
-// Pascal (6.x) has no tensor cores and cuBLAS has no BF16 GEMM for it (#395, measured NOT_SUPPORTED on a P40): both
-// operands are widened to fp32 by an exact shift and the product is cublasSgemm with the same fp32 accumulator.
+//   STRATA_BF16_TC=2 (a test mode) turns it on on any card.
 namespace {
 __global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ in, __half* __restrict__ out, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -166,7 +155,7 @@ int current_cc() {
     }
     return v;
 }
-// 0: cuBLAS's BF16 GEMM, 1: through FP16 (tensor cores), 2: through FP32 (Pascal)
+// 0: cuBLAS's BF16 GEMM, 1: through FP16 (tensor cores)
 int bf16_path() {
     static const int forced = [] {
         const char* v = std::getenv("STRATA_BF16_TC");
@@ -174,10 +163,7 @@ int bf16_path() {
     }();
     const int cc = current_cc();
     if (forced == 2 && cc > 0) return 1;   // a test mode: the FP16 path on any card (gemm_bf16_parity on sm_80+)
-    if (cc <= 0 || cc >= 80) return 0;
-    if (cc < 70) return 2;
-    if (forced >= 0) return forced != 0 ? 1 : 0;
-    return cc < 75 ? 1 : 0;
+    return 0;
 }
 bool grow(uint16_t*& p, int64_t& have, int64_t want) {   // `have`, `want`: 2-byte elements
     if (have >= want) return true;
@@ -210,45 +196,30 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
     const float alpha = 1.0f;
-    constexpr bool kPascalPath = false;
-    if (const int path = K > 0 ? bf16_path() : 0; (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && kPascalPath)) {
-        // FP16 (path 1) or FP32 (path 2, Pascal) copies of the weight and of X, converted in tiles.  Issue #1757: when
-        // the buffers did not fit in the VRAM that was left (a stage of a layer split keeps ~100 MiB), this fell through
-        // to the raw BF16 cuBLAS call, which a Pascal card answers with CUBLAS_STATUS_INTERNAL_ERROR (14).  Now the
-        // weight is converted in tiles of N rows (the whole weight when it fits, as before) and X in slices; a card with
-        // no room even for a tile says so.  A single output row stays cuBLAS's GEMV for path 1 (faster than the
-        // conversions).  Every tile is a disjoint block of Y, so each gets the caller's beta.
-        const int mult = path == 2 ? 2 : 1;   // 2-byte elements per converted value
+    if (const int path = K > 0 ? bf16_path() : 0; path == 1 && N > 1 && beta == 0.0f) {
+        // FP16 copies of the weight and of X, converted in tiles.  Issue #1757: the weight is converted in tiles of N
+        // rows (the whole weight when it fits) and X in slices.  A single output row stays cuBLAS's GEMV (faster than
+        // the conversions).  Every tile is a disjoint block of Y, so each gets the caller's beta.
         int64_t w_rows = N;
         int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
         bool fit = false;
         for (;;) {
-            if (grow(tc_w_, tc_w_elems_, mult * w_rows * K) && grow(tc_x_, tc_x_elems_, mult * x_rows * K)) { fit = true; break; }
+            if (grow(tc_w_, tc_w_elems_, w_rows * K) && grow(tc_x_, tc_x_elems_, x_rows * K)) { fit = true; break; }
             if (w_rows <= 64 && x_rows <= 64) break;
             w_rows = std::max<int64_t>(std::min<int64_t>(w_rows, 64), w_rows / 2);
             x_rows = std::max<int64_t>(std::min<int64_t>(x_rows, 64), x_rows / 2);
         }
-        if (!fit && path == 2) {   // Pascal has no BF16 cuBLAS call to fall back to; Volta keeps its raw one below
-            std::fprintf(stderr, "prefill gemm: no GPU memory left for the %s conversion buffers of a %lld x %lld BF16 weight "
-                                 "(Pascal cards run the BF16 products through them); free VRAM on this card: raise "
-                                 "--vram-reserve-mib, lower --max-context or --kv-resident, or give it fewer layers\n",
-                         "FP32", (long long) N, (long long) K);
-            std::exit(1);
-        }
         if (fit) {
             for (int64_t n0 = 0; n0 < N; n0 += w_rows) {
                 const int64_t nn = std::min<int64_t>(w_rows, N - n0);
-                if (path == 2) {
-                } else {
-                    bf16_to_f16(W + n0 * K, tc_w_, nn * K, (cudaStream_t) stream_);
-                    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
-                        const int64_t n = std::min<int64_t>(x_rows, T - t0);
-                        if (x_f16) {   // already the converted values (the same slices: the same GEMMs)
-                            f16(X + t0 * K, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
-                        } else {
-                            bf16_to_f16(X + t0 * K, tc_x_, n * K, (cudaStream_t) stream_);
-                            f16(tc_x_, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
-                        }
+                bf16_to_f16(W + n0 * K, tc_w_, nn * K, (cudaStream_t) stream_);
+                for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                    const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                    if (x_f16) {   // already the converted values (the same slices: the same GEMMs)
+                        f16(X + t0 * K, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
+                    } else {
+                        bf16_to_f16(X + t0 * K, tc_x_, n * K, (cudaStream_t) stream_);
+                        f16(tc_x_, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
                     }
                 }
             }
@@ -274,7 +245,6 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) (ldx ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
-    STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
@@ -301,7 +271,6 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         st = f16_gemm(CUBLAS_GEMM_ALGO2);
     }
     ck(st, "cublasGemmEx f16");
-    STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 
 void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {

@@ -10,8 +10,7 @@
 // produces a valid token, so only a comparison at the distribution level can tell them apart; the parity test
 // does that against an independently computed distribution.
 //
-// `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary (on sm_90+ without penalties,
-// `sampler_greedy_cluster_kernel`: the same token from a cluster of 8 CTAs per row).  The sampled chain has
+// `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary.  The sampled chain has
 // three implementations that pick the same token, bit for bit:
 //   - the SPLIT top_k (default): `sampler_split_part_kernel` cuts each row into 4,096-logit blocks over the whole
 //     GPU, each keeps its own top_k, and `sampler_split_merge_kernel` merges those lists and runs the tail;
@@ -22,7 +21,6 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
-#include "strata/core/emulate.hpp"
 
 #include <cuda_runtime.h>
 
@@ -183,29 +181,6 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         // A tie between two `-inf` candidates leaves `wi == n_vocab`, and the serial version answered 0.
         if (lane == 0) out[t] = (wi < n_vocab) ? wi : 0;
     }
-}
-
-/// **THE SAME ARGMAX ON A THREAD-BLOCK CLUSTER (sm_90+, S19), FOR THE CALLS WITHOUT PENALTIES.**  One block per
-/// token reads its 1 MB row (248,320 logits) on one SM with one load in flight per thread: latency-bound, 40 us per
-/// call on an RTX 5070, for every verify window and every draft step.  Here a cluster of `kAmCtas` CTAs shares the
-/// row, each thread keeps four loads in flight, and the CTAs' results meet in CTA 0's shared memory (distributed
-/// shared memory): 6 us (decode_cluster_parity --bench).
-///
-/// The answer is a function of the row alone, so it is the one-block kernel's bit for bit: the LOWEST index whose value
-/// is the largest non-NaN value above -inf (each thread walks its elements in ascending order with a strict `>`, and
-/// every merge takes the larger value or, on equality, the smaller index - an order-free rule), and 0 when there is
-/// none (all -inf / NaN), as there.  NaN never wins a `>`.
-///
-/// Barriers: a relaxed cluster arrive at entry, waited before the remote store (CTA 0 must be running); each CTA's
-/// result goes to slot `rank` of CTA 0, released by the next arrive; CTAs 1.. then exit (a cluster wait counts the
-/// threads that have not exited) and CTA 0 waits, reads its own slots, and writes the token.
-constexpr int kAmCtas = 8;      // CTAs per token (the portable cluster size)
-constexpr int kAmThreads = 1024;
-// grid (kAmCtas, n_tokens), cluster (kAmCtas, 1, 1), kAmThreads threads
-__global__ void __launch_bounds__(kAmThreads) sampler_greedy_cluster_kernel(const float* __restrict__ logits,
-                                                                            int n_vocab, int* __restrict__ out) {
-    (void) logits; (void) n_vocab; (void) out;
-    __trap();
 }
 
 /// **THE SAMPLED PATH, ONE BLOCK PER TOKEN.**  The kernel below replaced a version that ran the whole chain
@@ -1120,48 +1095,22 @@ int2* split_scratch(void* stream, size_t entries) {
 
 }  // namespace
 
+// What the sm_90+ cluster argmax runs on an sm_86 card and build: no launch, false, and on its first call per device
+// the probe's cudaGetLastError(), which clears an error left pending on the calling thread.
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
+    (void) logits; (void) out; (void) stream;
     if (n_tokens <= 0 || n_vocab <= 0) return true;
     if (n_tokens > 65535) return false;
-    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+ (the card's,
-    // or STRATA_EMULATE_CC's), code built for it (an older build's PTX holds a trap: the PTX version says which), and
-    // room for one cluster of kAmCtas CTAs.
-    static int ok[64] = {};
+    static int ok[64] = {};   // per device: 0 not probed yet, 2 probed (the cluster kernel does not run here)
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-    cudaLaunchConfig_t cfg{};
-    cudaLaunchAttribute at[1];
-    at[0].id = cudaLaunchAttributeClusterDimension;
-    at[0].val.clusterDim.x = kAmCtas;
-    at[0].val.clusterDim.y = 1;
-    at[0].val.clusterDim.z = 1;
-    cfg.gridDim = dim3(kAmCtas, 1, 1);
-    cfg.blockDim = dim3(kAmThreads, 1, 1);
-    cfg.dynamicSmemBytes = 0;
-    cfg.stream = (cudaStream_t) stream;
-    cfg.attrs = at;
-    cfg.numAttrs = 1;
     if (ok[dev] == 0) {
-        int major = 0, clusters = 0;
-        cudaFuncAttributes fa{};
-        const bool runs = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                          strata::cc_major_of(major) >= 9 &&
-                          cudaFuncGetAttributes(&fa, sampler_greedy_cluster_kernel) == cudaSuccess &&
-                          fa.ptxVersion >= 90 && fa.binaryVersion >= 90 &&
-                          cudaOccupancyMaxActiveClusters(&clusters, sampler_greedy_cluster_kernel, &cfg) ==
-                              cudaSuccess &&
-                          clusters >= 1;
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaGetLastError();
-        ok[dev] = runs ? 1 : 2;
+        ok[dev] = 2;
     }
-    if (ok[dev] != 1) return false;
-    cfg.gridDim = dim3(kAmCtas, (unsigned) n_tokens, 1);
-    const cudaError_t e = cudaLaunchKernelEx(&cfg, sampler_greedy_cluster_kernel, logits, n_vocab, out);
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "sample_tokens cluster launch: %s\n", cudaGetErrorString(e));
-        std::exit(1);
-    }
-    return true;
+    return false;
 }
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
@@ -1178,8 +1127,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
                                : 0;
     if (p.greedy || p.temperature <= 0.0f) {
-        // Without penalties (shmem == 0: no window) on sm_90+, a cluster of CTAs per token - the same token; see
-        // `sampler_greedy_cluster_kernel`.  STRATA_ARGMAX_MULTI=0: always the one-block kernel.
+        // STRATA_ARGMAX_MULTI=0: no call to sample_greedy_cluster
         static const bool multi = [] {
             const char* v = std::getenv("STRATA_ARGMAX_MULTI");
             return !v || std::atoi(v) != 0;

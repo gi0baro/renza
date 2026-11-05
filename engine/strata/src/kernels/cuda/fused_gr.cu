@@ -1,12 +1,9 @@
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
-#include "strata/core/emulate.hpp"
-#include "strata/core/sm75_series.hpp"
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
-#include "strata/kernels/gfx_arch.hpp"
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
@@ -1027,28 +1024,14 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     }
 }
 
-// the current device is Volta (sm_70): the fast norm/up is its default
-bool cur_dev_volta() {
-    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
-    if (!per_dev[dev]) {
-        int major = 0, minor = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        per_dev[dev] = major == 7 && minor == 0 ? 2 : 1;
-    }
-    return per_dev[dev] == 2;
-}
-
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
-// stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
+// stages n_tok * TILEV floats (2560), staged two tiles of n_tok * H_TILE.  The shared-memory
 // opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
 int down_chunk(bool staged, int* tile_out) {
     static bool attr[64] = {};
     static int chunk[64] = {};   // tokens the plain down kernel may carry in one launch on this card
     static int chunk_staged[64] = {};  // the same for staged
-    static int tile[64] = {};    // the plain down kernel's TILEV on this card (1280 on sm_75, 2560 elsewhere)
+    static int tile[64] = {};    // the plain down kernel's TILEV on this card
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) {
@@ -1058,30 +1041,17 @@ int down_chunk(bool staged, int* tile_out) {
     if (!attr[dev]) {
         int optin = 0;
         cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        optin = strata::smem_optin_of(optin);   // STRATA_EMULATE_CC (tests only)
         // the down kernel stages n_tok*TILEV floats of dynamic shared memory - 80 KB at the full 8 tokens of the
-        // CUDA tile.  sm_75 gets the smaller tile: all eight tokens fit one 40 KiB launch there (no more slicing),
-        // the TQ-5 prefetch holds half the registers, and the smaller blocks raise how many of the 41-block grid
-        // share an SM.  Cards whose opt-in is still below that (or that report no opt-in at all) slice the tokens;
+        // CUDA tile.  Cards whose opt-in is still below that (or that report no opt-in at all) slice the tokens;
         // the down kernel's outputs (lo, inject_out) are strictly per-token, so the chunk boundaries are safe, and
         // the up kernel below still sees every token of the batch in one launch.
-        int cc_maj = 0, cc_min = 0;
-        cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, dev);
-        const bool small_tile = strata::cc_major_of(cc_maj) * 10 + strata::cc_minor_of(cc_min) == 75;
-        const int tv = small_tile ? 1280 : 2560;
+        const int tv = 2560;
         tile[dev] = tv;
         int want = (int) (kFusedGrMaxT * tv * sizeof(float));
         if (optin > 0 && want > optin) want = optin;
-        if (small_tile) {
-            cudaFuncSetAttribute(gr_down_multi_kernel<1280>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<1280, kFusedGrMaxT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<1280, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-        } else {
-            cudaFuncSetAttribute(gr_down_multi_kernel<2560>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<2560, kFusedGrMaxT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<2560, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-        }
+        cudaFuncSetAttribute(gr_down_multi_kernel<2560>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+        cudaFuncSetAttribute(gr_down_multi_kernel<2560, kFusedGrMaxT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+        cudaFuncSetAttribute(gr_down_multi_kernel<2560, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
         auto set_staged_attr = [&](auto kernel, int max_t) {
             int ws = (int) (2 * max_t * H_TILE * sizeof(float));
             if (optin > 0 && ws > optin) ws = optin;
@@ -1098,15 +1068,9 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
         cudaGetLastError();      // drop any error the attempt left behind
-        // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
-        // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
-        // will launch is its per-block limit, so the capacity comes from that below sm_70 - the same tokens
-        // the "no opt-in" branch assumes, but taken from the attribute that is actually enforced.
-        int cc = 0, per_block = 0;
-        cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+        int per_block = 0;
         cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
-        cc = strata::cc_major_of(cc);
-        const int usable = (cc >= 7 && optin > 0) ? optin : per_block;
+        const int usable = optin > 0 ? optin : per_block;
         const int capacity = usable / (int) (tv * sizeof(float));
         chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
         const int capacity_staged = usable / (int) (2 * H_TILE * sizeof(float));
@@ -1153,16 +1117,7 @@ bool qfuse_hc_local() {
 bool up75_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_GR_UP75"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (env >= 0) return env != 0;
-    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
-    if (!per_dev[dev]) {
-        int major = 0, minor = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        per_dev[dev] = strata::sm75_default(major, minor) ? 2 : 1;   // Turing, STRATA_SM75_PERF=1
-    }
-    return per_dev[dev] == 2;
+    return false;
 }
 // sm_75: the staged down kernel's tokens per block (gridDim.y = ct / tg), 0 = one block row for all of them.
 // STRATA_GR_DOWN_TG=n forces n where it divides the launch (0 = off).
@@ -1170,18 +1125,7 @@ int down_tg(int ct) {
     static const int env = [] { const char* v = std::getenv("STRATA_GR_DOWN_TG"); return v ? std::atoi(v) : -1; }();
     if (ct < 2) return 0;
     if (env >= 0) return env > 0 && env <= 3 && ct % env == 0 ? env : 0;
-    // fused_gr_bench cold on an RTX 2080 Ti (down incl. a stamp): T 4 29.1 -> 27.3 us, T 6 38.5 -> 32.2 with pairs;
-    // one token per block is slower at every T (the weights are read from L2 once per group)
-    static int per_dev[64];   // 0 unknown, 1 no, 2 sm_75
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
-    if (!per_dev[dev]) {
-        int major = 0, minor = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        per_dev[dev] = strata::sm75_default(major, minor) ? 2 : 1;   // Turing, STRATA_SM75_PERF=1
-    }
-    return per_dev[dev] == 2 && (ct == 4 || ct == 6) ? 2 : 0;
+    return 0;
 }
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
@@ -1239,12 +1183,6 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             else if (exact_t && ct == 6) gr_down_staged_kernel<6, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else if (max4) gr_down_staged_kernel<4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else gr_down_staged_kernel<><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-        } else if (tv == 1280) {
-            if (q8w) {   // STRATA_HC_REQ8
-                if (max4) gr_down_multi_kernel<1280, 4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-                else gr_down_multi_kernel<1280, kFusedGrMaxT, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            } else if (max4) gr_down_multi_kernel<1280, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else gr_down_multi_kernel<1280><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
         } else {
             if (q8w) {   // STRATA_HC_REQ8
                 if (max4) gr_down_multi_kernel<2560, 4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
@@ -2020,7 +1958,7 @@ static bool gr_fast() {
     static const int env = [] { const char* v = std::getenv("STRATA_GR_FAST"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (g_gr_fast >= 0) return g_gr_fast != 0;
     if (env >= 0) return env != 0;
-    { const char* v = std::getenv("STRATA_SM70_TABLE"); return cur_dev_volta() && v != nullptr && std::atoi(v) != 0; }   // PR 1401: opt-in   // CUDA: on Volta (V100-SXM2: 50.9 -> 46.7 us a read at T 1, bitwise); elsewhere opt-in
+    return false;
 }
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
@@ -2397,16 +2335,5 @@ __global__ void hc_q8_bf16_kernel(const int8_t* __restrict__ q, const float* __r
 void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long long n, void* stream) {
     hc_q8_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const int8_t*) codes, scales, out, n);
 }
-
-// ===================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, HIP) ==============
-// 80 blocks that must all be resident (a start-up run per T decides; larger T keep the default read) and two grid
-// barriers on an atomic counter.  Block b: (A) stages R' * w_norm for columns [128 b, 128 b + 128) (one stream) and writes
-// that slice's sum of squares and the UNSCALED partial dots of the 320 down + 4 inject rows (the v3 identity
-// w . xn = sum_c rs[c] (w[:, c] . x'[c])); barrier; (B) rs per stream, then rows (k, r) = b + 80 j reduced to lo / inject;
-// barrier; (C) the up projection read straight from VRAM, a thread pair per row, the epilogue as gr_up_kernel.
-// ANOTHER SUMMATION ORDER than the default read (not bitwise; the init check bounds the difference).  Only the verifier's hyper-connection reads use it: they run on one stream per card (both pipeline
-// verifiers share it), so two of these kernels never wait on each other; the drafter's reads keep the default kernels.
-void fused_gr_persist_init() {}
-bool fused_gr_read_persist(const FusedGrArgs*, int, void*) { return false; }
 
 }  // namespace strata::kernels

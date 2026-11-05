@@ -74,8 +74,7 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
 /// into *t_out (either may be null): the verify window's PCIe-share balance, at no extra launch.
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
                           void* stream);
-/// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
-/// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
+/// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
 /// an empty one-thread kernel (a graph node that does nothing: STRATA_DUMMY_NODES measures what a node costs in a window)
 void gpu_noop(void* stream);
@@ -164,7 +163,7 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
 /// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.
 bool multi_block_head_ops();
 /// True where the verify head's and the draft's greedy pick should be argmax_rows: sm_80 to sm_89 (the one-block
-/// kernel is slow there; sm_90+ has sample_tokens' cluster kernel, other cards keep sample_tokens).
+/// kernel is slow there; other cards keep sample_tokens).
 bool argmax_rows_wanted();
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);

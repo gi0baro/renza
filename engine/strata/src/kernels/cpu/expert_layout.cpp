@@ -117,19 +117,6 @@ bool cpu_avx1_ok() {
     return ok;
 }
 
-bool cpu_sse42_ok() {
-    static const bool ok = [] {
-        unsigned r[4] = {0, 0, 0, 0};
-        __cpuid_count(1, 0, r[0], r[1], r[2], r[3]);
-        return ((r[2] >> 20) & 1u) && ((r[2] >> 23) & 1u);   // SSE4.2, POPCNT
-    }();
-    return ok;
-}
-
-const char* isa_floor_build() {
-    return "";
-}
-
 namespace {
 void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
     __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
@@ -189,7 +176,7 @@ bool cpu_gather_fast_here() {
 bool cpu_avxvnni_ok() {
     static const bool ok = [] {
         if (const char* v = std::getenv("STRATA_NO_AVXVNNI"); v != nullptr && std::atoi(v) != 0) return false;
-        if (isa_floor_build()[0] != '\0' || cpu_isa_cap() < 3 || !cpu_avx2_ok()) return false;
+        if (cpu_isa_cap() < 3 || !cpu_avx2_ok()) return false;
         unsigned r[4];
         cpuid_regs(0, 0, r);
         if (r[0] < 7) return false;

@@ -1,6 +1,4 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
-#include "strata/core/sm75_series.hpp"
-#include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/host_graph_launch.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -199,28 +197,13 @@ bool head_mix_multi_enabled() {
 // copy_rows_from_mapped_after): same reads, same values, one kernel node fewer each.  A dependent kernel costs ~2.4 us in a
 // gfx1201 graph whatever it does; measured on gfx12 only, so it is on there by default.  STRATA_FUSE_WAIT=0 / 1 forces it
 // off / on (HIP builds; a CUDA build never fuses).
-// the Turing series (STRATA_SM75_PERF=1, sm75_series.hpp) defaults of the CUDA build's switches below, read per device
-bool device_is_sm75() {
-    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
-    if (!per_dev[dev]) {
-        int maj = 0, mnr = 0;
-        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                        cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
-        if (!ok) cudaGetLastError();
-        per_dev[dev] = ok && strata::sm75_default(maj, mnr) ? 2 : 1;   // a Turing card with STRATA_SM75_PERF=1
-    }
-    return per_dev[dev] == 2;
-}
-
 bool fuse_wait_on() {
     // CUDA: STRATA_FUSE_WAIT=1 folds both waits (the plan's and the CPU rows'), =2 only the plan's, =0 neither.  Turing
     // default 2 (RTX 2080 Ti, Flash-Next Q2_0, two runs each: +0.6..+1.4 % decode); the rows' version makes every row
     // block of the copy poll the flag over PCIe and was -1.5 % there, so it stays opt-in.
     static const int env = [] { const char* v = std::getenv("STRATA_FUSE_WAIT"); return v != nullptr ? std::atoi(v) : -1; }();
     if (env >= 0) return env == 1 || env == 2;
-    return device_is_sm75();
+    return false;
 }
 // 143-amdk's rows version of the folded wait (copy_rows_from_mapped_after): HIP with fuse_wait_on, CUDA STRATA_FUSE_WAIT=1
 bool fuse_rows_on() {
@@ -482,7 +465,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
-    strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -826,15 +808,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     groups_[T] = G;
-    // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
-    // projections may start while the kernel before them finishes, loading their weights before they wait for its
-    // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
-    // the same as without them.
-    struct PdlScope {
-        bool prev;
-        explicit PdlScope(bool on) : prev(pdl_scope()) { pdl_scope() = on; }
-        ~PdlScope() { pdl_scope() = prev; }
-    } pdl_window(G == 1 && pdl_supported());
+    if (G == 1) pdl_supported();   // pdl.hpp: its first call per device clears a pending CUDA error
     // STRATA_DF_BRANCH: mixer work that reads only the layer's input runs on a side stream inside the graph.  fork(i)
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
     // side i: a branch never races with what came before its fork or after its join.  Not in a split window,
@@ -1029,7 +1003,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
             }
-            if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
@@ -1050,7 +1023,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // forces it off / on
         auto quant_in = [&](const float* x, int n_in) {
             static const int qil_env = [] { const char* v = std::getenv("STRATA_QIL"); return v != nullptr ? std::atoi(v) : -1; }();
-            const bool qil = qil_env >= 0 ? qil_env != 0 : device_is_sm75();
+            const bool qil = qil_env > 0;
             if (qil && n >= 2 && n <= 4 && g_mmvq_il()) {
                 strata::kernels::native_quantize_q8_1_il(x, xq_, xil_, n_in, n, cs);
                 il_ready = true;

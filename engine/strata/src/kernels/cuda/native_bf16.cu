@@ -77,8 +77,8 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
 template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
 __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const uint16_t* __restrict__ w,
                                           float* y_, int64_t ldy, int n_in, int n_tok) {
-    const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
-    float* STRATA_PDL_RESTRICT y = y_;
+    const float* x = x_;
+    float* y = y_;
     const int t = threadIdx.x;
     const uint16_t* row = w + (size_t) blockIdx.x * n_in;
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
@@ -91,15 +91,14 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const u
     float acc[NT];
 #pragma unroll
     for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
-    // PDL (pdl.hpp): this thread's first PRE weight pairs are loaded before waiting for the activations
-    constexpr int PRE = kPdlPrefetch ? 8 : 0;
+    // this thread's first PRE weight pairs are loaded before the loop
+    constexpr int PRE = 8;
     uint32_t wpre[PRE > 0 ? PRE : 1];
 #pragma unroll
     for (int q = 0; q < PRE; ++q) {
         const int pair = t + q * BLOCK_SIZE;
         wpre[q] = pair < n_in / 2 ? __ldg(weights2 + pair) : 0u;
     }
-    pdl_wait();
     int q = 0;
     for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE, ++q) {
         const uint32_t weight = q < PRE ? wpre[q] : __ldg(weights2 + pair);

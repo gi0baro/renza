@@ -30,7 +30,6 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
-#include "strata/kernels/gfx_arch.hpp"
 
 #include <algorithm>
 #include <atomic>
