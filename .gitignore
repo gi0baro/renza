@@ -1,0 +1,11 @@
+upstream/strata-0.1.45/
+third_party/llama.cpp/
+build/
+build-*/
+__pycache__/
+/data/
+# Scaffolding for the port, kept on disk until it is done, never committed.
+/PLAN.md
+/docs/
+/tests/
+/upstream/
