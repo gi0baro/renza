@@ -132,8 +132,6 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     return true;
 }
 
-bool cvec_replicate(std::string& err) { return !g_cvec.loaded() || upload_here(err); }
-
 void cvec_set_enabled(bool on) {
     if (!g_cvec.loaded() || on == g_on_host) return;
     int prev = 0;

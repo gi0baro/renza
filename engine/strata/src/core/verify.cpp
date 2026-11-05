@@ -315,19 +315,6 @@ const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
-// The overlapped split's hand-off wait on the GPU is bounded: STRATA_SPLIT_WAIT_MS (default 30000, 0 = no bound).
-// The host's own per-layer wait (20 s, #267) normally ends a stalled window first; this bound is the backstop for
-// a host that is gone (a killed process must not leave a kernel spinning on its card).
-const unsigned long long g_split_wait_ns = [] {
-    const char* e = std::getenv("STRATA_SPLIT_WAIT_MS");
-    return (unsigned long long) (e != nullptr ? std::atoll(e) : 30000) * 1000000ull;
-}();
-// test hook: STRATA_TEST_HANDOFF_DROP=N - the writing stage's N-th window (1-based) leaves its hand-off flag down, as
-// if the publish were lost; the reading stage's bounded wait (or the host's) must then end the window cleanly.
-const int64_t g_test_drop = [] {
-    const char* e = std::getenv("STRATA_TEST_HANDOFF_DROP");
-    return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
-}();
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
@@ -336,7 +323,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -460,16 +447,13 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : df_join_)
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
-    if (hcount_d_) cudaFree(hcount_d_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_bal_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
 
 bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
-    if (next_ && !next_->set_logit_bias(bias, err)) return false;
-    if (le_ < g_->n_layers) return true;
     const OnDevice on_device(device_);
     if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
         err = "logit_bias vocabulary size mismatch"; return false;
@@ -529,8 +513,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (le_ < 0) le_ = g.n_layers;
-    if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || (lb_ > 0 && hand_in_ == nullptr) ||
-        (le_ < g.n_layers && hand_out_ == nullptr)) {
+    if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || le_ < g.n_layers) {
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
     }
@@ -652,13 +635,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     cudaMemset(arena_, 0, count.used);
-    if (hflag_out_d_ != nullptr && hcount_d_ == nullptr) {   // the overlapped split's hand-off counter
-        if (cudaMalloc((void**) &hcount_d_, 64) != cudaSuccess) { err = "verify: hand-off counter allocation failed"; return false; }
-        cudaMemset(hcount_d_, 0, 64);
-        if (!mapped(64, (void**) &hdrop_h_, (void**) &hdrop_d_)) { err = "verify: hand-off test word allocation failed"; return false; }
-    }
-    if (hflag_in_d_ != nullptr && herr_h_ == nullptr &&
-        !mapped(64, (void**) &herr_h_, (void**) &herr_d_)) { err = "verify: hand-off error word allocation failed"; return false; }
     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
@@ -890,14 +866,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
-    if (lb_ > 0) {
-        const float* hin = hand_in_;   // [R][bo][inj] contiguous
-        // the overlapped split: this graph was launched before the previous stage finished - wait for its hand-off
-        if (hflag_in_d_ != nullptr) wait_handoff(hflag_in_d_, 1u, herr_d_, g_split_wait_ns, cs);
-        copy_from_mapped(R_, hin, (int64_t) T * HC * N, cs);
-        copy_from_mapped(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
-        copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
-    } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
+    if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     } else {
@@ -1601,7 +1570,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const char* e = std::getenv("STRATA_FUSE_HEAD_GR");
         return e && e[0] == '1';
     }();
-    const bool fuse_head_gr = fuse_head_gr_env && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
+    const bool fuse_head_gr = fuse_head_gr_env && (head_ != nullptr && head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
@@ -1745,18 +1714,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
-        float* hout = hand_out_;
-        if (hflag_out_d_ != nullptr) {   // the overlapped split: payload + the next stage's flag
-            handoff_publish(hout, R_, (int64_t) T * HC * N, bo_, (int64_t) T * N, inj2_, (int64_t) T * HC, hcount_d_,
-                            hflag_out_d_, cs, g_test_drop > 0 ? hdrop_d_ : nullptr);   // the test word only with the hook on
-            return true;
-        }
-        copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
-        copy_from_mapped(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
-        copy_from_mapped(hout + (size_t) T * (HC + 1) * N, inj2_, (int64_t) T * HC, cs);
-        return true;
-    }
 
     // ---- the head, T columns, and the argmax of each
     stamp(g.n_layers, 0, 0);
@@ -2137,10 +2094,6 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
-    // the overlapped split: the next stage's graph is launched after this, and must see THIS window's raise
-    if (hflag_out_h_ != nullptr) *(volatile uint32_t*) hflag_out_h_ = 0;
-    if (herr_h_ != nullptr) *(volatile uint32_t*) herr_h_ = 0;
-    if (hdrop_h_ != nullptr) *(volatile uint32_t*) hdrop_h_ = (g_test_drop > 0 && windows + 1 == g_test_drop) ? 1u : 0u;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     last_t_ = T;
@@ -2193,7 +2146,7 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
             prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
         }
     }
-    if (le_ == L) prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
+    prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
     ++prof_windows_;
 }
 
@@ -2215,46 +2168,6 @@ bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
     return true;
 }
 
-bool Verifier::handoff_failed(std::string& err) const {
-    if (herr_h_ == nullptr || *(const volatile uint32_t*) herr_h_ == 0) return false;
-    err = "verify: layer split: the hand-off into layer " + std::to_string(lb_) + " did not arrive within " +
-          std::to_string(g_split_wait_ns / 1000000ull) + " ms (STRATA_SPLIT_WAIT_MS); the window was not used. "
-          "STRATA_SPLIT_OVERLAP=0 runs the serial order";
-    trace_ev("HANDOFF-TIMEOUT", -1, lb_, (int64_t) (g_split_wait_ns / 1000000ull));
-    return true;
-}
-
-bool Verifier::chain_overlap() const {
-    return next_ != nullptr && hflag_out_h_ != nullptr && hflag_out_d_ != nullptr && hcount_d_ != nullptr &&
-           next_->hflag_in_h_ == hflag_out_h_ && next_->device_ != device_ && !next_->ple_stage();
-}
-
-bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
-    const OnDevice on_device(device_);
-    prelaunched_ = 0;
-    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];   // #871: the variant the previous stage refreshed
-    if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
-    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
-    if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    const Clock::time_point t0 = Clock::now();
-    stage_inputs(T, tokens, pos0);
-    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    trace_ev("WINDOW-PRE", -1, -1, pos0 * 16 + T);
-    ms_host += ms_since(t0);
-    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
-    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
-    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
-        !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
-    const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
-    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    prelaunched_ = T;
-    return true;
-}
-
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
@@ -2264,22 +2177,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    // the overlapped split launched this stage's window already: keep the graph variant (#871) chosen for it then,
-    // or this thread would serve the window as the other variant
-    const bool pre = prelaunched_ == T;
-    prelaunched_ = 0;
-    if (!pre && pre_launch_ && !pre_launch_(cs_, err)) return false;   // (a prelaunched window's was served with the first stage's)
-    if (!pre) refresh_ar();
+    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    refresh_ar();
     if (!capture(T, err) || !capture_commit(err)) return false;
-    const bool chain = chain_overlap();
-    if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
-        const OnDevice on_next(next_->device_);
-        next_->refresh_ar();                     // #871: the variant its prelaunch and its run() will both use
-        if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
-    }
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
-    if (!pre && !staged_) stage_inputs(T, tokens, pos0);
+    if (!staged_) stage_inputs(T, tokens, pos0);
     staged_ = false;
     const bool do_ple = ss.ple.ready() && ple_stage();
     uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
@@ -2293,54 +2196,28 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     std::optional<HostGraphLaunch> launch_o;   // (not set when the previous stage launched this window already)
-    if (!pre) {
-        if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
-        ms_host += ms_since(t0);
-        VDBG("staged; launching\n");
-        if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
-        if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-        // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
-        if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
-            !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
-        // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
-        static const bool threaded_launch = [] {
-            const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
-            return value != nullptr && value[0] == '1';
-        }();
-        launch_o.emplace(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
-                         [this] { (void) release_gpu_waits(5000); });
-        const cudaError_t le = launch_o->status();
-        trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-        (void) launch_o->query();
-        VDBG("launched\n");
-    }
-    // The overlapped split: the next stage's window is staged and launched on a helper thread while this thread
-    // serves this stage's layers; its graph waits on the GPU for this stage's hand-off flag.  The guard joins the
-    // helper on every return, and on an early return (an error after the launch) releases the next stage's GPU
-    // waits so no spin kernel outlives the window (#267).
-    struct NextLaunch {
-        Verifier* next = nullptr;
-        std::thread th;
-        bool ok = true;
-        bool handed = false;
-        std::string err;
-        bool join(std::string& e) {
-            if (th.joinable()) th.join();
-            if (!ok) e = err;
-            return ok;
-        }
-        ~NextLaunch() {
-            if (th.joinable()) th.join();
-            if (next != nullptr && !handed) (void) next->release_gpu_waits(5000);
-        }
-    } nl;
-    if (chain) {
-        nl.next = next_;
-        nl.th = std::thread([&nl, T, tokens, pos0] { nl.ok = nl.next->prelaunch(T, tokens, pos0, nl.err); });
-    }
+    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+    ms_host += ms_since(t0);
+    VDBG("staged; launching\n");
+    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
+    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+        !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+    // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
+    static const bool threaded_launch = [] {
+        const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    launch_o.emplace(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
+                     [this] { (void) release_gpu_waits(5000); });
+    const cudaError_t le = launch_o->status();
+    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    (void) launch_o->query();
+    VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
@@ -2448,32 +2325,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
-    // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
-    if (chain) {
-        // The overlapped split: no host sync between the stages.  The next stage's GPU starts on this stage's flag;
-        // this thread goes straight to serving the next stage's layers, and syncs this stage once the chain is done.
-        if (!nl.join(err)) return false;
-        nl.handed = true;
-        ++windows;
-        const bool ok = next_->run(T, tokens, pos0, pool, next_user_, out, err);
-        const OnDevice back(device_);
-        const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (copy_used_) {
-            cudaStreamSynchronize(copy_);
-            copy_used_ = false;
-        }
-        if (!ok) return false;
-        if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-        if (handoff_failed(err)) return false;   // a middle stage of three or more: its own hand-in
-        if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871, as below
-            *(volatile uint32_t*) h_plan_err_ = 0;
-            err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
-            return false;
-        }
-        commit_pending_ = false;
-        if (prof_on_ && G == 1) collect_profile();
-        return true;
-    }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
@@ -2489,7 +2340,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
@@ -2507,10 +2357,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
-        ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
-    }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
@@ -2647,7 +2493,6 @@ void Verifier::publish_plan(void* ctx) {
 
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                                std::string& err) {
-    if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
     const OnDevice on_device(device_);
     if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
         err = "window_logprobs: no head logits for this window";
@@ -2741,7 +2586,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!g_commit_async || next_ != nullptr) {
+        if (!g_commit_async) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
@@ -2757,7 +2602,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err);
+    return true;
 }
 
 bool Verifier::wait_commit(std::string& err) {
@@ -2767,7 +2612,7 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
-    return next_ == nullptr || next_->wait_commit(err);
+    return true;
 }
 
 bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const char* what, std::string& err) {
@@ -2813,7 +2658,7 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
     nf_row_ = -1;
     nf_pos_ = -1;
     nf_mask_ = 0;
-    if (!nan_guard_on() || h_nf_ == nullptr || !last_stage()) return;   // (a stage without the head checks nothing)
+    if (!nan_guard_on() || h_nf_ == nullptr) return;
     const volatile uint32_t* f = h_nf_;
     for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
         for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
@@ -2832,7 +2677,6 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
 }
 
 bool Verifier::copy_logits(int t, float* host) const {
-    if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;

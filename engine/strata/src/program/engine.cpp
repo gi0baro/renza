@@ -48,7 +48,6 @@
 #endif
 #include "strata/core/native_dense.hpp"
 #include "strata/program/conv_cache.hpp"
-#include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/program/split_ring.hpp"
 #include "strata/program/draft_kv_plan.hpp"

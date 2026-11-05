@@ -103,7 +103,7 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
-    int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    int64_t vocab() const { return n_vocab_; }
     /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
     /// checks its T rows on the device beside the greedy pick (logits_nonfinite_rows into mapped flags, read after
@@ -111,11 +111,10 @@ public:
     /// stage).  STRATA_NAN_GUARD=0: off (always -1).  STRATA_NAN_INJECT=<n>[,<n>...] (debug): the n-th window the
     /// guard checks in this process (counted from 1 over every stage-with-head verifier: prompt-tail windows, decode
     /// windows and batch windows alike) reports row 0 as non-finite, so the whole response can be tested.
-    int nonfinite_row() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_row() : nf_row_; }
-    int64_t nonfinite_pos() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_pos() : nf_pos_; }
+    int nonfinite_row() const { return nf_row_; }
+    int64_t nonfinite_pos() const { return nf_pos_; }
     /// Row t of the last window (a batch window: each slot's own rows) held a non-finite logit.
     bool nonfinite_in(int t) const {
-        if (next_ != nullptr && !last_stage()) return next_->nonfinite_in(t);
         return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
     }
     static bool nan_guard_on();
@@ -127,7 +126,6 @@ public:
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
         sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
-        if (next_) next_->set_sampling(sp);
     }
     // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
@@ -141,7 +139,6 @@ public:
     void set_history(const int32_t* history, int history_len) {
         hist_d_ = history;
         hist_len_ = history_len;
-        if (next_) next_->set_history(history, history_len);
     }
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): for the NEXT run() only, judge the
     /// window's first `n_q` drafts against the drafter's distributions `q` (host memory, n_q rows of kSpecQStride
@@ -151,7 +148,6 @@ public:
     void set_spec_q(const int32_t* q, int n_q) {
         spec_q_ = q;
         spec_nq_ = n_q;
-        if (next_) next_->set_spec_q(q, n_q);
     }
     /// Counters of the rejection path (windows judged, drafts kept / offered over its rows with a q list).
     int64_t spec_windows = 0;
@@ -159,39 +155,11 @@ public:
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
-    void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
-
-    /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
-    /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
-    /// does not end at the last layer writes its residual to `handoff_out` and has no head.  The hand-off holds,
-    /// per token, the residual R (hc x n_embd), the last layer's pending write bo (n_embd) and inject (hc): the next
-    /// stage folds that write into its first read exactly as the unsplit window does, so the split is bit-exact.
-    /// Both pointers must be device-visible (mapped pinned memory, portable when the stages are on two devices).
-    /// Set before `init`.  Default: the whole model, no hand-off.
-    void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
-        lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
-    }
-    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  More than --batch's 8 slots on a
-    /// layer split: the pipelined slot groups write their rows at hbase = group * rows-per-group, one row per slot.
-    void set_handoff_rows(int rows) { handoff_rows_ = rows; }
-    /// STRATA_SPLIT_OVERLAP=1 (opt-in; stages on DIFFERENT devices only): the hand-off carries a ready flag (one
-    /// mapped word per hand-off buffer: host and device addresses).  The writing stage raises it from the GPU when
-    /// its hand-off is out (handoff_publish); the reading stage's window graph waits on it (wait_flag_ge) - so the
-    /// next stage's graph is launched while this stage is still running, and the host no longer syncs between the
-    /// stages.  Null (the default): the old order - sync, then launch the next stage.  Set before `init`.
-    void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
-        hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
-    }
-    /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
-    /// and `final_R` are the last stage's.
-    void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
-    /// floats per token in a hand-off buffer
-    static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+    void set_head_sampling(bool on) { head_sampling_ = on; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
-    bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
@@ -223,7 +191,7 @@ public:
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
-    const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    const float* final_R_all() const { return R_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -298,26 +266,6 @@ private:
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
-    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
-    const float* hand_in_ = nullptr;
-    float* hand_out_ = nullptr;
-    uint32_t* hflag_in_h_ = nullptr;     ///< set_handoff_flags: the incoming hand-off's ready word (host / device)
-    uint32_t* hflag_in_d_ = nullptr;
-    uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
-    uint32_t* hflag_out_d_ = nullptr;
-    uint32_t* hcount_d_ = nullptr;       ///< handoff_publish's block counter (device memory)
-    uint32_t* herr_h_ = nullptr;         ///< the bounded hand-off wait gave up (mapped; the reading stage's)
-    uint32_t* herr_d_ = nullptr;
-    uint32_t* hdrop_h_ = nullptr;        ///< STRATA_TEST_HANDOFF_DROP: the writing stage withholds its flag (mapped)
-    uint32_t* hdrop_d_ = nullptr;
-    bool handoff_failed(std::string& err) const;   ///< the bounded hand-off wait timed out in the last window
-    int prelaunched_ = 0;                ///< prelaunch ran for a window of this size: run skips staging + launch
-    /// The overlapped split: stage this window's inputs and launch its graph now (the graph waits on the hand-off
-    /// flag); `run` then only serves the host side.  Called on a helper thread while the previous stage runs.
-    bool prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
-    bool chain_overlap() const;          ///< this stage hands off through a flag to a next stage that waits on it
-    Verifier* next_ = nullptr;
-    void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;

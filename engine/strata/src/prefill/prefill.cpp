@@ -316,77 +316,6 @@ inline int bf16x2_mode(bool f16_io) {
     return f16_io ? 0 : v;
 }
 inline bool bf16x2(bool f16_io) { return bf16x2_mode(f16_io) != 0; }
-// STRATA_HANDOFF_PIPE=P (opt-in, 2..16; unset/0/1 = the one copy): a layer split hands a chunk's rows on in P row pieces.
-// The stage records an event when its chunk's work is done and one after each piece's copy into the pinned hand-off
-// buffer, waits on the host only for the first (what on_stage_chunk's checkpoint parts and the error check need), and
-// starts the next stage at once: that stage's upload of piece i waits on piece i's event on the GPU, so its uploads
-// overlap the remaining downloads (separate PCIe links; the 3090s here have no P2P) and the thread start is hidden
-// behind them.  The same bytes land in the same rows before the next stage's first kernel: exact.  No device memory;
-// the events and the existing two pinned buffers per stage only.
-static constexpr int kHandPiecesMax = 16;
-static int handoff_pipe_pieces() {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_HANDOFF_PIPE");
-        const int p = e ? std::atoi(e) : 0;
-        return p >= 2 ? std::min(p, kHandPiecesMax) : 0;
-    }();
-    return v;
-}
-// rows [r0, r0 + nr) of piece i of a T-row chunk in P pieces (the same split on both sides of a hand-off)
-static void handoff_piece(int64_t T, int P, int i, int64_t& r0, int64_t& nr) {
-    const int64_t per = (T + P - 1) / P;
-    r0 = std::min<int64_t>(T, (int64_t) i * per);
-    nr = std::min<int64_t>(T, r0 + per) - r0;
-}
-// STRATA_HANDOFF_PIPE: the next stage's chunks run on one thread of the stage's own, started once and pinned once
-// (std::async started a thread per chunk: ~1 ms from the hand-off to the next stage's first call, measured with nsys).
-// The futures are the same (run_impl's result, or what it threw), so the chain's waits do not change.
-// (STRATA_HANDOFF_PIPE_WORKER=0: a thread per chunk again, for an A/B of the two halves.)
-static bool handoff_pipe_worker() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER"); return !e || std::atoi(e) != 0; }();
-    return handoff_pipe_pieces() > 0 && v;
-}
-struct HandWorker {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<std::packaged_task<bool()>> jobs;
-    bool stop = false;
-    std::thread th;
-    HandWorker() {
-        th = std::thread([this] {
-            strata::aux_cpus::pin_current_thread();
-            for (;;) {
-                std::packaged_task<bool()> job;
-                {
-                    std::unique_lock<std::mutex> lk(mu);
-                    cv.wait(lk, [this] { return stop || !jobs.empty(); });
-                    if (jobs.empty()) return;   // stopped, and every job taken has run (no broken promise)
-                    job = std::move(jobs.front());
-                    jobs.pop_front();
-                }
-                job();
-            }
-        });
-    }
-    std::future<bool> submit(std::packaged_task<bool()> job) {
-        std::future<bool> f = job.get_future();
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            jobs.push_back(std::move(job));
-        }
-        cv.notify_one();
-        return f;
-    }
-    ~HandWorker() {
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            stop = true;
-        }
-        cv.notify_one();
-        if (th.joinable()) th.join();
-    }
-};
-
 // S23 (opt-in STRATA_HC_UPMIX=1): the hyper-connection read's up projection and gr_mix_r as one kernel (gr_upmix: gfx11,
 // and CUDA sm_80+ on chunks of 33+ tokens - there, with CUDA 13.3 on an RTX 5090, cuBLAS's up GEMM sums K in the fused
 // kernel's order and the read is the default pair's bits: gr_upmix_parity, STRATA_HC_UPMIX_CHECK);
@@ -817,12 +746,6 @@ struct Prefill::Impl {
     cudaEvent_t kv_released = nullptr, kv_ready = nullptr;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
-    float* hand[2] = {};
-    // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
-    int hand_pieces = 0;
-    cudaEvent_t hand_done[2] = {};
-    cudaEvent_t hand_ev[2][kHandPiecesMax] = {};
-    std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -882,7 +805,6 @@ void Prefill::reset() {
 
 void Prefill::release() {
     if (!impl_) return;
-    impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
@@ -891,10 +813,6 @@ void Prefill::release() {
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
-        if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
-        for (cudaEvent_t& e : impl_->hand_ev[b])
-            if (e) cudaEventDestroy(e);
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
@@ -1080,27 +998,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     cudaGetDevice(&m.device);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
-    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || stage_le_ < g.n_layers) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
-            err = "prefill: the layer split's hand-off buffers";
-            return false;
-        }
-    if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
-        bool ok = true;
-        auto make = [](cudaEvent_t& e) { return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess; };
-        for (int b = 0; b < 2; ++b) {   // (a retry after a failed init keeps the events it made)
-            ok = ok && make(m.hand_done[b]);
-            for (int i = 0; ok && i < handoff_pipe_pieces(); ++i) ok = make(m.hand_ev[b][i]);
-        }
-        if (!ok) { err = "prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)"; return false; }
-        m.hand_pieces = handoff_pipe_pieces();
-    }
     if (m.tok_dev == nullptr) {
         if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
             err = std::string("prefill: the token id buffer (") + cudaGetErrorString(e) + ")";
@@ -1630,14 +1533,12 @@ int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio
     return (best < today && 100 * best_cost < 97 * today_cost) ? best : cap;
 }
 int Prefill::stage_count() const {
-    int stages = 1;
-    for (const Prefill* p = next_; p != nullptr; p = p->next_) ++stages;
-    return stages;
+    return 1;
 }
 int64_t Prefill::plan_chunk(int64_t n) const {
     const double pipe = pipe_value();
     const int stages = stage_count();
-    if (pipe <= 0.0 || hand_in_ != nullptr || stages < 2) return 0;
+    if (pipe <= 0.0 || stages < 2) return 0;
     return pipeline_chunk(n, impl_->T, stages, pipe > 1.0 ? pipe : 0.0);
 }
 void Prefill::force_chunk(int64_t chunk, bool single, bool planned) {
@@ -1653,9 +1554,7 @@ void Prefill::log_plan(int64_t n, int64_t chunk, int stages) {
                             : "1: today's chunk count, evened out");
 }
 int64_t Prefill::chain_experts_streamed() const {
-    int64_t sum = 0;
-    for (const Prefill* p = this; p != nullptr; p = p->next_) sum += p->stats_.experts_streamed;
-    return sum;
+    return stats_.experts_streamed;
 }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
@@ -1852,16 +1751,14 @@ struct PfTimer {
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     // force_chunk is for this run only: taken before any early return can leave it to the next one
-    const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
-    const bool forced_single = force_single_, forced_planned = force_planned_;
+    const int64_t forced = std::exchange(force_chunk_, 0);
+    const bool forced_planned = force_planned_;
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
-    // The direct successor's future lives on the Prefill object. Intermediate
-    // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
@@ -1899,11 +1796,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t planned_C = forced > 0 ? 0 : plan_chunk(n);
     const int64_t C = forced > 0 ? forced : planned_C > 0 ? planned_C : m.T;
     if (planned_C > 0 && C < std::min(n, m.T)) log_plan(n, C, stage_count());
-    const bool single_chunk = hand_in_ == nullptr ? (forced > 0 ? forced_single : n <= C) : single_chunk_;
     // a read the pipe chunked takes no CPU share: its chunks overlap on the stages by design, and which stage won the
     // pool would decide which experts the CPU computed (other bits) - timing, where the chunks are a function of n
-    const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
-                                                  : pipe_chunked_;
+    const bool pipe_chunked = forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T);
     PfTimer pt;
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
@@ -1940,12 +1835,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    if (hand_in_ == nullptr) stopped_at_ = -1;
+    stopped_at_ = -1;
     for (int64_t c0 = 0; c0 < n; c0 += C) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
         // waits for the later stages to read them)
-        if (c0 > 0 && hand_in_ == nullptr && stop_at_chunk && stop_at_chunk()) {
+        if (c0 > 0 && stop_at_chunk && stop_at_chunk()) {
             stopped_at_ = c0;
             break;
         }
@@ -1955,41 +1850,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
         const auto tsetup = Clock::now();
-        // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
-        // previous stage handed on
-        if (hand_in_ != nullptr && hand_ev_ != nullptr) {
-            // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
-            // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
-            // chunk here) every piece is waited for before the one copy.
-            const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
-            const bool whole = c0 == 0 && T == n;
-            bool ok = true;
-            for (int i = 0; ok && i < hand_pieces_; ++i) {
-                int64_t r0 = 0, nr = 0;
-                handoff_piece(n, hand_pieces_, i, r0, nr);
-                ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
-                if (ok && whole && nr > 0)
-                    ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
-                                         cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
-            }
-            if (ok && !whole)
-                ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice,
-                                     m.cs) == cudaSuccess;
-            if (!ok) {
-                err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
-                      cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
-        } else if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                cudaSuccess) {
-                err = "prefill: the layer split's hand-off upload failed";
-                return false;
-            }
-        }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
         // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
-        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
+        bool batched = m.tok_dev != nullptr;
         const core::NativeEmbed* nemb = core::native_embed();
         const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
         if (batched && nemb == nullptr &&
@@ -2019,7 +1882,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                       (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
             }
         }
-        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
+        for (int64_t t = 0; !batched && t < T;) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
             if (row) {
                 // #1996: the picture's rows live in the caller's (pageable) memory.  A run of consecutive rows is
@@ -2047,7 +1910,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 ++t;
             }
         }
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
+        gr_broadcast(m.emb, m.R, T, m.cs);
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
@@ -3626,56 +3489,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
-        if (next_ != nullptr) {
-            // The current hand-off slot was used two chunks ago.
-            float* h = m.hand[hand_buf_];
-            const int hp = m.hand_pieces;
-            if (hp > 0) {
-                // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
-                // state on_stage_chunk saves, the error check), the next stage's uploads wait on the pieces' events
-                bool ok = cudaEventRecord(m.hand_done[hand_buf_], m.cs) == cudaSuccess;
-                for (int i = 0; ok && i < hp; ++i) {
-                    int64_t r0 = 0, nr = 0;
-                    handoff_piece(T, hp, i, r0, nr);
-                    if (nr > 0)
-                        ok = cudaMemcpyAsync(h + (size_t) r0 * D, m.R + (size_t) r0 * D, (size_t) nr * D * 4,
-                                             cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
-                    ok = ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
-                }
-                if (!ok || cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
-                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
-                    return false;
-                }
-            } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
-                       cudaStreamSynchronize(m.cs) != cudaSuccess) {
-                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
-            // Wait only for the DIRECT successor's previous chunk. That successor
-            // may already have forwarded its older chunk to later GPUs.
-            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
-            next_err_.clear();
-            next_->hand_in_ = h;
-            next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
-            next_->hand_pieces_ = hp;
-            next_->single_chunk_ = single_chunk;
-            next_->pipe_chunked_ = pipe_chunked;
-            if (handoff_pipe_worker()) {
-                if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
-                next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
-                    const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
-                    (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
-                    return r;
-                }));
-            } else
-            next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
-                strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
-            });
-            hand_buf_ ^= 1;
-            continue;   // the last stage reports the chunk (on_chunk)
-        }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
@@ -3724,8 +3537,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             host_chunk_ms += ms_since(toc2);
         }
     }
-    // Do not drain the successor here. This is the overlap: an intermediate
-    // stage can return while later GPUs are still processing the previous chunk.
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
@@ -3806,27 +3617,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     return true;
 }
 
-bool Prefill::drain_pipeline(std::string& err) {
-    bool ok = true;
-
-    if (next_run_.valid()) {
-        if (!next_run_.get()) {
-            err = next_err_;
-            ok = false;
-        }
-    }
-
-    if (next_ != nullptr) {
-        std::string tail_err;
-        if (!next_->drain_pipeline(tail_err)) {
-            if (ok) err = tail_err;
-            ok = false;
-        }
-    }
-
-    return ok;
-}
-
 bool Prefill::reserve_uploads(int64_t T) {
     bool ok = true;
     if (impl_ != nullptr && T > 0) {
@@ -3839,30 +3629,22 @@ bool Prefill::reserve_uploads(int64_t T) {
             bytes = std::max(bytes, (size_t) (T * N) * sizeof(float));
         ok = m.up_ring.reserve(bytes);
     }
-    if (next_ != nullptr) ok = next_->reserve_uploads(T) && ok;
     return ok;
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
-    std::string drain_err;
-    const bool drain_ok = drain_pipeline(drain_err);
-
     if (!body_ok) return false;
-    if (!drain_ok) {
-        err = drain_err;
-        return false;
-    }
     // STRATA_MMQ_DIRECT=1 with STRATA_MMQ_DIRECT_LOG=1 (a check, not a default): each stage's totals so far - how many
     // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones
     if (mmq::direct_mode() == 1) {
         static const bool log = [] { const char* v = std::getenv("STRATA_MMQ_DIRECT_LOG"); return v && std::atoi(v) != 0; }();
-        for (const Prefill* p = this; log && p != nullptr; p = p->next_)
+        if (log)
             std::fprintf(stderr, "strata prefill: layers %lld..%lld: %lld of %lld resident experts read in place, %lld "
-                                 "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) p->stage_lb_,
-                         (long long) p->stage_le_, (long long) p->stats_.experts_direct,
-                         (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed);
+                                 "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) stage_lb_,
+                         (long long) stage_le_, (long long) stats_.experts_direct,
+                         (long long) stats_.experts_resident, (long long) stats_.experts_streamed);
     }
     return true;
 }

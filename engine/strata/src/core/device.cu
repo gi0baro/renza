@@ -43,7 +43,6 @@ int device_count() {
 // visible device).  Set once, before any context exists, by generate.cpp's STRATA_PRIMARY_DEVICE handling.
 static int g_primary_device = 0;
 
-void set_primary_device(int ordinal) { g_primary_device = ordinal; }
 int primary_device() { return g_primary_device; }
 
 bool device_summary(int ordinal, std::string& name, std::string& detail) {
