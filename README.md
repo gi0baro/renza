@@ -1,12 +1,11 @@
 # (infe)renza
 
-My local inference engine: [Strata](https://github.com/Niko1221/Strata)'s engine, which spreads a MoE model's
-experts across VRAM, RAM and NVMe, inside [ds4](https://github.com/antirez/ds4)'s server. One binary, no Python at
-run time, OpenAI- and Anthropic-compatible API for coding agents.
+My local inference harness: basically [Strata](https://github.com/Niko1221/Strata)'s engine,
+inside [ds4](https://github.com/antirez/ds4)'s server.
+One binary, no Python at run time, usual APIs.
 
-Built and tuned for one machine only: RTX 3090 Ti 24 GB, Ryzen 7 5700X, 128 GB RAM, NVMe, Linux, CUDA 13.4,
-running Qwen3.8-Flash-Next (Swift 1.5, IQ3_S). It is public so anyone with the same hardware can fork it and
-experiment; issues and pull requests are not accepted.
+Built and tuned for one Linux machine only: RTX 3090Ti, 128GB RAM, Zen3 CPU.
+It is public so anyone with the same hardware can fork it and experiment; issues and pull requests are not accepted.
 
 Built on ds4 and Strata, with llama.cpp's ggml. MIT, see [LICENSE](LICENSE).
 
