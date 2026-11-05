@@ -17,7 +17,6 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
-    if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
     scratch_ = nullptr;
@@ -71,8 +70,6 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
-        if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
-            strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();

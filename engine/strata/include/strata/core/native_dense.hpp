@@ -55,11 +55,10 @@ public:
     uint64_t weight_bytes() const { return bytes_; }
     /// What the device lost to `load`: each matrix rounded up to the granule `cudaMalloc` backs it with.
     uint64_t allocated_bytes() const { return allocated_; }
-    size_t tensor_count() const { return weights_.size() - packed_keys_.size(); }
+    size_t tensor_count() const { return weights_.size(); }
 
 private:
     std::vector<void*> weights_;
-    std::vector<const void*> packed_keys_;   // GGUF-layout pointers registered with STRATA_Q8_PACKED=1
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     uint64_t allocated_ = 0;

@@ -24,7 +24,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -52,114 +51,12 @@ __device__ __forceinline__ float f16_at(const uint8_t* p) {
     return __half2float(__ushort_as_half((uint16_t) (p[0] | (p[1] << 8))));
 }
 
-/// **ONE S2 ROW AGAINST A Q8_0 ACTIVATION, WARP-WIDE.**  Every lane accumulates its own float partial over a
-/// strided set of 32-element chunks and the caller reduces; `chunk` indices are absolute so the caller can
-/// start the lane at any offset.
-///
-/// Returns the lane's partial.  `codes` is `n_in/4` bytes and `scales` `n_in/QK` fp16, both for THIS row.
-///
-/// **`x_scales` IS R4.2h AND IT IS OPTIONAL ON PURPOSE.**  When it is non-null the activation's multiplier
-/// comes from an fp32 array instead of the block's fp16 `d`.  The CPU pool multiplies by the fp32
-/// `ActQ::scale` (`cpu/expert.cpp:92`), and the two disagreed by **4.761e-04 relative on 80 of 80 chunks**
-/// (`bench/micro/act_quant_parity.cu`), which is what made a cache hit compute a different expert from a
-/// cache miss.  Null keeps the previous fp16 behaviour **exactly**, so `moe_hit_parity` - which passes no
-/// scales - still measures the kernel it always measured.
-__device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes,
-                                               const uint8_t* __restrict__ scales,
-                                               const uint8_t* __restrict__ x_q8_0, int n_chunks, int lane,
-                                               const float* __restrict__ x_scales = nullptr) {
-    float acc = 0.0f;
-    for (int c = lane; c < n_chunks; c += 32) {
-        const uint8_t* cb = codes + (size_t) c * 8;             // 8 code bytes = 32 elements
-        const uint8_t* xb = x_q8_0 + (size_t) c * 34;           // one block_q8_0
-        const float dx = x_scales ? x_scales[c] : f16_at(xb);
-        const int8_t* xq = (const int8_t*) (xb + 2);
-
-        // ---- THE CODES, EXPANDED TO ONE BYTE PER ELEMENT, THEN FOUR AT A TIME INTO `dp4a`.
-        //
-        // The packed form is LSB-first: element 4j+k is bits [2k, 2k+2) of code byte j.  `dp4a` needs both
-        // operands as packed int8, so each code byte becomes a word whose four bytes are its four 2-bit
-        // fields - which is exactly `(c & 3) | ((c>>2)&3)<<8 | ((c>>4)&3)<<16 | ((c>>6)&3)<<24`.
-        int s = 0;      // sum of code * x
-        int hx = 0;     // sum of x        - the weight-independent term, as ones * x
-        const int ones = 0x01010101;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const unsigned cbyte = cb[j];
-            const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
-                                  (((cbyte >> 6) & 3u) << 24));
-            // **`memcpy`, NOT A CAST.**  A `block_q8_0` is 34 BYTES - two of header then 32 of int8 - so the
-            // activation data at offset 2 is never 4-byte aligned, and `*(const int*)(xq + 4*j)` faults with
-            // "misaligned address".  It faulted exactly that way on this kernel's first run.  `memcpy` of a
-            // known 4 bytes compiles to whatever load is legal for the alignment, which is the point of using
-            // it rather than reasoning about which cast happens to work.
-            int xw;
-            memcpy(&xw, xq + 4 * j, 4);
-            s = STRATA_DP4A(cw, xw, s);
-            hx = STRATA_DP4A(ones, xw, hx);
-        }
-        // One weight scale per 64 elements, so per TWO 32-element chunks.
-        const float dw = f16_at(scales + (size_t) (c >> 1) * 2);
-        acc += dw * dx * (float) (s - hx);
-    }
-    return acc;
-}
-
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
     return v;
 }
 
-/// GATE AND UP, ONE WARP PER ROW.
-///
-/// **THE ROWS ARE INTERLEAVED AND THE FIRST VERSION OF THIS GOT IT WRONG.**  In the blob, row-SLOT `i` of the
-/// `2*FF` gate/up rows is gate row `i/2` when `i` is even and up row `(i-1)/2` when it is odd - that is what
-/// `O_GU_CODES + (2r)*ROW_GU` and `+ (2r+1)*ROW_GU` mean in `expert.cpp`.  This kernel decoded the correct
-/// code row for slot `i` and then wrote it to output slot `i` of a layout whose first `FF` entries are gate and
-/// whose last `FF` are up, which pairs `silu(gate[r]) * up[r]` with the WRONG `up` for every `r`.  It produced
-/// finite, plausible numbers.  `moe_hit_parity` caught it on the first run, at worst relative error 2.2e+03.
-///
-/// So slot `i` is DECODED from row-slot `i` and WRITTEN to the output slot its parity says it belongs to.
-__global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
-                          long long blob_bytes, const uint8_t* __restrict__ x_q8_0,
-                          const float* __restrict__ x_scales, float* __restrict__ gate_up, int n_hits,
-                          const int32_t* __restrict__ d_count = nullptr,
-                          const int32_t* __restrict__ dst_index = nullptr, int tok_div = 0) {
-    const int warps_per_block = (int) (blockDim.x >> 5);
-    const long long slot = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
-    const long long rows_per_hit = 2LL * FF;
-    const long long total = (long long) n_hits * rows_per_hit;
-    if (slot >= total) return;
-    const int h = (int) (slot / rows_per_hit);
-    if (d_count != nullptr && h >= *d_count) return;     // token graph: capacity layout, device count
-    const int i = (int) (slot % rows_per_hit);
-    const int lane = threadIdx.x & 31;
-
-    const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
-    if (tok_div > 0) {   // plan v0.3 P6 verify window: each hit reads its own token's activation
-        const int tok = dst_index[h] / tok_div;
-        x_q8_0 += (size_t) tok * (size_t) (H / 32) * 34;
-        if (x_scales != nullptr) x_scales += (size_t) tok * (size_t) (H / 32);
-    }
-    const float acc = row_dot_s2_q8(blob + (size_t) i * ROW_GU,
-                                    blob + O_GU_SCALES + (size_t) i * SC_GU * 2, x_q8_0, H / 32, lane, x_scales);
-    const float s = warp_sum(acc);
-    if (lane != 0) return;
-    // ---- THE OUTPUT LAYOUT IS GATE-MAJOR, AND THAT IS NOT COSMETIC.
-    //
-    // The first version wrote `gate_up[h*2FF + {0..FF-1}] = gate` and `[h*2FF + FF..] = up`, i.e. a per-hit
-    // [gate | up] pair, and then called the shared `swiglu_kernel` and `quantize_q8_0` over the whole buffer.
-    // Both of those walk a CONTIGUOUS range, so with more than one hit they read hit 0's UP rows where they
-    // wanted hit 1's GATE rows - finite numbers, wrong expert.  With one hit it would have passed.
-    //
-    // Gate-major removes the mismatch instead of adding a stride to two other kernels: every hit's gate rows
-    // are contiguous from 0, every hit's up rows are contiguous from `n_hits * FF`, and the swiglu's output
-    // lands in the first `n_hits * FF` floats exactly where `quantize_q8_0` reads it.
-    const int r = i >> 1;
-    const size_t base = (i & 1) ? ((size_t) n_hits * FF + (size_t) h * FF) : ((size_t) h * FF);
-    gate_up[base + (size_t) r] = s;
-}
 
 /// `silu(gate) * up`, in place, over a GATE-MAJOR buffer: `[0, n_pairs)` is every hit's gate and
 /// `[n_pairs, 2*n_pairs)` is every hit's up, so hit `h`'s row `r` meets itself at `h*FF + r`.
@@ -203,32 +100,6 @@ __global__ void swiglu_quantize_q8_0_scaled_kernel(float* __restrict__ gate_up, 
     int v = (int) r;
     v = v < -127 ? -127 : (v > 127 ? 127 : v);
     out[2 + lane] = (uint8_t) (int8_t) v;
-}
-
-/// DOWN, ONE WARP PER ROW, reading the quantized intermediate the caller produced.
-///
-/// `dst_index[h]` is which row of the shared output buffer hit `h` fills - see the header.  It is the router's
-/// slot, not `h`, and the two differ on every layer where some experts are resident and some are not.
-__global__ void down_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
-                            const int32_t* __restrict__ dst_index, long long blob_bytes,
-                            const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
-                            float* __restrict__ out, int n_hits, const int32_t* __restrict__ d_count = nullptr) {
-    const int warps_per_block = (int) (blockDim.x >> 5);
-    const long long row = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
-    const long long total = (long long) n_hits * H;
-    if (row >= total) return;
-    const int h = (int) (row / H);
-    if (d_count != nullptr && h >= *d_count) return;
-    const int r = (int) (row % H);
-    const int lane = threadIdx.x & 31;
-
-    const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
-    const uint8_t* xb = h_q8_0 + (size_t) h * (size_t) (FF / 32) * 34;
-    const float acc = row_dot_s2_q8(blob + O_D_CODES + (size_t) r * ROW_D,
-                                    blob + O_D_SCALES + (size_t) r * SC_D * 2, xb, FF / 32, lane,
-                                    h_scales ? h_scales + (size_t) h * (size_t) (FF / 32) : nullptr);
-    const float s = warp_sum(acc);
-    if (lane == 0) out[(size_t) dst_index[h] * H + r] = s;
 }
 
 // ---- THE SAME INTEGERS FROM FEWER INSTRUCTIONS.  `STRATA_OLD_GROUPED=1` keeps the kernels above.
@@ -515,89 +386,26 @@ void check(const char* who, void* stream) {
     (void) stream;
 }
 
-// The previous kernels stay selectable for A/B - `STRATA_OLD_GROUPED=1` in the environment, or
-// `moe_grouped_select_old` (the parity test runs both in one process).  The environment is read once, on first use;
-// the choice is made at each launch, so a captured graph keeps the kernels it was captured with.
-std::atomic<int> g_select_old{-1};
-// Which kernels the last launch of an entry point used: 1 = new, 0 = previous, -1 = none since the last query.
-std::atomic<int> g_last_path{-1};
-
-bool old_kernels() {
-    const int s = g_select_old.load(std::memory_order_relaxed);
-    if (s >= 0) return s != 0;
-    static const bool env = [] {
-        const char* e = std::getenv("STRATA_OLD_GROUPED");
-        return e != nullptr && e[0] == '1';
-    }();
-    return env;
-}
-
-// `STRATA_GROUPED_PAIR_MIN_HITS=N`: the per-hit path keeps the previous one-warp-per-row kernels below N hits of
-// capacity.  The new per-hit kernels launch half the warps (two rows each), so one hit's gate/up is 80 blocks - fewer
-// than an RTX 5090's SMs - and whether that costs time at one to three hits is what `--bench` measures.  Bitwise
-// the same either way; default 0 (always the new kernels).  Ignored while `moe_grouped_select_old` forces a choice.
-long long pair_min_hits() {
-    if (g_select_old.load(std::memory_order_relaxed) >= 0) return 0;
-    static const long long n = [] {
-        const char* e = std::getenv("STRATA_GROUPED_PAIR_MIN_HITS");
-        return e != nullptr ? std::atoll(e) : 0LL;
-    }();
-    return n;
-}
-
-// The new kernels read the activations as aligned words (`load_x_chunk`), so they need 4-byte aligned activation
-// rows - the input's and the intermediate's in `scratch`; the per-hit ones also read a blob's codes as uint2, which
-// needs an 8-byte aligned arena and slot size (the grouped kernels above already did).  Anything else keeps the
-// previous kernels rather than issuing a misaligned load.
-bool new_grouped(const void* x_q8_0, const void* scratch) {
-    const bool fast = !old_kernels() && ((uintptr_t) x_q8_0 & 3) == 0 && ((uintptr_t) scratch & 3) == 0;
-    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
-    return fast;
-}
-
-bool new_hit(const void* blob_base, long long blob_bytes, const void* x_q8_0, const void* scratch, long long cap) {
-    const bool fast = new_grouped(x_q8_0, scratch) && ((uintptr_t) blob_base & 7) == 0 && (blob_bytes & 7) == 0 &&
-                      cap >= pair_min_hits();
-    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
-    return fast;
-}
-
 // The per-hit path's two projections, previous or new kernels (one warp per row, or per pair of rows).
-void launch_hit_gu(bool fast, const uint8_t* blob_base, const int32_t* slot_index, long long blob_bytes,
+void launch_hit_gu(const uint8_t* blob_base, const int32_t* slot_index, long long blob_bytes,
                    const uint8_t* x_q8_0, const float* x_scales, float* gate_up, long long cap,
                    const int32_t* d_count, const int32_t* dst_index, int tok_div, cudaStream_t cs) {
     const int warps = THREADS / 32;
-    if (fast) {
-        const long long pairs = cap * (long long) FF;
-        gu_pair_kernel<<<(unsigned) ((pairs + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div);
-    } else {
-        const long long rows = cap * 2LL * FF;
-        gu_kernel<<<(unsigned) ((rows + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div);
-    }
+    const long long pairs = cap * (long long) FF;
+    gu_pair_kernel<<<(unsigned) ((pairs + warps - 1) / warps), THREADS, 0, cs>>>(
+        blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div);
 }
 
-void launch_hit_down(bool fast, const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
+void launch_hit_down(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                      long long blob_bytes, const uint8_t* h_q8_0, const float* h_scales, float* out, long long cap,
                      const int32_t* d_count, cudaStream_t cs) {
     const int warps = THREADS / 32;
-    if (fast) {
-        const long long pairs = cap * (long long) (H / 2);
-        down_pair_kernel<<<(unsigned) ((pairs + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out, (int) cap, d_count);
-    } else {
-        const long long rows = cap * (long long) H;
-        down_kernel<<<(unsigned) ((rows + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out, (int) cap, d_count);
-    }
+    const long long pairs = cap * (long long) (H / 2);
+    down_pair_kernel<<<(unsigned) ((pairs + warps - 1) / warps), THREADS, 0, cs>>>(
+        blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out, (int) cap, d_count);
 }
 
 }  // namespace
-
-void moe_grouped_select_old(int old) { g_select_old.store(old < 0 ? -1 : (old != 0 ? 1 : 0)); }
-
-int moe_grouped_last_path() { return g_last_path.exchange(-1, std::memory_order_relaxed); }
 
 uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n_ff) {
     if (n_hits <= 0) return 0;
@@ -615,7 +423,6 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
                         void* stream, const float* x_scales) {
     if (n_hits <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, n_hits);
 
     const uint64_t gu_bytes = ((uint64_t) n_hits * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) n_hits * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
@@ -625,7 +432,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
 
     // 1. gate + up, one launch for every row of every hit.
     {
-        launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, n_hits, nullptr, nullptr,
+        launch_hit_gu(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, n_hits, nullptr, nullptr,
                       0, cs);
         check("moe_hit_grouped_s2/gu", stream);
     }
@@ -645,7 +452,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
     else quantize_q8_0(gate_up, h_q8_0, n_hits * (int64_t) FF, stream);
     // 4. down.
     {
-        launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
+        launch_hit_down(blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, n_hits, nullptr, cs);
         check("moe_hit_grouped_s2/down", stream);
     }
@@ -719,14 +526,13 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                             void* scratch, float* out, void* stream, const float* x_scales) {
     if (cap <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
     const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
     {
-        launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, nullptr, 0,
+        launch_hit_gu(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, nullptr, 0,
                       cs);
         check("moe_hit_grouped_s2_dev/gu", stream);
     }
@@ -738,7 +544,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
     if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
     else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     {
-        launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
+        launch_hit_down(blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
         check("moe_hit_grouped_s2_dev/down", stream);
     }
@@ -756,14 +562,13 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
                               const float* x_scales, int k_per_token, void* scratch, float* out, void* stream) {
     if (cap <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
     const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
     {
-        launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, dst_index,
+        launch_hit_gu(blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, dst_index,
                       k_per_token, cs);
         check("moe_hit_grouped_s2_multi/gu", stream);
     }
@@ -775,7 +580,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
     else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     {
-        launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
+        launch_hit_down(blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
         check("moe_hit_grouped_s2_multi/down", stream);
     }
@@ -793,136 +598,6 @@ constexpr int GMAX = 8;                          // entries per group (tokens ro
 static_assert(GMAX >= kVerifyMaxT, "a verify window's group can exceed GMAX entries");
 constexpr int GU_ROWS = 32;                      // gate/up rows per block: 4 per warp
 constexpr int D_ROWS = 64;                       // down rows per block: 8 per warp
-
-// One activation chunk's contribution, `row_dot_s2_q8`'s inner body with the 32 int8 of the chunk already in
-// aligned words: same dp4a sequence, same float expression, so the result is bitwise the per-entry kernel's.
-__device__ __forceinline__ float chunk_dot(uint2 cb, const int* xw, float dw, float dx) {
-    const uint8_t* cbytes = (const uint8_t*) &cb;
-    int s = 0, hx = 0;
-    const int ones = 0x01010101;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const unsigned cbyte = cbytes[j];
-        const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
-                              (((cbyte >> 6) & 3u) << 24));
-        s = STRATA_DP4A(cw, xw[j], s);
-        hx = STRATA_DP4A(ones, xw[j], hx);
-    }
-    return dw * dx * (float) (s - hx);
-}
-
-// Gate/up: a block = GU_ROWS rows of ONE group.  The group's activations (each entry's token row of x_q8_0 and
-// its fp32 scales) are staged once into shared memory as aligned words; each warp then walks its rows, loading
-// each lane's code chunks once and dotting them with every entry.
-__global__ void __launch_bounds__(256) gu_grouped_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                         const int32_t* __restrict__ grp_start,
-                                                         const int32_t* __restrict__ n_groups,
-                                                         const int32_t* __restrict__ ent_tok,
-                                                         const uint8_t* __restrict__ x_q8_0,
-                                                         const float* __restrict__ x_scales,
-                                                         float* __restrict__ gate_up, int cap_entries) {
-    __shared__ int xs_q[GMAX][H / 4];          // the entries' int8 activations as words (2560 B each)
-    __shared__ float xs_d[GMAX][H / 32];
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
-    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    for (int i = t; i < ne * (H / 32); i += blockDim.x) {
-        const int k = i / (H / 32), c = i - k * (H / 32);
-        const uint8_t* xb = x_q8_0 + (size_t) ent_tok[e0 + k] * (size_t) (H / 32) * 34 + (size_t) c * 34;
-        xs_d[k][c] = x_scales ? x_scales[(size_t) ent_tok[e0 + k] * (H / 32) + c] : f16_at(xb);
-        const int8_t* q = (const int8_t*) (xb + 2);
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            int v;
-            memcpy(&v, q + 4 * w, 4);
-            xs_q[k][c * 8 + w] = v;
-        }
-    }
-    __syncthreads();
-    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-    const int row0 = blockIdx.x * GU_ROWS;
-    for (int rr = warp; rr < GU_ROWS; rr += 8) {
-        const int i = row0 + rr;
-        const uint8_t* codes = blob + (size_t) i * ROW_GU;
-        const uint8_t* scales = blob + O_GU_SCALES + (size_t) i * SC_GU * 2;
-        uint2 cb[GU_CHUNKS];
-        float dw[GU_CHUNKS];
-#pragma unroll
-        for (int q = 0; q < GU_CHUNKS; ++q) {
-            const int c = lane + 32 * q;
-            if (c < H / 32) {
-                cb[q] = *(const uint2*) (codes + (size_t) c * 8);
-                dw[q] = f16_at(scales + (size_t) (c >> 1) * 2);
-            }
-        }
-        for (int k = 0; k < ne; ++k) {
-            float acc = 0.0f;
-#pragma unroll
-            for (int q = 0; q < GU_CHUNKS; ++q) {
-                const int c = lane + 32 * q;
-                if (c >= H / 32) break;
-                acc += chunk_dot(cb[q], &xs_q[k][c * 8], dw[q], xs_d[k][c]);
-            }
-            const float sum = warp_sum(acc);
-            if (lane == 0) {
-                const int e = e0 + k, r = i >> 1;
-                const size_t base = (i & 1) ? ((size_t) cap_entries * FF + (size_t) e * FF) : ((size_t) e * FF);
-                gate_up[base + (size_t) r] = sum;
-            }
-        }
-    }
-}
-
-// Down: a block = D_ROWS rows of ONE group; the entries' quantized intermediates staged once.  A down row is 20
-// chunks, so lanes 0..19 each hold one chunk, as in the per-entry kernel.
-__global__ void __launch_bounds__(256) down_grouped_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                           const int32_t* __restrict__ grp_start,
-                                                           const int32_t* __restrict__ n_groups,
-                                                           const int32_t* __restrict__ ent_dst,
-                                                           const uint8_t* __restrict__ h_q8_0,
-                                                           const float* __restrict__ h_scales,
-                                                           float* __restrict__ out) {
-    __shared__ int hs_q[GMAX][FF / 4];
-    __shared__ float hs_d[GMAX][FF / 32];
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
-    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    for (int i = t; i < ne * (FF / 32); i += blockDim.x) {
-        const int k = i / (FF / 32), c = i - k * (FF / 32);
-        const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) (FF / 32) * 34 + (size_t) c * 34;
-        hs_d[k][c] = h_scales ? h_scales[(size_t) (e0 + k) * (FF / 32) + c] : f16_at(xb);
-        const int8_t* q = (const int8_t*) (xb + 2);
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            int v;
-            memcpy(&v, q + 4 * w, 4);
-            hs_q[k][c * 8 + w] = v;
-        }
-    }
-    __syncthreads();
-    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-    const int row0 = blockIdx.x * D_ROWS;
-    for (int rr = warp; rr < D_ROWS; rr += 8) {
-        const int r = row0 + rr;
-        const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
-        const uint8_t* scales = blob + O_D_SCALES + (size_t) r * SC_D * 2;
-        const int c = lane;
-        uint2 cb = make_uint2(0, 0);
-        float dw = 0.0f;
-        if (c < FF / 32) {
-            cb = *(const uint2*) (codes + (size_t) c * 8);
-            dw = f16_at(scales + (size_t) (c >> 1) * 2);
-        }
-        for (int k = 0; k < ne; ++k) {
-            float acc = 0.0f;
-            if (c < FF / 32) acc += chunk_dot(cb, &hs_q[k][c * 8], dw, hs_d[k][c]);
-            const float sum = warp_sum(acc);
-            if (lane == 0) out[(size_t) ent_dst[e0 + k] * H + r] = sum;
-        }
-    }
-}
 
 // ---- The grouped kernels with the staged activations laid out for the reads.
 //
@@ -1140,15 +815,10 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-    const bool fast = new_grouped(x_q8_0, scratch);
     {
         const dim3 grid((unsigned) (2 * FF / GU_ROWS), (unsigned) cap_groups);
-        if (fast)
-            gu_grouped_t_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
-                                                      gate_up, (int) cap_entries);
-        else
-            gu_grouped_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up,
-                                                    (int) cap_entries);
+        gu_grouped_t_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                                  gate_up, (int) cap_entries);
         check("moe_grouped_s2/gu", stream);
     }
     // #783 PR-k (stuchapin909): SwiGLU and the scaled Q8_0 quantize of its result in one kernel (gate_up still gets the
@@ -1158,7 +828,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
         return e == nullptr || e[0] != '0';
     }();
     static_assert(FF % 32 == 0, "the fused SwiGLU + Q8_0 kernel works in whole 32-value blocks");
-    if (fast && x_scales != nullptr && swiglu_q8) {
+    if (x_scales != nullptr && swiglu_q8) {
         const long long pairs = cap_entries * (long long) FF;
         const long long n_blocks = pairs >> 5;
         const int warps = THREADS / 32;
@@ -1175,10 +845,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     {
         const dim3 grid((unsigned) (H / D_ROWS), (unsigned) cap_groups);
         const float* hs = x_scales != nullptr ? h_scales : nullptr;
-        if (fast)
-            down_grouped_t_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
-        else
-            down_grouped_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
+        down_grouped_t_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
         check("moe_grouped_s2/down", stream);
     }
 }
