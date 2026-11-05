@@ -259,7 +259,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const auto* tensors = gguf.get("split.tensors.count");
             if (gguf.get("general.architecture") && (!number || number->u == 0)) {
                 // splitter may copy general.architecture into every shard (Huihui abliterated re-split)
-                err = strata::check_engine_architecture(gguf);
+                err = strata::check_architecture(gguf);
                 if (!err.empty()) return false;
                 have_architecture = true;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {

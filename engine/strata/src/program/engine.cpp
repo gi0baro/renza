@@ -2006,14 +2006,9 @@ int EngineState::start_up(int argc, char** argv) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
             // here: it used to be skipped, leaving a model with some tensors absent and a later error, or none.
             o.native_shards = strata::gguf_split_paths(o.native_preset);
-            // a model family Strata recognises but has no engine path for yet (Qwen3.6-35B-A3B) is refused here,
-            // with a message that says so, before anything else about the file is judged
+            // the first shard is parsed before anything else about the file is judged: an unreadable file fails here
             {
                 const strata::GgufFile meta(o.native_shards.front());
-                const std::string why = strata::model_family_not_supported(strata::model_family(meta));
-                if (strata::model_family(meta) != strata::ModelFamily::Unknown && !why.empty()) {
-                    return fail(2, "strata generate: --native %s: %s\n", o.native_preset.c_str(), why.c_str());
-                }
             }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's

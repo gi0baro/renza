@@ -552,30 +552,6 @@ inline ModelFamily model_family(const GgufFile& g) {
     return arch ? model_family_from_arch(arch->s) : ModelFamily::Unknown;
 }
 
-/// Qwen3.6-35B-A3B's guard: every key the geometry is read from must be present (core::geometry_from_gguf),
-/// and the few that the layer pattern depends on must have the values the model has.
-inline std::string check_architecture_qwen35moe(const GgufFile& g) {
-    static const char* const keys[] = {
-        "qwen35moe.block_count", "qwen35moe.embedding_length", "qwen35moe.attention.head_count",
-        "qwen35moe.attention.head_count_kv", "qwen35moe.attention.key_length", "qwen35moe.attention.value_length",
-        "qwen35moe.expert_count", "qwen35moe.expert_used_count", "qwen35moe.expert_feed_forward_length",
-        "qwen35moe.expert_shared_feed_forward_length", "qwen35moe.ssm.conv_kernel", "qwen35moe.ssm.state_size",
-        "qwen35moe.ssm.group_count", "qwen35moe.ssm.time_step_rank", "qwen35moe.ssm.inner_size",
-        "qwen35moe.full_attention_interval", "qwen35moe.nextn_predict_layers",
-    };
-    for (const char* k : keys) {
-        const MetaValue* v = g.get(k);
-        if (!v) return std::string("missing ") + k;
-        if (!v->is_num()) return std::string(k) + " is not a number";
-    }
-    const MetaValue* nl = g.get("qwen35moe.block_count");
-    const MetaValue* mtp = g.get("qwen35moe.nextn_predict_layers");
-    if (mtp->u >= nl->u) return "qwen35moe.nextn_predict_layers is not smaller than qwen35moe.block_count";
-    if (g.get("qwen35moe.full_attention_interval")->u < 2)
-        return "qwen35moe.full_attention_interval must be at least 2 (the GDN / attention pattern)";
-    return {};
-}
-
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -756,25 +732,14 @@ inline std::string geometry_unsupported(const core::ModelGeometry& g) {
 }
 
 /// The architecture guard: "" when the engine can read the model whose metadata shard is `f`.  Qwen3.8-Flash-Next
-/// (qwen4exp) is read and checked against the shape the kernels are compiled for; Qwen3.6-35B-A3B (qwen35moe) must
-/// carry every key its geometry is read from (core::geometry_from_gguf).
+/// (qwen4exp) is read and checked against the shape the kernels are compiled for.
 inline std::string check_architecture(const GgufFile& f) {
     const MetaValue* arch = f.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    const ModelFamily family = model_family_from_arch(arch->s);
-    if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
     return err;
-}
-
-/// The engine's guard: `check_architecture`, then a family this engine has a path for.  A recognised family
-/// it does not run yet (Qwen3.6 on SYCL) is refused with a message that says so.
-inline std::string check_engine_architecture(const GgufFile& g) {
-    std::string err = check_architecture(g);
-    if (!err.empty()) return err;
-    return model_family_not_supported(model_family(g));
 }
 
 } // namespace strata

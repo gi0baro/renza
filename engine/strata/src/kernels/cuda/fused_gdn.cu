@@ -15,9 +15,6 @@ static_assert(S == strata::core::kCompiledGeometry.ssm_state_size, "fused_gdn is
 constexpr int RG = 4;           // row groups
 constexpr int RPG = S / RG;     // 32 rows per thread
 
-// SILU: the output gate is SiLU(z) (Qwen3.6, qwen35moe) instead of sigmoid(z) (Flash-Next); a compile-time flag, so
-// the sigmoid instantiation is the kernel it was.
-template <bool SILU>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q,
                                                                const float* __restrict__ k, const float* __restrict__ v,
                                                                const float* __restrict__ gate,
@@ -71,8 +68,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = rsqrtf(ss / (float) S + eps);
         const float zz = z[head * S + col];
-        if constexpr (SILU) y[head * S + col] = oc * scale * gamma[col] * (zz / (1.0f + __expf(-zz)));
-        else y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+        y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
     }
 }
 
@@ -153,34 +149,20 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-namespace {
-template <bool SILU>
-void step_norm(float* state, const float* q, const float* k, const float* v, const float* gate, const float* beta,
-               const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, void* stream) {
+void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
+                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                         void* stream) {
     if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_kernel<SILU><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta,
-                                                                                         z, gamma, eps, y, h_k, h_v);
+    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta,
+                                                                                   z, gamma, eps, y, h_k, h_v);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-}
-}  // namespace
-
-void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
-                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
-                         void* stream) {
-    step_norm<false>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
-}
-
-void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
-                              const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
-                              int h_v, void* stream) {
-    step_norm<true>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
 }
 
 }  // namespace strata::kernels

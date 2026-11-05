@@ -4046,24 +4046,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         if (v != nullptr && v[0] != '\0') return v[0] == '1';
         return false;
     }();
-    // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
-    const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
     if (v2k && (L.gu_type == 12 || L.gu_type == 13) &&
-        (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
+        ((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640)) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
 #define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh)
-        if (q36geo) {
-            // the gate/up of the V2K path (4 rows per warp, the chunk's activations in LDS) + SwiGLU/q8_1, and the old down kernel:
-            // for n_ff 512 the new down kernel measured slower (15.1 vs 13.4 us per layer on gfx1201, R9700)
-            const dim3 ggu((unsigned) (2 * L.n_ff / (GU_ROWS * 4)), (unsigned) cap_groups);
-            if (L.gu_type == 12) s27_gu_kernel<12, true, 4, false><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-            else s27_gu_kernel<13, true, 4, false><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-            s26_swiglu_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, hq, nh);
-            const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
-            launch_down<13>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        }
-        else if (L.gu_type == 12 && L.d_type == 7) STRATA_V2K(12, 7);
+        if (L.gu_type == 12 && L.d_type == 7) STRATA_V2K(12, 7);
         else if (L.gu_type == 12) STRATA_V2K(12, 8);
         else if (L.d_type == 7) STRATA_V2K(13, 7);
         else STRATA_V2K(13, 8);
