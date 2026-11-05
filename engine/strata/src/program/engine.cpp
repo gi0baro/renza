@@ -1448,7 +1448,6 @@ struct EngineState {
     strata::core::TokenHits thits;
     bool graph_hits = false;
     std::function<int64_t(int64_t, int64_t)> request_chunk;
-    std::function<int64_t(int64_t, int64_t)> equal_chunk;
     int64_t kAutoLendPct = 0;
     int64_t auto_ceiling = 0;
     KvGrow kvg;
@@ -1494,9 +1493,6 @@ struct EngineState {
     std::optional<CheckpointPool> ckpt_pool;
     uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
     int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
-    // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
-    // checkpoints taken inside it
-    ConvCheckpoint::PromptPlan seg_plan;
     int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
     bool pp_tail_saved = false;
     // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
@@ -2156,9 +2152,6 @@ int EngineState::start_up(int argc, char** argv) {
         }
     }
     native_pack = strata::kernels::cpu::expert_layout().native;
-    // STRATA_MMQ_DIRECT: the room each sized expert slot keeps after its blob (0 unless it is on: the slot costs and
-    // the arena are then today's, byte for byte)
-    slot_guard = native_pack ? (int64_t) strata::prefill::Prefill::slot_guard_bytes() : 0;
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
@@ -3159,13 +3152,6 @@ int EngineState::start_up(int argc, char** argv) {
     }
     // STRATA_MMQ_DIRECT: the guard after each sized slot (kept across the retry loop's close/open)
     xcache.set_slot_guard(slot_guard);
-    if (slot_guard > 0 && o.expert_cache > 0) {
-        if (!sized_slots.empty())
-            std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
-        else   // xcache.open below: every slot is the largest blob's size, and no guard is added
-            std::fprintf(stderr, "strata generate: uniform expert slots, no guard (STRATA_MMQ_DIRECT): an expert is read "
-                                 "in its slot where the slot's slack covers the over-read\n");
-    }
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
@@ -3678,23 +3664,6 @@ int EngineState::start_up(int argc, char** argv) {
         const int64_t rounded = tokens > std::numeric_limits<int64_t>::max() - 255
                                     ? tokens
                                     : ((tokens + 255) / 256) * 256;
-        return std::min(max_chunk, rounded);
-    };
-    // STRATA_PREFILL_EQUAL=1 (opt-in, PR #693): a segment of `tokens` reads in n = ceil(tokens / max_chunk) chunks of EQUAL
-    // size (ceil(tokens / n) rounded up to 256) instead of full chunks and a short last one.  A chunk of
-    // stream_all_min_tokens() or more streams every expert the GPU does not hold, whatever its length, so a prompt's cost
-    // is its number of such chunks and equal chunks borrow no more slots than that count needs.  A last chunk below
-    // stream_all_min_tokens() stays as it is (it moves only the experts its own tokens route to).  Used ONLY where a
-    // segment's chunk is chosen (the serve lend).  The chunk geometry changes the rounding, so it is off by default.
-    static const bool equal_chunks = [] { const char* e = std::getenv("STRATA_PREFILL_EQUAL"); return e != nullptr && e[0] == '1'; }();
-    equal_chunk = [&](int64_t tokens, int64_t max_chunk) -> int64_t {
-        const int64_t plain = request_chunk(tokens, max_chunk);
-        if (!equal_chunks || tokens <= 0 || max_chunk <= 0) return plain;
-        const int64_t n = tokens / max_chunk + (tokens % max_chunk != 0);
-        const int64_t last = tokens - (n - 1) * max_chunk;
-        if (n <= 1 || last < strata::prefill::Prefill::stream_all_min_tokens()) return plain;
-        const int64_t per = tokens / n + (tokens % n != 0);
-        const int64_t rounded = per > std::numeric_limits<int64_t>::max() - 255 ? per : ((per + 255) / 256) * 256;
         return std::min(max_chunk, rounded);
     };
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
@@ -4585,7 +4554,6 @@ int EngineState::serve_setup() {
             }
         }
         c.used = ++check_clock;
-        if (seg_plan.chunk > 0 && L > seg_plan.from && L < seg_plan.to) c.plan = seg_plan;   // inside a planned segment
         if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
             const int64_t old_tail = tail_ckpt_len;
             auto old = [&](const ConvCheckpoint& k) { return old_tail >= 0 && (int64_t) k.ids.size() == old_tail; };
@@ -5259,7 +5227,7 @@ int EngineState::serve_setup() {
                              "spec_min_p=%.2f conversation_cache_mib=0 conversation_cache_slots=4 "
                              "conversation_cache_min_free_mib=2560 conversation_cache_min_tokens=0 "
                              "tail_role_token=%lld vram_elastic=%d "
-                             "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g engine=" STRATA_VERSION,
+                             "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=0 engine=" STRATA_VERSION,
                              (long long) o.max_context, o.kv.c_str(),
                              (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                               ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -5274,8 +5242,7 @@ int EngineState::serve_setup() {
                              // the prompt path: its chunk cap, the stages a prompt flows through, the chunk size from which a
                              // chunk streams every expert, the prompt pipe setting
                              (long long) o.prefill_chunk, sp->stage_count(),
-                             (long long) strata::prefill::Prefill::stream_all_min_tokens(),
-                             strata::prefill::Prefill::pipe_setting());
+                             (long long) strata::prefill::Prefill::stream_all_min_tokens());
     }
     S = o.spec;
     S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;
@@ -5822,17 +5789,13 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
     // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
     // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
     // participant's own cache, and marking only that participant's own layers
-    int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
-    auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
-        seg_lend = 0;
+    auto lend = [&](int64_t tokens, std::string& e) -> bool {
         if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
         const auto t_ln = Clock::now();
         // what this segment needs, capped by the configured chunk: a request lends only what its own
         // prompt needs, so a large chunk costs a short prompt nothing
-        const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
-        const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk : want_full;
-        // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
-        const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+        const int64_t want_full = request_chunk(tokens, o.prefill_chunk);
+        const int64_t want = o.prefill_head_alias ? o.prefill_chunk : want_full;
         if (want <= 0) {
             e = "prefill: cannot lend buffers for an empty request segment";
             return false;
@@ -5891,8 +5854,6 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
                 }
             p.lent_chunk = want_p;
         }
-        for (const PfPart& p : pf_parts)
-            if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
         if (any) res_upload();
         if (trace) {
             int64_t n_lent = 0;
@@ -5906,20 +5867,11 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
     req_chunk = 0;
     req_chunk_len = 0;
     auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-        ConvCheckpoint::PromptPlan plan;
-        const bool planned = plan.chunk > 0;
-        const bool plan_single = planned && plan.single;
         if (b0 - a0 > req_chunk_len) {
             req_chunk_len = b0 - a0;
-            req_chunk = planned ? std::min(plan.chunk, b0 - a0) : std::min(sp->chunk(), b0 - a0);
+            req_chunk = std::min(sp->chunk(), b0 - a0);
         }
-        seg_plan = plan;   // the checkpoints taken inside it keep it; cleared when the segment is done
-        struct SegPlanScope {
-            ConvCheckpoint::PromptPlan& p;
-            ~SegPlanScope() { p = {}; }
-        } seg_plan_scope{seg_plan};
         auto run = [&](int64_t q, int64_t r) -> bool {
-            if (planned) sp->force_chunk(plan.chunk, plan_single, plan.chunked);
             return sp->run(ids.data() + q, r - q, q, e);
         };
         return run(a0, b0);
@@ -5985,7 +5937,7 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
         err.clear();
         const bool win = windows_ok(at, to);
         if (win && !refill(err)) return die("refilling a lent slot failed: " + err);
-        if (!win && !lend(to - at, err, 0)) return die("lending the prompt path its slots failed: " + err);
+        if (!win && !lend(to - at, err)) return die("lending the prompt path its slots failed: " + err);
         const int64_t read_to = to;
         const auto tsp = Clock::now();
         pp_exact = false;   // a batched part is in flight: a cancel may leave the state past pp_reached
@@ -6436,16 +6388,6 @@ int EngineState::finish_request() {
         };
         const ConvStateSizes z = conv_state_sizes(g, ss);
         uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
-        if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr && ss.gdn_alloc > 0) {   // per GDN layer: which one differs first
-            const size_t per = z.gdn / (size_t) ss.gdn_alloc;
-            std::string s;
-            char b[8];
-            for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
-                std::snprintf(b, sizeof(b), "%04llx ", (unsigned long long) (hash_dev((const uint8_t*) ss.gdn_state + i * per, per, 1469598103934665603ull) & 0xffff));
-                s += b;
-            }
-            std::fprintf(stderr, "strata serve: STATE_HASH_GDN %s\n", s.c_str());
-        }
         uint64_t h_ple = hash_dev(ss.ple_hist, ss.ple_hist ? z.ple : 0, 1469598103934665603ull);
         uint64_t h_tail = 1469598103934665603ull, h_pool = h_tail, h_kv = h_tail, h_stale = h_tail;
         // pooled= keeps its 0.1.29 meaning: the completed rows [0, L / idx_block) only.  pooled_full= adds the

@@ -20,14 +20,6 @@ namespace strata::prefill {
 namespace {
 }  // namespace
 
-void gemm_set_f16_range(bool on) {
-    (void) on;
-}
-bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool reset) {
-    (void) max_abs; (void) over; (void) reset;
-    return false;
-}
-
 namespace {
 
 void ck(cublasStatus_t s, const char* what) {
@@ -50,8 +42,6 @@ bool prompt_f16() {
 
 Gemm::~Gemm() {
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
-    if (tc_w_) cudaFree(tc_w_);
-    if (tc_x_) cudaFree(tc_x_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -113,29 +103,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     return true;
 }
 
-// ---- below sm_80: BF16 GEMMs without BF16 tensor cores (PR #655, #540, #395) ----------------------------------------
-// Turing and Volta have no BF16 tensor cores: cublasGemmEx on CUDA_R_16BF inputs falls back to a SIMT fp32 kernel
-// (magma_sgemmEx), a fifth of a 4K prompt on an RTX 2080 Ti (#655) and ~10% of a V100's prompt (#540).  BF16 -> FP16
-// is exact for every value inside FP16's normal range (the 7-bit mantissa fits in 10 bits); weights and normalized
-// activations sit there.  With the FP16 path, the weight is converted once per call and the activations in row
-// slices, into the instance's own buffers, and the product runs as the FP16 GEMM (fp32 accumulate) on the tensor
-// cores.  Finite values beyond FP16's range are clamped to +-65504 (#540) instead of becoming Inf.  A beta = 1
-// product (STRATA_PREFILL_BF16X2's remainder, ~2^-9 of the original, deep in FP16's subnormal band) keeps cuBLAS.
-//   STRATA_BF16_TC=2 (a test mode) turns it on on any card.
 namespace {
-__global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ in, __half* __restrict__ out, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float f = __uint_as_float((uint32_t) in[i] << 16);
-        if (f > 65504.0f && !isinf(f)) f = 65504.0f;
-        else if (f < -65504.0f && !isinf(f)) f = -65504.0f;
-        out[i] = __float2half_rn(f);
-    }
-}
-void bf16_to_f16(const uint16_t* in, uint16_t* out, int64_t n, cudaStream_t st) {
-    if (n <= 0) return;
-    bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, reinterpret_cast<__half*>(out), n);
-}
 // The current device's compute capability as 10 * major + minor, per device (a layer split can mix cards); 0: not
 // known, read as "not an old card" so a failed query keeps the cuBLAS BF16 call.
 int current_cc() {
@@ -155,94 +123,22 @@ int current_cc() {
     }
     return v;
 }
-// 0: cuBLAS's BF16 GEMM, 1: through FP16 (tensor cores)
-int bf16_path() {
-    static const int forced = [] {
-        const char* v = std::getenv("STRATA_BF16_TC");
-        return v != nullptr && v[0] != '\0' ? std::atoi(v) : -1;
-    }();
-    const int cc = current_cc();
-    if (forced == 2 && cc > 0) return 1;   // a test mode: the FP16 path on any card (gemm_bf16_parity on sm_80+)
-    return 0;
-}
-bool grow(uint16_t*& p, int64_t& have, int64_t want) {   // `have`, `want`: 2-byte elements
-    if (have >= want) return true;
-    if (p) cudaFree(p);
-    p = nullptr;
-    have = 0;
-    if (cudaMalloc((void**) &p, (size_t) want * 2) != cudaSuccess) { cudaGetLastError(); p = nullptr; return false; }
-    have = want;
-    return true;
-}
-constexpr int64_t kXSliceElems = 16ll << 20;   // 32 MiB of FP16 activations per slice (64 MiB as fp32)
-
 }  // namespace
 void gemm_set_dense_f32(int) {}
-bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
-    (void) X; (void) ldx; (void) W; (void) Y; (void) T; (void) N; (void) K;
-    return false;
-}
 
 bool Gemm::bf16_converts_x() const {
-    return bf16_path() == 1;
-}
-__global__ void f16_to_bf16_kernel(const __half* __restrict__ in, uint16_t* __restrict__ out, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = (uint16_t) (__float_as_uint(__half2float(in[i])) >> 16);   // exact: the value was a BF16
+    current_cc();
+    return false;
 }
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-                float beta, int64_t ldx, bool x_f16) {
+                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
-    if (ldx <= K) ldx = 0;
     const float alpha = 1.0f;
-    if (const int path = K > 0 ? bf16_path() : 0; path == 1 && N > 1 && beta == 0.0f) {
-        // FP16 copies of the weight and of X, converted in tiles.  Issue #1757: the weight is converted in tiles of N
-        // rows (the whole weight when it fits) and X in slices.  A single output row stays cuBLAS's GEMV (faster than
-        // the conversions).  Every tile is a disjoint block of Y, so each gets the caller's beta.
-        int64_t w_rows = N;
-        int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
-        bool fit = false;
-        for (;;) {
-            if (grow(tc_w_, tc_w_elems_, w_rows * K) && grow(tc_x_, tc_x_elems_, x_rows * K)) { fit = true; break; }
-            if (w_rows <= 64 && x_rows <= 64) break;
-            w_rows = std::max<int64_t>(std::min<int64_t>(w_rows, 64), w_rows / 2);
-            x_rows = std::max<int64_t>(std::min<int64_t>(x_rows, 64), x_rows / 2);
-        }
-        if (fit) {
-            for (int64_t n0 = 0; n0 < N; n0 += w_rows) {
-                const int64_t nn = std::min<int64_t>(w_rows, N - n0);
-                bf16_to_f16(W + n0 * K, tc_w_, nn * K, (cudaStream_t) stream_);
-                for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
-                    const int64_t n = std::min<int64_t>(x_rows, T - t0);
-                    if (x_f16) {   // already the converted values (the same slices: the same GEMMs)
-                        f16(X + t0 * K, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
-                    } else {
-                        bf16_to_f16(X + t0 * K, tc_x_, n * K, (cudaStream_t) stream_);
-                        f16(tc_x_, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
-                    }
-                }
-            }
-            return;
-        }
-    }
-    if (x_f16) {   // not the tensor-core path after all (one output row, or no room): X back to BF16, a slice at a time
-        const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
-        if (!grow(tc_x_, tc_x_elems_, x_rows * K)) {
-            std::fprintf(stderr, "prefill gemm: no GPU memory for converting an FP16 image back to BF16\n");
-            std::exit(1);
-        }
-        for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
-            const int64_t n = std::min<int64_t>(x_rows, T - t0);
-            f16_to_bf16_kernel<<<(unsigned) ((n * K + 255) / 256), 256, 0, (cudaStream_t) stream_>>>(
-                reinterpret_cast<const __half*>(X + t0 * K), tc_x_, n * K);
-            bf16(tc_x_, W, Y + t0 * ldy, n, N, K, ldy, beta, 0, false);
-        }
-        return;
-    }
+    if (K > 0) current_cc();
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
-                    CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) (ldx ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
 }
@@ -278,12 +174,7 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                  int64_t ldy, float beta, int64_t ldx) {
-    if (ldx > 0 && ldx != K) {
-        std::fprintf(stderr, "prefill gemm: a padded X (ldx %lld, K %lld) needs STRATA_PF_PAD's path\n",
-                     (long long) ldx, (long long) K);
-        std::exit(1);
-    }
+                  int64_t ldy, float beta) {
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;

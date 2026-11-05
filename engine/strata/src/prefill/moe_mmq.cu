@@ -192,14 +192,9 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     ck(cudaGetLastError(), "quantize");
 }
 
-void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols, int64_t ld,
-                      int64_t tokens, int k_used, void* stream) {
+void quantize_scatter(const float* x, const int32_t* slot, void* xq, int t, int64_t cols, int64_t ld, int64_t tokens,
+                      int k_used, void* stream) {
     if (tokens <= 0 || k_used <= 0) return;
-    static const bool gather = [] { const char* e = std::getenv("STRATA_QUANT_GATHER"); return e != nullptr && std::atoi(e) != 0; }();
-    if (gather) {
-        quantize(x, src, xq, t, cols, ld, tokens * k_used, stream);
-        return;
-    }
     quantize_scatter_mmq_q8_1_cuda(x, slot, xq, (ggml_type) t, cols, ld, pad512(cols), tokens, tokens * k_used, k_used,
                                    (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize_scatter");
@@ -247,81 +242,6 @@ void Context::run(const Product& p, void* stream) {
             std::exit(1);
     }
     ck(cudaGetLastError(), "mul_mat_q");
-}
-
-// ---- STRATA_MMQ_DIRECT ----
-size_t overread_bytes(int t, int64_t cols) {
-    if (!supported(t)) return 0;
-    // the K tile's over-read for each (fallback=false) config on any visible GPU, the largest of them: the over-read
-    // is not monotonic in the tile length (20 blocks: 12 more with a 16-block tile, 4 with a 24-block one), so each
-    // config's own; MMQ_ITER_K's is the floor (it is the tile when no config is known)
-    const int64_t qk = ggml_blck_size((ggml_type) t), bpn = cols / qk;
-    auto over = [&](int64_t k_vram) -> int64_t {
-        const int64_t bpi = k_vram / qk;
-        return bpi > 0 ? (bpi - bpn % bpi) % bpi : 0;
-    };
-    int64_t blocks = over(MMQ_ITER_K);
-    const ggml_cuda_device_info& info = ggml_cuda_info();
-    for (int id = 0; id < info.device_count; ++id)
-        for (int J = 8; J <= 128; J += 8) {
-            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, info.devices[id].cc);
-            if (c.type != GGML_TYPE_COUNT) blocks = std::max<int64_t>(blocks, over(c.K_vram));
-        }
-    return (size_t) blocks * ggml_type_size((ggml_type) t);
-}
-
-bool whole_tiles(int t, int64_t w_rows, int n_experts) {
-    if (!supported(t) || w_rows % 128 != 0 || n_experts <= 0) return false;
-    // launch_mul_mat_q's grid: without stream-k one block per tile; with it one block per tile when the tiles fill
-    // their waves to >= 90 % (NVIDIA), else nsm blocks that split tiles along K at boundaries set by the tile count.
-    // The tile count is nty * n_experts * ntx, ntx = any positive count of J-wide column tiles (max_rows decides),
-    // and ntiles >= 9 * nsm always fills its waves to >= 90 %: the ntx below that are checked one by one.
-    const ggml_cuda_device_info& info = ggml_cuda_info();
-    for (int id = 0; id < info.device_count; ++id) {
-        const int cc = info.devices[id].cc, nsm = info.devices[id].nsm;
-        const size_t smpbo = info.devices[id].smpbo;
-        bool any = false, stream_k = false;
-        ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config((ggml_type) t, 8, false, cc);
-        for (int J = 8; J <= 128; J += 8) {
-            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, cc);
-            if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
-            if (!any) c0 = c;
-            any = true;
-            // every tile width accumulates each output over the same K tiles in the same order
-            if (c.I != c0.I || c.K_vram != c0.K_vram || c.sram_layout != c0.sram_layout) return false;
-            stream_k = stream_k || c.stream_k;
-        }
-        if (!any) return false;
-        if (!stream_k) continue;
-        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || nsm <= 0) return false;
-        const int64_t per_ntx = (w_rows / c0.I) * n_experts;
-        for (int64_t ntx = 1; per_ntx * ntx < 9 * (int64_t) nsm + per_ntx; ++ntx) {
-            const int64_t tiles = per_ntx * ntx, waves = (tiles + nsm - 1) / nsm;
-            if (100 * tiles / (nsm * waves) < 90) return false;
-        }
-    }
-    return true;
-}
-
-int direct_mode() {
-    static const int mode = [] {
-        const char* v = std::getenv("STRATA_MMQ_DIRECT");
-        const int m = v ? std::atoi(v) : 0;
-        if (m != 1 && m != 2) return 0;
-        std::fprintf(stderr, "strata: STRATA_MMQ_DIRECT=%d is ignored: this build has no pointer-table MMQ "
-                             "(CUDA with STRATA_MMQ_TAB only)\n", m);
-        return 0;
-    }();
-    return mode;
-}
-
-size_t direct_slot_guard() { return direct_mode() != 0 ? kSlotGuard : 0; }
-
-void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream) {
-    // never reached: only a direct group calls it, and direct_mode() is 0 without the pointer-table MMQ
-    (void) g; (void) guard_bytes; (void) tail_gu; (void) tail_d; (void) tail_bytes; (void) stream;
-    std::fprintf(stderr, "prefill mmq: this build has no pointer-table MMQ (STRATA_MMQ_TAB)\n");
-    std::exit(1);
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,

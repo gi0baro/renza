@@ -637,15 +637,6 @@ const DevInfo& dev_info() {
     return d;
 }
 
-// opt-in on top of STRATA_PF_FUSED=1: STRATA_PF_FUSED_KQ=1 takes UD-Q4_K_XL's formats (the output differs from the FP16
-// expert path's at rounding level; KL-gated, see aurora_s23.md)
-bool kq_on() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_PF_FUSED_KQ");
-        return v != nullptr && v[0] == '1';
-    }();
-    return on;
-}
 // STRATA_PF_F16=1 (gfx11): the formats native_f16_kernel takes
 bool f16_gu(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;

@@ -9,10 +9,9 @@
 //
 // A PinnedRing owns a few pinned slots, each with an event.  h2d() copies the bytes into the next slot (after the copy
 // that last read that slot is done), queues the DMA from the slot and records the slot's event.  So the caller may
-// overwrite or free its source the moment the call returns, as a pageable copy allowed.  With no pinned RAM (or
-// STRATA_TEST_PAGEABLE=1) the copy is made from the caller's memory and the stream is waited for, so the source is
-// free on return all the same.  A ring belongs to ONE device (the one current when it is first used) and is used by one
-// thread at a time.
+// overwrite or free its source the moment the call returns, as a pageable copy allowed.  With no pinned RAM the copy is
+// made from the caller's memory and the stream is waited for, so the source is free on return all the same.  A ring
+// belongs to ONE device (the one current when it is first used) and is used by one thread at a time.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -46,7 +45,7 @@ public:
     // `bytes` (nullptr: none could be had - use direct()), the caller fills it, then submit() queues the copy and
     // guards the slot.  An acquired slot must be submitted before the next acquire().
     void* acquire(size_t bytes) {
-        if (bytes == 0 || pageable_forced()) return nullptr;
+        if (bytes == 0) return nullptr;
         int cur = -1;
         if (cudaGetDevice(&cur) != cudaSuccess) { cudaGetLastError(); return nullptr; }
         if (dev_ < 0) dev_ = cur;
@@ -118,7 +117,7 @@ public:
     // before a read whose windows run beside it).  On the device that is current, as acquire().  False: a slot could
     // not be had (its uploads then grow it, or go up from the caller's memory, as before).
     bool reserve(size_t bytes) {
-        if (bytes == 0 || pageable_forced()) return true;
+        if (bytes == 0) return true;
         int cur = -1;
         if (cudaGetDevice(&cur) != cudaSuccess) { cudaGetLastError(); return false; }
         if (dev_ < 0) dev_ = cur;
@@ -169,10 +168,6 @@ private:
         cudaEvent_t ev = nullptr;
         bool pending = false;
     };
-    static bool pageable_forced() {
-        static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
-        return v;
-    }
     Slot slots_[kSlots];
     Slot* acquired_ = nullptr;
     int next_ = 0;

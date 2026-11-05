@@ -12,13 +12,6 @@
 
 namespace strata::prefill {
 
-/// STRATA_F16_RANGE: count what the gfx103x FP16 route converts on this device - the BF16 weights to FP16 (slot 0)
-/// and the FP16 GEMM outputs widened to FP32 (slot 1): the largest |value| and how many were beyond 65504 or not
-/// finite.  gemm_f16_range_read returns them (and resets when asked); false where the route does not exist (CUDA).
-void gemm_set_f16_range(bool on);
-bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool reset);
-
-
 class Gemm {
 public:
     Gemm() = default;
@@ -33,30 +26,20 @@ public:
                        std::string& err);
 
     /// Y[T, N] (fp32, row stride ldy) = X[T, K] (bf16, row-major) . W[N, K]^T (bf16, row-major).  `beta` = 1 adds.
-    /// Below sm_80 (no BF16 tensor cores): Volta converts both to FP16 and runs the FP16 tensor-core GEMM (Turing with
-    /// STRATA_BF16_TC=1), Pascal widens both to fp32 (cublasSgemm); see gemm.cu.
-    /// `x_f16`: X holds, instead of BF16, the FP16 values the Turing tensor-core path would convert it to
-    /// (prefill's xn16 with its f16img writers): that path skips the conversion; any other converts back.
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-              float beta = 0.0f, int64_t ldx = 0, bool x_f16 = false);
-    /// true when bf16() runs its products through FP16 tensor cores here (Turing, STRATA_BF16_TC): where X may be FP16
+              float beta = 0.0f);
+    /// false: bf16() reads X as BF16.  Its first call on a device queries the compute capability.
     bool bf16_converts_x() const;
-
-    /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
-    /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
-    /// shape (so the caller falls back to bf16(), with the same ldx).
-    bool bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K);
 
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
-    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
-    /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
+    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits
     /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
+                int64_t ldy = 0, float beta = 0.0f);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
@@ -90,12 +73,6 @@ private:
     // RDNA2 (gfx103x, HIP): the product as an SGEMM on FP32 copies (tc_w_, tc_x_); false: the native call runs (gemm.cu)
     bool rdna2_sgemm(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                      float beta, bool bf16);
-    // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16);
-    // RDNA2: FP32 copies of the weight and an activation slice (Gemm::rdna2_sgemm)
-    uint16_t* tc_w_ = nullptr;
-    int64_t tc_w_elems_ = 0;
-    uint16_t* tc_x_ = nullptr;
-    int64_t tc_x_elems_ = 0;
     bool native_mmq(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                     int64_t ldy);
     void* mmq_ctx_ = nullptr;

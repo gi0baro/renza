@@ -226,12 +226,6 @@ public:
     uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
     /// The arena bytes of slot `s` (its blob, any slack and the guard).
     uint64_t slot_room(int32_t s) const { return slot_offset(s + 1) - slot_offset(s); }
-    /// STRATA_MMQ_DIRECT: the address `blob` bytes into slot `s` when the slot has room for `need` more bytes there
-    /// (null otherwise, or for a bad slot).  Uniform slots too: their stride is the largest blob.
-    uint8_t* slot_tail(int32_t s, uint64_t blob, uint64_t need) const {
-        if (s < 0 || s >= slots_ || base_ == nullptr) return nullptr;
-        return slot_room(s) >= blob + need ? base_ + slot_offset(s) + blob : nullptr;
-    }
 
 private:
     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
