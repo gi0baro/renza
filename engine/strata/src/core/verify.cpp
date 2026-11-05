@@ -161,7 +161,6 @@ bool env_on(const char* name) {
     return e != nullptr && e[0] != 0 && e[0] != '0';
 }
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
-const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 
 // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
@@ -942,7 +941,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }();
             const bool ple_post = ple_batch_kv && ple_post_env;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
-            const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
+            const bool multi_write = !ple_post && dec_batch && n > 1;
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
             if (ple_post) {
                 float* qn = parts_ + (size_t) tb * K * N;           // n x 10240 (K * N = 25600 per row)
@@ -1670,7 +1669,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
-                if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
+                if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
                 else for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                 if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
             }

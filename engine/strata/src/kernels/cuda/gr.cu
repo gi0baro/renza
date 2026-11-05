@@ -411,20 +411,12 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
     }
 }
 
-static bool no_multi_gr() {
-    static const bool off = [] {
-        const char* v = std::getenv("STRATA_NO_MULTI_GR");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return off;
-}
-
 void gr_read_multi(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
                    const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws,
                    float* xn_multi, float* lo_multi, float* gated_multi, float* mixed, float* inject,
                    int n_tok, void* stream) {
     if (n_tok <= 0 || s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
-    if (!no_multi_gr() && native_mmvf && n_tok > 1 && xn_multi != nullptr && lo_multi != nullptr && gated_multi != nullptr) {
+    if (native_mmvf && n_tok > 1 && xn_multi != nullptr && lo_multi != nullptr && gated_multi != nullptr) {
         const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
         const int hc_dim = (int) (s.hc * s.n_embd);
         if ((hc_dim & 1) != 0 || (hc_lr & 1) != 0)
@@ -479,7 +471,7 @@ void gr_write(const float* R, const float* block_out, const float* inject, const
 void gr_write_multi(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
                     int n_tok, void* stream) {
     if (n_tok <= 0 || s.n_embd <= 0 || s.hc <= 0) return;
-    if (!no_multi_gr() && native_mmvf && n_tok > 1) {
+    if (native_mmvf && n_tok > 1) {
         native_gr_post_multi(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, n_tok, stream);
         if (stream == nullptr) {
             const cudaError_t e = cudaDeviceSynchronize();

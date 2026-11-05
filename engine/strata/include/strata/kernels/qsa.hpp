@@ -249,40 +249,10 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                         float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
                         const float* sin_tab, void* stream);
 
-/// Per-CELL indexer scores, `n_kv = pos + 1` of them, fp32.
-///
-///   pooled  (n_bid + 1, idx_dim)   block keys, the spare slot last, as `indexer_key_append` maintains them
-///   q_idx   (idx_n_head, idx_dim)  ALREADY normed and rotated by the caller
-///   bias    (n_bid + 1,) or null   optional additional per-block bias
-///
-///   score[j] = bias[cb] + sum_h Relu(dot(pooled[cb], q_idx[h])),   cb = min(j / r, n_bid)
-///   score[j] += 1e9f for incomplete-tail cells (j >= (n_kv / r) * r).
-/// The tail bias matches llama.cpp's causal decode input and applies even when bias is null.
-/// Completed blocks receive no tail bias; the step API derives this from each replay's n_kv.
-///
-/// The Relu is PER HEAD and the sum is over heads AFTERWARDS: `relu(sum_h dot_h)` is the rival reading, and it
-/// is a different number whenever any head's dot is negative.  Flipping one query head's sign can never lower
-/// the score, which is the property the test asserts.  There is NO softmax and NO 1/sqrt(d) here.
-void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,
-               int64_t n_kv, float* cell_scores, void* stream);
-
-/// The largest `qsa_selection_width(n_kv)` cells of `cell_scores`, ascending, into `ids`.
-///
-/// Ties are broken by ASCENDING INDEX.  ggml does not specify that, and `ref/qsa.py` is explicit about it so a
-/// mismatch is at least diagnosable; the host test compares against `np.lexsort((arange, -scores))`, which is
-/// the same rule, implemented independently of the kernel's threshold search.
-///
-/// `cap` is the caller's buffer size in ids and must be >= the width; the kernel writes EXACTLY `width` and
-/// refuses rather than truncating.  The `-1` padding that `docs/capture-format.md` L66-73 describes is the
-/// capture writer's job, not this kernel's: the padded width is a property of the run, not of one token.
-///
 /// `n_kv` must be <= 32768 (`kTopkMaxCells`): the selection runs in ONE block, which is what makes the
 /// ascending tie rule deterministic without a second pass over global memory.  Phase 3 replaces this with a
 /// radix select and Phase 7 raises the cap; until then a longer context is refused loudly.
 inline constexpr int64_t kTopkMaxCells = 32768;
-
-void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids,
-              void* stream);
 
 /// Softmax GQA over ONLY the gathered cells.  `q` is (n_head, head_dim) f32, already normed and rotated.
 ///
@@ -338,14 +308,6 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
 // The kernels already guard for the surplus: `qsa_index_kernel` returns for `b > n_bid`, `kv_gather_kernel`
 // returns past its device `n_ids`, and `qsa_attend_kernel` handles an empty selection itself.  So passing a
 // capacity LARGER than this token needs is correct, not merely safe.
-
-/// `max_blocks` must be at least `(max_cells / idx_block) + 2`.
-void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
-                    const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream);
-
-/// `cap` must be `qsa_selection_width(kTopkMaxCells, s)` - the largest width the kernel can ever write.
-void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step,
-                   int32_t* ids, void* stream);
 
 /// `max_ids` must be the CAPACITY of `k_scratch`/`v_scratch` in ids.
 void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,

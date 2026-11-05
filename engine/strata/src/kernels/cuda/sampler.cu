@@ -11,13 +11,12 @@
 // does that against an independently computed distribution.
 //
 // `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary.  The sampled chain has
-// three implementations that pick the same token, bit for bit:
+// two implementations that pick the same token, bit for bit:
 //   - the SPLIT top_k (default): `sampler_split_part_kernel` cuts each row into 4,096-logit blocks over the whole
 //     GPU, each keeps its own top_k, and `sampler_split_merge_kernel` merges those lists and runs the tail;
-//   - `sampler_one_block_kernel` (`STRATA_SAMPLER_ONE_BLOCK=1`, and the fallback when the split cannot run): one
-//     block per token, `top_k` block-argmax rounds, each over the logits after the previous pick;
-//   - `sampler_kernel` (`STRATA_OLD_SAMPLER=1`), the kernel of engine 0.1.20, kept as the reference.
-// The two new ones share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
+//   - `sampler_one_block_kernel` (the fallback when the split cannot run): one
+//     block per token, `top_k` block-argmax rounds, each over the logits after the previous pick.
+// The two share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -181,165 +180,6 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         // A tie between two `-inf` candidates leaves `wi == n_vocab`, and the serial version answered 0.
         if (lane == 0) out[t] = (wi < n_vocab) ? wi : 0;
     }
-}
-
-/// **THE SAMPLED PATH, ONE BLOCK PER TOKEN.**  The kernel below replaced a version that ran the whole chain
-/// in ONE THREAD per token (`<<<ceil(T/64), 64>>>`, so a 4-token window fielded four threads): `top_k` alone
-/// was `k` sequential scans of the vocabulary with an inner sweep over the already-taken list - 20 x 248,320
-/// iterations of dependent work on one SM - and a verify window measured **1.6 s in the sampler**, which made
-/// every temperature-bearing request ~30x slower than a greedy one.  The selection is `k` argmax rounds, and
-/// an argmax over the vocabulary parallelises exactly like `sampler_greedy_kernel` (block over the vocab), so
-/// the rounds run back to back inside a block-per-token launch: the per-token cost falls to
-/// `k x n_vocab / 1024` plus `k` block reductions.
-///
-/// THE SEMANTICS ARE THE SERIAL ONES, EXACTLY.  Each round's argmax resolves ties to the LOWEST index (the
-/// serial scan's strict `>` keeps the first maximum it meets), so the kept sequence - both its set and its
-/// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
-/// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
-///
-/// **KEPT AS THE REFERENCE, BEHIND `STRATA_OLD_SAMPLER=1`.**  Two costs remain in it: the `taken`
-/// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
-/// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
-/// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
-__global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
-                               const int* __restrict__ history, int history_len, const SamplerParams p,
-                               int* __restrict__ out) {
-    const int t = blockIdx.x;
-    if (t >= n_tokens) return;
-    const float* l = logits + (size_t) t * n_vocab;
-
-    // Temperature is needed by BOTH stages below, so it is computed here; the chain still APPLIES it after
-    // the truncation filters - the survivors are chosen on the raw logits and only then scaled.
-    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-
-    // The penalty window is the last `penalty_last_n` entries of this row's history (disabled at this
-    // launch: `sample_tokens` refuses a non-zero `penalty_last_n` without a history buffer).
-    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
-    int hlen = 0;
-    if (hrow) {
-        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
-        if (hlen < 0) hlen = 0;
-        hrow += history_len - hlen;          // the window is the TAIL
-    }
-
-    // the membership bitmap, as in `sampler_greedy_kernel` - see the cost note there.  The gate needs an
-    // NON-EMPTY WINDOW too: the launch sizes the bitmap only when penalties are on, so a caller that hands over
-    // a stale history buffer with `penalty_last_n == 0` must not touch it.
-    extern __shared__ unsigned int penal_bits[];
-    const int bits_words = (int) ((n_vocab + 31) / 32);
-    const bool use_bits = hrow != nullptr && hlen > 0 && bits_words > 0;
-    if (use_bits) {
-        for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
-        __syncthreads();
-        for (int i = threadIdx.x; i < hlen; i += blockDim.x)
-            if (hrow[i] >= 0 && hrow[i] < n_vocab)   // an id outside the vocabulary is never a candidate
-                atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
-        __syncthreads();
-    }
-    auto hit_count = [&](int v) -> int {
-        if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
-        return history_count(hrow, hlen, v);
-    };
-
-    // top_k in 1..64 is taken as given; 0 ("off") and anything wider mean the widest shortlist the kernel
-    // keeps, 64.  Every row writes out[t]: a verify window reads all of them.
-    const int KMAX = 64;
-    int k = (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX;
-    if (k > n_vocab) k = n_vocab;
-
-    // ---- top_k: k rounds of a block argmax over the not-yet-taken.  `sel_*` holds the kept ids and their
-    // raw logits in selection order: descending by value, ties to the lower index, which is the order the
-    // top_p cut below is defined over.
-    __shared__ int sel_ids[KMAX];
-    __shared__ float sel_logit[KMAX];
-    __shared__ float sv[32];
-    __shared__ int si[32];
-    for (int i = 0; i < k; ++i) {
-        // `n_vocab` is the "no candidate" index: it loses every comparison to a real one (same convention as
-        // the greedy kernel, whose tie rule this reduction shares).
-        float bv = __int_as_float(0xff800000);   // -inf
-        int best = n_vocab;
-        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-            bool taken = false;
-            for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
-            if (taken) continue;
-            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
-            if (s > bv) { bv = s; best = v; }
-        }
-        for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
-            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
-            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
-        }
-        const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
-        if (lane == 0) { sv[warp] = bv; si[warp] = best; }
-        __syncthreads();
-        if (warp == 0) {
-            const int nw = (int) ((blockDim.x + 31) >> 5);
-            float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
-            int wi = lane < nw ? si[lane] : n_vocab;
-            for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
-                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
-                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
-            }
-            if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
-        }
-        __syncthreads();
-    }
-
-    // ---- top_p over the top_k list (penalised logits, descending as the selection produced them), then min_p,
-    // then temperature and one Philox draw - llama.cpp's order (issue #53).  Every thread computes the same chain
-    // redundantly over `sel_*` - the arithmetic is the serial kernel's, instruction for instruction - so they
-    // agree on `pick` and thread 0 writes it.
-    int n_keep = k;
-    float mx = sel_logit[0];
-    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
-    if (p.top_p < 1.0f) {
-        double sum = 0.0;
-        for (int i = 0; i < k; ++i) sum += exp((double) sel_logit[i] - (double) mx);
-        double cum = 0.0;
-        int cut = k;
-        for (int i = 0; i < k; ++i) {
-            cum += exp((double) sel_logit[i] - (double) mx) / sum;
-            if (cum >= (double) p.top_p) { cut = i + 1; break; }
-        }
-        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
-        n_keep = cut;
-    }
-    // ---- min_p on top_p's survivors: the descending prefix whose probability is at least `min_p` of the top
-    // token's.  In logit space the threshold is `sel_logit[0] + logf(min_p)` - equivalent to `p >= min_p * p_max`
-    // without the overflow an exp of raw logits risks.  0 disables, and the head itself always survives
-    // (`expf(0) == 1 >= min_p` for min_p in 0..1), so the count never reaches zero.
-    if (p.min_p > 0.0f) {
-        const float thresh = sel_logit[0] + logf(p.min_p);
-        for (int i = 0; i < n_keep; ++i)
-            if (sel_logit[i] < thresh) { n_keep = i; break; }
-    }
-    // temperature only: the penalties were applied once, before the selection (issue #53: they were applied a
-    // second time here, after the temperature scaling - llama.cpp's chain has one penalties stage)
-    auto scaled = [&](int i) { return sel_logit[i] * inv_t; };
-    float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, scaled(i));
-    double sum = 0.0;
-    for (int i = 0; i < n_keep; ++i) sum += exp((double) scaled(i) - (double) smx);
-    int pick = sel_ids[n_keep - 1];
-    if (p.gumbel) {
-        double best = -1.0;
-        for (int i = 0; i < n_keep; ++i) {
-            const double r = exp((double) scaled(i) - (double) smx) / sum /
-                             gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) sel_ids[i]);
-            if (r > best) { best = r; pick = sel_ids[i]; }
-        }
-    } else {
-        const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
-        double cum = 0.0;
-        for (int i = 0; i < n_keep; ++i) {
-            cum += exp((double) scaled(i) - (double) smx) / sum;
-            if ((double) u < cum) { pick = sel_ids[i]; break; }
-        }
-    }
-    if (threadIdx.x == 0) out[t] = pick;
 }
 
 // ---- the same list, in the same order, without the `taken` sweep ----
@@ -1007,10 +847,6 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
     }
 }
 
-// Which sampled path runs, read once: `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
-// `STRATA_SAMPLER_ONE_BLOCK=1` the one-block kernel; by default the split top_k wherever it applies.
-enum class SampledPath { Split, OneBlock, Old };
-
 bool env_flag(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
@@ -1019,13 +855,6 @@ bool env_flag(const char* name) {
 bool gumbel_env() {
     static const bool on = env_flag("STRATA_SPEC_GUMBEL");
     return on;
-}
-
-SampledPath sampled_path() {
-    static const SampledPath path = env_flag("STRATA_OLD_SAMPLER")         ? SampledPath::Old
-                                    : env_flag("STRATA_SAMPLER_ONE_BLOCK") ? SampledPath::OneBlock
-                                                                           : SampledPath::Split;
-    return path;
 }
 
 // A stream being captured into a graph must not reach `split_scratch` (cudaMalloc): it
@@ -1137,11 +966,6 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
-    } else if (sampled_path() == SampledPath::Old) {
-        // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
-        // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out);
     } else {
         // The split top_k by default: stage 1 over (61 blocks x rows) for 248,320 logits, stage 2 one warp per
         // row.  The one-block kernel when asked for, or when the split cannot run: a wider vocabulary than the merge
@@ -1150,7 +974,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         const int k = sampled_k(p.top_k, n_vocab);
         const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
         int2* scratch = nullptr;
-        if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
+        if (n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
             !stream_capturing(stream))
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
@@ -1227,7 +1051,7 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
     const int k = sampled_k(p.top_k, n_vocab);
     const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
-    if (sampled_path() != SampledPath::Split || n_blocks > kSplitMaxBlocks || n_tokens > kSplitMaxRows ||
+    if (n_blocks > kSplitMaxBlocks || n_tokens > kSplitMaxRows ||
         stream_capturing(stream))
         return false;
     int2* scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);

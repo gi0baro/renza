@@ -36,7 +36,5 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 bool qsa_decode_attn_split(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn, int64_t n_q,
                            void* stream);
-/// Tests: the int8-KV kernel on INT8 tensor cores (1), v2 (0), or as STRATA_PROMPT_ATTN_IMMA says (-1).
-void qsa_prompt_attn_set_imma(int on);
 
 }  // namespace strata::kernels
