@@ -67,7 +67,8 @@ target_link_libraries(renza-tokenize PRIVATE renza_text)
 add_library(renza_vision_image STATIC vision/image.c)
 target_include_directories(renza_vision_image PUBLIC vision)
 target_compile_options(renza_vision_image PRIVATE ${RENZA_C_FLAGS})
-target_link_libraries(renza_vision_image PUBLIC m)
+find_package(Threads REQUIRED)
+target_link_libraries(renza_vision_image PUBLIC m Threads::Threads)
 
 find_package(CUDAToolkit REQUIRED)
 add_library(renza_vision STATIC EXCLUDE_FROM_ALL vision/encoder.c vision/encoder_cuda.cu)
@@ -86,7 +87,8 @@ add_executable(renza-vision-image-tests vision/test/image_test.c)
 target_compile_options(renza-vision-image-tests PRIVATE ${RENZA_C_FLAGS})
 target_link_libraries(renza-vision-image-tests PRIVATE renza_vision_image ${CMAKE_DL_LIBS})
 add_test(NAME renza-vision-image-tests
-    COMMAND renza-vision-image-tests "${CMAKE_CURRENT_SOURCE_DIR}/vision/test/rotated.jpg")
+    COMMAND renza-vision-image-tests "${CMAKE_CURRENT_SOURCE_DIR}/vision/test/rotated.jpg"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vision/test/prog_sos_se_oob.jpg")
 
 set(RENZA_DS4_ROOT "$ENV{HOME}/Downloads/code/ds4" CACHE PATH "Read-only ds4 tree (preprocessing oracle)")
 list(JOIN RENZA_C_FLAGS " " renza_c_flags_string)
@@ -97,7 +99,7 @@ add_test(NAME renza-vision-ds4-parity
         "-DC_COMPILER=${CMAKE_C_COMPILER}"
         "-DC_FLAGS=${renza_c_flags_string}"
         "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-        "-DIMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tests/baseline/images/shapes.png=70:10:7|${RENZA_DS4_ROOT}/tests/vision-fixtures/qwen38/orbit.png|${RENZA_DS4_ROOT}/tests/vision-fixtures/qwen38/maple.png|${CMAKE_CURRENT_SOURCE_DIR}/vision/test/rotated.jpg"
+        "-DIMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tests/baseline/images/shapes.png=70:10:7|${RENZA_DS4_ROOT}/tests/vision-fixtures/qwen38/orbit.png|${RENZA_DS4_ROOT}/tests/vision-fixtures/qwen38/maple.png|${CMAKE_CURRENT_SOURCE_DIR}/vision/test/rotated.jpg|${RENZA_DS4_ROOT}/tests/vision-fixtures/glm53/screenshot.png"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/vision/check_ds4_parity.cmake")
 set_tests_properties(renza-vision-ds4-parity PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP:")
 

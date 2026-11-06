@@ -106,6 +106,48 @@ static void check_jpeg_orientation(const char *path) {
     free(data);
 }
 
+static int check_jpeg_rejected(const char *path) {
+    renza_image image = {0};
+    char error[160] = {0};
+    if (renza_image_decode_file(&image, path, error, sizeof(error))) {
+        fprintf(stderr, "%s: malformed JPEG was accepted\n", path);
+        renza_image_free(&image);
+        return 0;
+    }
+    return 1;
+}
+
+/* 1x1 progressive grayscale JPEG with a single scan whose SOS carries the
+ * given Ss/Se. Used for scan headers that must be rejected. */
+static int check_jpeg_sos_rejected(uint8_t ss, uint8_t se) {
+    uint8_t b[128];
+    size_t n = 0;
+    static const uint8_t sof2[] = {0xFF, 0xC2, 0x00, 0x0B, 0x08, 0x00, 0x01,
+                                   0x00, 0x01, 0x01, 0x01, 0x11, 0x00};
+    b[n++] = 0xFF; b[n++] = 0xD8;
+    b[n++] = 0xFF; b[n++] = 0xDB; b[n++] = 0x00; b[n++] = 0x43; b[n++] = 0x00;
+    for (int i = 0; i < 64; i++) b[n++] = 0x01;
+    memcpy(b + n, sof2, sizeof(sof2)); n += sizeof(sof2);
+    /* DC table 0: one 1-bit code for category 0. */
+    b[n++] = 0xFF; b[n++] = 0xC4; b[n++] = 0x00; b[n++] = 0x14; b[n++] = 0x00;
+    b[n++] = 0x01;
+    for (int i = 1; i < 16; i++) b[n++] = 0x00;
+    b[n++] = 0x00;
+    b[n++] = 0xFF; b[n++] = 0xDA; b[n++] = 0x00; b[n++] = 0x08; b[n++] = 0x01;
+    b[n++] = 0x01; b[n++] = 0x00; b[n++] = ss; b[n++] = se; b[n++] = 0x00;
+    b[n++] = 0x00;
+    b[n++] = 0xFF; b[n++] = 0xD9;
+
+    renza_image image = {0};
+    char error[160] = {0};
+    if (renza_image_decode_memory(&image, b, n, error, sizeof(error))) {
+        fprintf(stderr, "SOS Ss=%u Se=%u was accepted\n", ss, se);
+        renza_image_free(&image);
+        return 0;
+    }
+    return 1;
+}
+
 static bool load_ds4(const char *lib, image_api *api) {
     void *h = dlopen(lib, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     if (!h) {
@@ -172,7 +214,7 @@ int main(int argc, char **argv) {
         image_api ds4;
         if (!load_ds4(argv[2], &ds4)) return 1;
         for (int i = 3; i < argc; i++) compare_image(&ds4, argv[i]);
-    } else if (argc == 2) {
+    } else if (argc == 3) {
         check_tokens(1024, 768, 768, 32, 24);
         check_tokens(1024, 1024, 1024, 32, 32);
         check_tokens(4000, 3000, 972, 36, 27);
@@ -180,8 +222,13 @@ int main(int argc, char **argv) {
         check_tokens(8, 8, 64, 8, 8);
         check_aspect_refused();
         check_jpeg_orientation(argv[1]);
+        /* Progressive AC scan with Se=200 (issue #1292). Unpatched Iris indexes
+         * jpeg_zigzag[] past 63 and writes outside the coefficient block. */
+        CHECK(check_jpeg_rejected(argv[2]), "malformed JPEG was accepted");
+        /* DC scans must have Se == 0. */
+        CHECK(check_jpeg_sos_rejected(0, 5), "invalid DC scan was accepted");
     } else {
-        fprintf(stderr, "usage: %s ROTATED.jpg | --ds4 LIB IMAGE[=TOKENS:GW:GH]...\n", argv[0]);
+        fprintf(stderr, "usage: %s ROTATED.jpg MALFORMED.jpg | --ds4 LIB IMAGE[=TOKENS:GW:GH]...\n", argv[0]);
         return 2;
     }
     if (failures) fprintf(stderr, "%d check(s) failed\n", failures);
