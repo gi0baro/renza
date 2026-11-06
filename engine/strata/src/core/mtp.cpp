@@ -773,6 +773,12 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
         native_mmvq(wt_k_proj, wp_k_proj, xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
         native_mmvq(wt_v_proj, wp_v_proj, xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+        // #783 PR-d (stuchapin909): the T tokens' K norm, K/V rotation and K/V append each run once over all T rows
+        // (every row is independent; the rope keeps its per-token positions). STRATA_NO_BATCH_KV_STEP=1 appends per token.
+        static const bool no_batch_kv = [] {
+            const char* v = std::getenv("STRATA_NO_BATCH_KV_STEP");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
         // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope fused (bit-identical to the pair, rope_parity
         // check 6; STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes). K rows of one token
         // are consecutive in `pos`, tokens are NH apart, so a one-token window is the fusable case.
@@ -793,9 +799,9 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
             fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
         }
         // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
-        if (st_.kv_q4)
+        if (!no_batch_kv && st_.kv_q4)
             kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
-        else if (st_.kv_int8)
+        else if (!no_batch_kv && st_.kv_int8)
             kv_append_q8_steps(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step, 4, kcur_, vcur_,
                                (int) (NKV * HD), T, s, cs, &st_.host);
         else
@@ -947,6 +953,10 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             shared_rows();
         }
         g_mp.stamp(11, cs);
+        static const bool no_multi_gr = [] {   // #783 PR-g: STRATA_NO_MULTI_GR=1 keeps the per-token GR calls
+            const char* v = std::getenv("STRATA_NO_MULTI_GR");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
         for (int t = 0; t < T; ++t) {
             if (!(T > 1 && native_moe_combine_enabled())) {
                 if (native_moe_combine_enabled())
@@ -954,12 +964,15 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
                 else
                     moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
             }
+            if (no_multi_gr)
+                gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
         }
         if (T > 1 && native_moe_combine_enabled())
             native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
         // #783 PR-g (stuchapin909): the T residual writes in one launch (each token's R, block output and injection are
         // its own, so doing them after the loop changes nothing)
-        gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
+        if (!no_multi_gr)
+            gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
         g_mp.stamp(12, cs);
         // ---- the final mixer and the main model's head
         if (head_mix_multi_on) {

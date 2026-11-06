@@ -351,7 +351,11 @@ struct Options {
     bool shared_late = false;          ///< plan v0.3 P3 A/B: shared expert inside post[l] (old order)
     bool keep_canonical = false;       ///< plan v0.3 P1 A/B: load canonical copies of natively served tensors
     bool no_token_graph = false;       ///< plan v0.3 P3 A/B: two graphs per layer instead of one per token
+    bool no_fused_gr = false;          ///< plan v0.3 P3 A/B: the six-kernel native gr_read + separate gr_write
+    bool no_fast_attn = false;         ///< plan v0.3 P3 A/B: gather + one-block-per-head QSA attention
     bool no_publish_kernel = false;    ///< plan v0.3 P3 A/B: memcpy nodes for the doorbell and QSA step
+    bool no_fused_gdn = false;         ///< plan v0.3 P3 A/B: llama.cpp-layout GDN step + separate out norm
+    bool no_fast_select = false;       ///< plan v0.3 P7 A/B: FP64 row scores + bit-serial cell top-k
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
@@ -548,6 +552,7 @@ void usage() {
                  "  --mtp-q4 all|proj|head  opt-in: the draft layer's projections and/or draft head as 4-bit copies\n"
                  "  --mtp-draft-vocab FILE  opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
+                 "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones\n"
@@ -1845,7 +1850,11 @@ int EngineState::parse_options(int argc, char** argv) {
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
         else if (a == "--no-token-graph") o.no_token_graph = true;
+        else if (a == "--no-fused-gr") o.no_fused_gr = true;
+        else if (a == "--no-fast-attn") o.no_fast_attn = true;
         else if (a == "--no-publish-kernel") o.no_publish_kernel = true;
+        else if (a == "--no-fused-gdn") o.no_fused_gdn = true;
+        else if (a == "--no-fast-select") o.no_fast_select = true;
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
             // tokens would look like a working run.
@@ -2406,8 +2415,11 @@ int EngineState::start_up(int argc, char** argv) {
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
     strata::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
     // Plan v0.3 P3: the fused hyper-connection read rides the native (FP32-activation) contract.
+    strata::core::layer_set_fast_attn(!o.no_fast_attn);
     strata::core::layer_set_publish_kernel(!o.no_publish_kernel);
-    strata::core::layer_set_fused_gr(o.gr_native_mmvf);
+    strata::core::layer_set_fused_gdn(!o.no_fused_gdn);
+    strata::core::layer_set_fast_select(!o.no_fast_select);
+    strata::core::layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr);
     strata::core::layer_set_native_bf16(o.native_bf16);
     strata::core::layer_set_native_flash_attn_short(o.native_flash_attn_short);
     strata::kernels::ple_set_native_bf16(o.native_bf16_extra);

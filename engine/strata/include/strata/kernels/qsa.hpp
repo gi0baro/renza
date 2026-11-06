@@ -309,6 +309,14 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
 // returns past its device `n_ids`, and `qsa_attend_kernel` handles an empty selection itself.  So passing a
 // capacity LARGER than this token needs is correct, not merely safe.
 
+/// `max_blocks` must be at least `(max_cells / idx_block) + 2`.
+void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
+                    const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream);
+
+/// `cap` must be `qsa_selection_width(kTopkMaxCells, s)` - the largest width the kernel can ever write.
+void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step,
+                   int32_t* ids, void* stream);
+
 /// `max_ids` must be the CAPACITY of `k_scratch`/`v_scratch` in ids.
 void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
                     const int32_t* ids, const int32_t* step, int64_t max_ids, const QsaShapes& s,

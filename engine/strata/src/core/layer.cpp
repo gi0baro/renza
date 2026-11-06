@@ -44,7 +44,7 @@
 #include <memory>
 #include <vector>
 namespace strata::core {
-namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_publish_kernel = true; }
+namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
 constexpr int Q8K_ELEMS_PER_BLOCK = 256;
 constexpr float RMS_EPS = 1e-6f;
@@ -249,7 +249,7 @@ st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_
 st_begin(layer, 10, stream);
 // Plan v0.3 P3: under the native contract, conv + SiLU + both L2 norms are one kernel, and alpha/beta with their
 // epilogues another (`fused_gdn.hpp`).
-const bool fused_pre = native_gdn_enabled() && native_bf16_projections && g.ssm_d_conv == 4 &&
+const bool fused_pre = g_fused_gdn && native_gdn_enabled() && native_bf16_projections && g.ssm_d_conv == 4 &&
                        g.ssm_state_size == 128;
 if (fused_pre) {
     fused_gdn_conv_l2(b.conv_state, b.qkv, conv_kernel, b.h, (int) C, (int) (2 * g.ssm_k_heads), RMS_EPS, stream);
@@ -308,7 +308,7 @@ st_begin(layer, 12, stream);
     st_end(layer, 12, stream); st_begin(layer, 13, stream);
     GdnShapes gs{g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads};
     // Plan v0.3 P3: with the native contract the step and the output norm are one kernel (after the z GEMV).
-    const bool fused_gdn = native_gdn_enabled() && g.ssm_state_size == 128;
+    const bool fused_gdn = g_fused_gdn && native_gdn_enabled() && g.ssm_state_size == 128;
     if (!fused_gdn) try {
         if (native_gdn_enabled()) native_gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);
         else gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);
@@ -398,7 +398,8 @@ strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
 bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                       const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err) {
     using namespace strata::kernels;
-    const bool batched = native_bf16_projections && !(native_router_enabled() && g.n_expert == 512 && k == 10);
+    const bool batched = native_bf16_projections && !(native_router_enabled() && g.n_expert == 512 && k == 10) &&
+                         !std::getenv("STRATA_ROUTE_PER_TOKEN");
     if (!batched || n == 1) {
         for (int t = 0; t < n; ++t) {
             MoEBuffers mb = b;
@@ -410,7 +411,12 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
     const LayerView v(tables, layer);
     const WeightRef* w_router = v.get("ffn_gate_inp.weight");
     if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }
-    bf16_gemv_fp32_mmvf_cols(x, (const uint16_t*) w_router->data, logits, g.n_embd, g.n_expert, n, stream);
+    if (std::getenv("STRATA_ROUTE_PROJ_PER_TOKEN"))
+        for (int t = 0; t < n; ++t)
+            bf16_gemv_fp32_mmvf(x + t * g.n_embd, (const uint16_t*) w_router->data, logits + t * g.n_expert, g.n_embd,
+                                g.n_expert, stream);
+    else
+        bf16_gemv_fp32_mmvf_cols(x, (const uint16_t*) w_router->data, logits, g.n_embd, g.n_expert, n, stream);
     router_top10(logits, n, (int) g.n_expert, (int) k, ids, weights, stream);
     return true;
 }
@@ -476,13 +482,17 @@ bool layer_verify_compatible(std::string& why) {
     // Plan v0.3 P6: the verify window reproduces exactly this configuration's per-token arithmetic.
     if (!native_bf16_projections) why = "the native BF16 projections are off";
     else if (!g_fused_gr) why = "the fused hyper-connection read is off";
-    else if (!strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
-    else if (native_flash_attn_short) why = "the split-K decode attention is off";
+    else if (!g_fused_gdn || !strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
+    else if (!g_fast_attn || native_flash_attn_short) why = "the split-K decode attention is off";
+    else if (!g_fast_select) why = "the block top-k selection is off";
     else if (!strata::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
     else return true;
     return false;
 }
 void layer_set_publish_kernel(bool enabled) { g_publish_kernel = enabled; }
+void layer_set_fused_gdn(bool enabled) { g_fused_gdn = enabled; }
+void layer_set_fast_select(bool enabled) { g_fast_select = enabled; }
+void layer_set_fast_attn(bool enabled) { g_fast_attn = enabled; }
 void layer_set_fused_gr(bool enabled) { g_fused_gr = enabled; }
 bool layer_fused_gr() { return g_fused_gr; }
 void layer_set_shared_early(bool enabled) { g_shared_early = enabled; }
@@ -1157,13 +1167,17 @@ if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim))
 // token's counts: a grid or a shared-memory size that follows the sequence length is baked into a captured
 // graph, and the kernels guard for the surplus.    const
 int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
-    // Plan v0.3 P7: block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
-    qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
-    qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
+    if (g_fast_select) {
+        // Plan v0.3 P7: block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
+        qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
+        qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
+    } else {
+    qsa_index_step(st.idx_pooled, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);
+    }
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
-    if (!native_flash_attn_short && dump == nullptr) {
+    if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
         strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
     } else {
