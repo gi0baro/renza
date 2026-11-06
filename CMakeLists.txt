@@ -169,16 +169,19 @@ set_tests_properties(renza-strata-open-test-build PROPERTIES FIXTURES_SETUP renz
 add_test(NAME renza-strata-open-test COMMAND renza-strata-open-test)
 set_tests_properties(renza-strata-open-test PROPERTIES FIXTURES_REQUIRED renza_strata_open)
 
-set(RENZA_TOKENIZER_GGUF "/data/ML/models-strata/swift-IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
+set(RENZA_TOKENIZER_GGUF "/data/ML/models-renza/swift-IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
     CACHE FILEPATH "GGUF used by the tokenizer oracle check")
-set(RENZA_STRATA_ROOT "$ENV{HOME}/ML/Strata" CACHE PATH "Read-only Strata oracle tree")
-set(RENZA_STRATA_TOKENIZER "$ENV{HOME}/ML/Strata-data/packs/swift-iq3_s/tokenizer"
+set(RENZA_STRATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/upstream/strata-0.1.45" CACHE PATH "Read-only Strata oracle tree")
+set(RENZA_STRATA_TOKENIZER "${CMAKE_CURRENT_SOURCE_DIR}/data/qwen/pack/tokenizer"
     CACHE PATH "Strata tokenizer tables")
+set(RENZA_STRATA_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/tests/.venv/bin/python"
+    CACHE FILEPATH "Python interpreter for the Strata oracle")
 add_test(NAME renza-tokenizer-check
     COMMAND ${CMAKE_COMMAND}
         "-DTOKENIZER_BINARY=$<TARGET_FILE:renza-tokenize>"
         "-DGGUF=${RENZA_TOKENIZER_GGUF}"
         "-DSTRATA_ROOT=${RENZA_STRATA_ROOT}"
+        "-DSTRATA_PYTHON=${RENZA_STRATA_PYTHON}"
         "-DTOKENIZER_DIR=${RENZA_STRATA_TOKENIZER}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/text/check_tokenizer.cmake")
 set_tests_properties(renza-tokenizer-check PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP:")

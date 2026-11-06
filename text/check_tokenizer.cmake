@@ -1,4 +1,4 @@
-set(python "${STRATA_ROOT}/.venv/bin/python")
+set(python "${STRATA_PYTHON}")
 foreach(required IN ITEMS "${python}" "${GGUF}" "${STRATA_ROOT}/tools/strata_tokenizer.py"
                           "${TOKENIZER_DIR}/vocab.json")
     if(NOT EXISTS "${required}")

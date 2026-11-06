@@ -181,12 +181,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     parser.add_argument("gguf", type=Path)
-    parser.add_argument("--strata", type=Path, default=Path.home() / "ML/Strata")
+    parser.add_argument("--strata", type=Path, default=ROOT / "upstream/strata-0.1.45")
     parser.add_argument("--inputs", type=Path, default=ROOT / "tests/baseline/results/inputs")
     parser.add_argument("--llama-vocab", type=Path, default=LLAMA_VOCAB)
     args = parser.parse_args()
     tokenizer_dir = Path(os.environ.get("STRATA_TOKENIZER", str(
-        Path.home() / "ML/Strata-data/packs/swift-iq3_s/tokenizer")))
+        ROOT / "data/qwen/pack/tokenizer")))
     required = [args.gguf, args.strata / "tools/strata_tokenizer.py", tokenizer_dir / "vocab.json",
                 tokenizer_dir / "merges.txt", tokenizer_dir / "token_type.json"]
     missing = [str(path) for path in required if not path.is_file()]

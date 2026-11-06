@@ -3,18 +3,12 @@ set -euo pipefail
 
 third_party=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root="$third_party/llama.cpp"
-reference_llama=/home/giovanni/ML/Strata/third_party/llama.cpp
 llama_commit=3cf03257f219afbe7334045ff7c6a06ac68c627d
 
 # A partial or unverified checkout must not be left buildable.
 trap 'rm -rf -- "$root"' ERR
 rm -rf -- "$root"
-if [[ -d "$reference_llama" ]]; then
-    # setup.py's source stamp seeds with the commit but does not hash llama.cpp.
-    cp -a -- "$reference_llama" "$root"
-    diff -rq -- "$reference_llama" "$root"
-else
-    python3 - "$third_party" "$llama_commit" <<'PY'
+python3 - "$third_party" "$llama_commit" <<'PY'
 from pathlib import Path
 import shutil
 import sys
@@ -39,5 +33,4 @@ with tempfile.TemporaryDirectory(dir=third_party) as directory:
         sys.exit("unexpected llama.cpp archive layout")
     shutil.move(str(extracted[0]), third_party / "llama.cpp")
 PY
-fi
 printf 'llama.cpp %s: %s\n' "$llama_commit" "$root"
