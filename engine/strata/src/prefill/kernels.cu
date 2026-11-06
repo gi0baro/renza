@@ -35,7 +35,7 @@ __device__ __forceinline__ uint16_t bf(float f) {
     u += 0x7fffu + ((u >> 16) & 1u);
     return (uint16_t) (u >> 16);
 }
-// The BF16 GEMMs' second operand (STRATA_PREFILL_BF16X2): what the BF16 image `hi` left out of f, itself in BF16.
+// The BF16 GEMMs' second operand: what the BF16 image `hi` left out of f, itself in BF16.
 // W.hi + W.lo carries ~16 mantissa bits of the activation - the decode path's FP32 x to within ~1e-5.
 __device__ __forceinline__ uint16_t bf_lo(float f, uint16_t hi) { return bf(f - __uint_as_float((uint32_t) hi << 16)); }
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
@@ -47,7 +47,7 @@ __device__ __forceinline__ uint16_t hf_sat(float f) {
     return hf(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f));
 }
 
-// Turing's FP16 image of the hyper-connection's xn16 (gemm.cu's bf16_to_f16_kernel applied to a BF16 value): the
+// The FP16 image of the hyper-connection's xn16: the
 // writers store what the BF16 tensor-core path would convert, so the GEMM reads it without a conversion pass
 __device__ __forceinline__ uint16_t bf_to_hf_conv(uint16_t b) {
     float f = __uint_as_float((uint32_t) b << 16);
@@ -55,8 +55,7 @@ __device__ __forceinline__ uint16_t bf_to_hf_conv(uint16_t b) {
     else if (f < -65504.0f && !isinf(f)) f = -65504.0f;
     return __half_as_ushort(__float2half_rn(f));
 }
-// The prompt path's 16-bit activation image for the BF16-weight GEMMs: BF16, or FP16 where the GEMM library is fast
-// only in FP16 (prompt_f16() in gemm.cu: rocBLAS on gfx103x).  Set once per device before the first prompt.
+// The prompt path's 16-bit activation image for the BF16-weight GEMMs: BF16.
 __device__ __forceinline__ uint16_t act16(float f) { return bf(f); }
 // block-wide sum for blockDim.x <= 1024, result broadcast
 __device__ float block_sum(float v, float* sh) {
@@ -537,8 +536,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
 // 64 SMs up this kernel has one block per SM, below that two on some SMs, while the kernel before has ceil(192 / SMs).
 // With the engine's grids on fewer SMs (gdn_rec_parity --bench), on a 4080 SUPER / a 3090: 1.40-1.42x / 1.28-1.29x at
 // 64 SMs and more, 1.02-1.04x / 1.03-1.06x at 48 to 63 (two blocks against four: a draw, slower on neither),
-// 1.28-1.31x / 1.28-1.30x at 39 to 47, 1.53-1.57x / 1.54-1.55x at 32 to 38.  Per call, from the current device (a
-// layer split can mix cards).
+// 1.28-1.31x / 1.28-1.30x at 39 to 47, 1.53-1.57x / 1.54-1.55x at 32 to 38.  Per call, from the current device.
 bool gdn_keyhead_ok() {
     static const bool off = [] { const char* v = std::getenv("STRATA_GDN_KEYHEAD"); return v != nullptr && std::atoi(v) == 0; }();
     if (off) return false;
@@ -878,7 +876,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
-    (void) variant;   // the quad recurrence kernels are AMD-only
+    (void) variant;
     if (T <= 0 || variant == 2) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
     } else {

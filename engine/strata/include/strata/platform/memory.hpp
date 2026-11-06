@@ -2,8 +2,7 @@
 //
 // `cudaHostRegister` refuses the 31.6 GiB expert arena on Windows, and an unlocked arena is trimmed under memory
 // pressure (the CPU pool then swung 2x between runs). With the n-gram table out of RAM there is headroom to lock
-// it instead: raise the process's minimum working set by the region's size, then VirtualLock it (Windows needs
-// only SeIncreaseWorkingSetPrivilege, which ordinary accounts hold). Linux: mlock.
+// it instead: mlock on Linux.
 #pragma once
 
 #include <cstdint>
@@ -22,18 +21,13 @@ struct LockResult {
 /// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden.
 LockResult lock_resident(void* p, uint64_t bytes);
 
-/// Pin-by-need: lock several disjoint regions (the holes between the registered ranges of an arena).  The Windows
-/// working-set minimum is raised ONCE for the total (lock_resident per region would add its margin every time);
-/// stops at the first refusal and reports the bytes locked so far.  Undo each region with unlock_resident.
+/// Lock several disjoint regions (the holes between the registered ranges of an arena).
+/// Stops at the first refusal and reports the bytes locked so far.  Undo each region with unlock_resident.
 LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& regions);
 
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
 
-/// #243, Windows: the GPU's shared (non-local) memory budget and this process's use of it, from DXGI
-/// (IDXGIAdapter3::QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) for the adapter whose LUID is the
-/// 8 bytes at `luid` (cudaDeviceProp::luid).  Page-locked host memory the GPU maps is charged there.  False (and
-/// `why` says so) when the query is not possible - always elsewhere than Windows.
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
 
 /// The machine's physical RAM in bytes (0 when unknown).
@@ -60,7 +54,7 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
     return room >= need;
 }
 
-/// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with STRATA_READ_AHEAD=0.
+/// Whether `advise_willneed` asks the OS for anything: not with STRATA_READ_AHEAD=0.
 bool read_ahead_enabled();
 /// Asks the OS to start reading [p, p + bytes) of a file mapping, without waiting.  Linux reads at most one
 /// readahead window per request, so the range is asked for in 128 KiB steps.

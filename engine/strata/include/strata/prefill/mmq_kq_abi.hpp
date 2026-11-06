@@ -1,6 +1,3 @@
-// include/strata/prefill/mmq_kq_abi.hpp - the interface between the engine (src/prefill/moe_mmq.cu) and strata_kq, the
-// shared library with the K-quant MMQ prompt kernels.  Bump the version when a function's
-// meaning changes; the argument block (ggml's mmq_args) is checked by its size.
 #pragma once
 
 #define STRATA_KQ_ABI_VERSION 1

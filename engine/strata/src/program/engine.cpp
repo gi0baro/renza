@@ -305,7 +305,7 @@ struct Options {
     /// via `expert_hit_run`, and switching the cache on **does** move work off the CPU pool: the drain fell
     /// **19.076 -> 10.312 ms/token** at 4096 per-layer slots, for **-2.7 ms/token** end to end.  What was
     /// true is that the ADMISSION POLICY gave every slot to the first position, which is why the earlier
-    /// measurement found nothing - see `expert_cache_per_layer`.
+    /// measurement found nothing.
     int expert_cache = 0;
     bool expert_cache_cpu_order = false;
     /// The PLE gather's prefetch, as an A/B arm.  The gather measured 2.10-2.61 ms/token because its sixteen
@@ -359,7 +359,7 @@ struct Options {
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
-    bool pcie_frac_auto = false;     ///< single-GPU serve (CUDA + HIP/gfx1100), no --pcie-frac: the share is refined in the first decode windows (PcieAuto)
+    bool pcie_frac_auto = false;     ///< single-GPU serve (CUDA), no --pcie-frac: the share is refined in the first decode windows (PcieAuto)
     double pcie_probe_gbps = 0.0;    ///< the start-up probe's reading (for PcieAuto)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
@@ -437,8 +437,8 @@ void usage() {
                  "                       shard that holds per_layer_token_embd.weight when not given\n"
                  "  --ple-io direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
                  "                       reads, the table never enters RAM or the file cache; mmap: A/B arm;\n"
-                 "                       ram: the whole table locked in RAM at start (VirtualLock on Windows,\n"
-                 "                       mlock elsewhere), so no SSD read sits on the prompt or token path\n"
+                 "                       ram: the whole table locked in RAM at start (mlock),\n"
+                 "                       so no SSD read sits on the prompt or token path\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
@@ -774,14 +774,11 @@ public:
     bool idle() const { return done_.load(std::memory_order_acquire); }
     void wait() const { while (!idle()) std::this_thread::yield(); }
 private:
-    // The second logical processor of the last physical core that has two: an SMT sibling no pool worker or host loop
-    // is pinned to (the pool takes the first of every core but the first, the host the first core), or -1.
     static int smt_spare_cpu() {
         return -1;
     }
     void loop() {
-        // the job's memcpys stay off the host's core and the pool's: by default the spare SMT sibling of the last
-        // two-thread core (Windows); STRATA_ADAPT_JOB_CPU=<logical cpu>, or -1 for no pinning.  Without either, --aux-cpus
+        // STRATA_ADAPT_JOB_CPU=<logical cpu>, or -1 for no pinning.  Without it, --aux-cpus
         // (off by default) puts the thread on the spare CPUs; an explicit STRATA_ADAPT_JOB_CPU is the user's word over it.
         const char* c = std::getenv("STRATA_ADAPT_JOB_CPU");
         const int cpu = c != nullptr ? std::atoi(c) : smt_spare_cpu();
@@ -1139,16 +1136,10 @@ std::string string_printf(const char* fmt, ...) {
 constexpr int kPenaltyWindowCap = 4096;
 constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
 constexpr size_t kResPatchCap = 16384;   // the residency entries res_sync patches in one kernel
-// ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]),
-// which is the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage
-// borrowing the tail of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the
-// chunk, is laid out by `Prefill::relayout`, and is refilled before any window reads - so outside the
-// prompt the whole cache is expert cache.  THIS IS THE POINT OF THE STRUCT: the loan used to exist only
-// for CUDA0, and `no_prefill_borrow` made every stage instead withhold a chunk-sized reserve from its
-// cache for the entire session, which is what cost the 4-way its context (see the note at the top of the
-// layer-split block).  A stage may only lend the rows for ITS OWN layers: `host_res` is one table whose
-// slot values are indices into whichever cache owns the layer, so a loan that marked rows by slot number
-// alone would hand CUDA0 a slot belonging to another stage's cache.
+// ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (the whole model) borrowing the
+// tail of CUDA0's cache.  A loan is sized by the exact `Prefill::bytes_needed` for the chunk, is laid out by
+// `Prefill::relayout`, and is refilled before any window reads - so outside the prompt the whole cache is expert
+// cache.
 struct PfPart {
     strata::core::ExpertCache* cache = nullptr;
     const strata::core::SessionState* ses = nullptr;
@@ -1957,9 +1948,7 @@ int EngineState::start_up(int argc, char** argv) {
     // next.  Refused here, by name, rather than an illegal instruction in the first expert.
     if (!strata::kernels::cpu::cpu_avx2_ok()) {
         return fail(2, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
-                       "CPU expert kernels need; Strata runs on Intel Haswell (2013), AMD Zen (2017) or newer. "
-                       "Older CPUs are EXPERIMENTAL and slow: setup compiles an engine for them on this PC "
-                       "(STRATA_ISA_FLOOR, see \"Older CPUs\" in docs/INSTALL.md)\n",
+                       "CPU expert kernels need; Strata runs on Intel Haswell (2013), AMD Zen (2017) or newer.\n",
                     strata::kernels::cpu::cpu_name().c_str());
     }
 
@@ -1987,8 +1976,6 @@ int EngineState::start_up(int argc, char** argv) {
                             f.gu_type, f.d_type);
             }
 #if defined(STRATA_PREFILL_MMQ)
-            // MODEL-UPDATE Phase 1: the K-quants' prompt kernels (STRATA_MMQ_KQ=1) are a library of their own on CUDA
-            // (strata_kq): asking for the formats opens it now, before the expert cache takes the free VRAM
             (void) strata::prefill::mmq::supported(f.gu_type);
             (void) strata::prefill::mmq::supported(f.d_type);
 #endif
@@ -2039,7 +2026,7 @@ int EngineState::start_up(int argc, char** argv) {
     };
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) {
-        // #2347: an NVFP4 / i-quant / Unsloth pack IS a native pack and runs on an AVX2 CPU (its rows have AVX2
+        // #2347: an i-quant or Unsloth pack IS a native pack and runs on an AVX2 CPU (its rows have AVX2
         // kernels).  This refusal is the canonical Q2_0 pack's, reached when the --pack folder has no
         // native_experts.txt - a hand-written config pointing --pack at the wrong folder reads as "this CPU is too
         // old".  Say so before the refusal, and where the file is when it sits one level down (a pack/ subfolder).
@@ -2048,7 +2035,7 @@ int EngineState::start_up(int argc, char** argv) {
             const std::filesystem::path pk(o.pack);
             std::fprintf(stderr, "strata generate: %s has no native_experts.txt, so it is read as the canonical Q2_0 "
                                  "pack, whose CPU kernel needs AVX-512.\n"
-                                 "        An NVFP4, i-quant or Unsloth pack has that file in the folder given as --pack "
+                                 "        An i-quant or Unsloth pack has that file in the folder given as --pack "
                                  "and runs on an AVX2 CPU as well;\n",
                          o.pack.c_str());
             if (std::filesystem::exists(pk / "pack" / "native_experts.txt", ec))
@@ -2196,7 +2183,7 @@ int EngineState::start_up(int argc, char** argv) {
     if (!o.native_head_gguf.empty()) skip.insert("output.weight");
     // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
     if (!native_pack) skip.erase("blk.1.ple_key.weight");
-    // #326: a --compat-bf16 pack (OrcaRouter IQ3_XXS) keeps its BF16 key in the arena
+    // #326: an OrcaRouter IQ3_XXS pack keeps its BF16 key in the arena
     if (native_pack && !strata::core::NativeDense::keep_unquantized_ple_key(o.pack, skip, err)) {
         return fail(1, "strata generate: %s\n", err.c_str());
     }
@@ -2489,7 +2476,7 @@ int EngineState::start_up(int argc, char** argv) {
     }
     mem_mark("the session (KV, GDN state, PLE history)");
 
-    // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
+    // Secure MTP's CUDA0 allocations before the large host arena is registered with CUDA.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference
     static const strata::core::ModelGeometry draft_geometry{};
@@ -2589,7 +2576,7 @@ int EngineState::start_up(int argc, char** argv) {
         const std::string e = strata::core::device_code_error();
         if (!e.empty()) {
             return fail(1, "strata generate: this engine has no code for %s (sm_%d%d): %s - rebuild it for this "
-                           "card (setup does: START-HERE.bat --setup)\n", name, p.major, p.minor, e.c_str());
+                           "card\n", name, p.major, p.minor, e.c_str());
         }
     }
     if (o.mmap_experts) {
@@ -3674,8 +3661,7 @@ int EngineState::start_up(int argc, char** argv) {
         }
         // #577: the unbuffered choice above was made before the RAM copy existed, from the budget asked for; now the
         // copy is built, decide again from the RAM it really holds and the expert bytes outside it (on a 96 GB PC
-        // the file cache keeps those, and every refill after a prompt read the drive instead).  Windows and Linux: the
-        // unbuffered reads exist there
+        // the file cache keeps those, and every refill after a prompt read the drive instead).
         if (o.mmap_experts && o.resident_budget > 0 && !startup_kept) {
             std::string why;
             const bool was = src.unbuffered();
@@ -4138,10 +4124,9 @@ int EngineState::serve_setup() {
         for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
         // E-9: batched through the prompt path when it can
         bool batched = false;
-        const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
-            use_mtp, false, false, strata::core::native_embed() != nullptr);
-        if (dkv.try_batched || dkv.why != nullptr) {
-            const char* why = dkv.why;
+        const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(use_mtp);
+        if (dkv.try_batched) {
+            const char* why = nullptr;
             if (dkv.try_batched) batched = sp->draft_kv(mtp, R_rows, nxt.data(), T, p0, e, &why);
         }
         if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
@@ -4181,7 +4166,7 @@ int EngineState::serve_setup() {
     drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
     const bool all_experts_resident = !host_res.empty() &&
         std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
-    // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42) and on HIP gfx1200/gfx1201 (0.1.43): a missed expert that every token of
+    // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42): a missed expert that every token of
     // a verify window routes at rank 7 or lower is neither copied nor computed (answers differ slightly from 0.1.41,
     // KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.  Nothing to do, so no default and no line, when every
     // expert is in VRAM.
@@ -4268,15 +4253,15 @@ int EngineState::serve_setup() {
             for (int64_t l = 0; l <= g.n_layers; ++l) agate.ticks[(size_t) l] = {&agate, (int32_t) l};
             agate.has.assign((size_t) g.n_layers, 0);
             if (!ver.set_adapt_gate(&agate)) aov_why = "the device-planned layers (STRATA_VERIFY_DEVICE_PLAN) are on";
-            // #2188: on Windows the default is the host function.  Under WDDM a stream's work sits in the driver's
+            // #2188: under WDDM a stream's work sits in the driver's
             // command buffer until something flushes it, and nothing does while the host only spins on the pinned
             // int: the first request stopped with "copies for layer 45 never landed".  STRATA_ADAPT_SIGNAL=copy asks
-            // for the stream-ordered copy there too (the enqueue then flushes the stream), =host everywhere.
+            // for the stream-ordered copy (the enqueue then flushes the stream), =host everywhere.
             const char* asig = std::getenv("STRATA_ADAPT_SIGNAL");
             const bool sig_copy = !(asig != nullptr && asig[0] == 'h');
             if (aov_why == nullptr && !sig_copy)
                 std::fprintf(stderr, "strata serve: adaptive overlap signal: host functions%s\n",
-                             asig == nullptr ? " (the Windows default, #2188; STRATA_ADAPT_SIGNAL=copy: a stream-ordered copy)" : "");
+                             asig == nullptr ? " (STRATA_ADAPT_SIGNAL=copy: a stream-ordered copy)" : "");
             if (aov_why == nullptr && sig_copy) {
                 // the landing of each layer's copies is told by a stream-ordered D2H copy of the layer number into pinned memory
                 // (STRATA_ADAPT_SIGNAL=host: a host function instead). No callback thread has to be scheduled while the pool's workers spin on every other CPU
@@ -4748,7 +4733,7 @@ int EngineState::serve_setup() {
                              o.spec_min_p,
                              (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                              // the prompt path: its chunk cap, the stages a prompt flows through, the chunk size from which a
-                             // chunk streams every expert, the prompt pipe setting
+                             // chunk streams every expert
                              (long long) o.prefill_chunk, sp->stage_count(),
                              (long long) strata::prefill::Prefill::stream_all_min_tokens());
     }
@@ -5853,7 +5838,7 @@ int EngineState::finish_request() {
     if (req_look > 0) {
         char off[160] = "";
         if (req_offload > 0)
-            std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
+            std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe (%.1f%% of "
                           "all %lld routed)", (long long) req_offload,
                           100.0 * (double) req_offload / (double) (req_look + req_offload),
                           (long long) (req_look + req_offload));

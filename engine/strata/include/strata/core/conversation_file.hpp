@@ -73,7 +73,7 @@ struct SessionConfig {
     std::string backend;            // "cuda" or "hip": no cross-backend restore
     std::string kv;                 // --kv
     int64_t max_context = 0, kv_resident = 0, mtp_window = 0;
-    bool kv_rot = false;            // STRATA_KV_ROT
+    bool kv_rot = false;
     SessionRope rope;
     // the control vectors as loaded: a digest of the tables the engine uploaded (every file's content x its exact
     // scale, summed), the mode, the layer range and the direction; 0 when none is loaded
@@ -92,7 +92,7 @@ struct SessionModelFile {
     bool optional = false;
 };
 // Sampled fingerprint of the model inputs: role, size, first and last MiB of each entry, in the given order (a file
-// listed under several roles is read once).  Paths are UTF-8 (wide APIs on Windows; invalid UTF-8 is refused).  An
+// listed under several roles is read once).  Paths are UTF-8.  An
 // edit in the middle of a file that keeps its size is NOT detected: model files must not change while sessions saved
 // with them are kept.  `beat` (optional) is called after each distinct file is read.
 bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint64_t& fingerprint, std::string& error,
@@ -154,11 +154,11 @@ struct SessionWriteOptions {
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
-// mode 0600 on POSIX), flushes it, renames it over `path` and, on POSIX, flushes the folder (Windows has no folder
-// flush: the rename is MoveFileExW with MOVEFILE_WRITE_THROUGH).  A failure BEFORE the rename keeps an existing file
-// at `path` and removes only this call's own temporary file.  A failure of the folder flush AFTER the rename returns
-// false with `status->published`: the new file is at `path` (the old one is gone), its directory entry may not
-// survive a power loss.  A filesystem that cannot flush a folder (EINVAL) is not a failure; `status` says so.
+// mode 0600 on POSIX), flushes it, renames it over `path` and, on POSIX, flushes the folder.  A failure BEFORE the
+// rename keeps an existing file at `path` and removes only this call's own temporary file.  A failure of the folder
+// flush AFTER the rename returns false with `status->published`: the new file is at `path` (the old one is gone),
+// its directory entry may not survive a power loss.  A filesystem that cannot flush a folder (EINVAL) is not a
+// failure; `status` says so.
 bool session_file_write(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
                         size_t& bytes, std::string& error, const SessionWriteOptions& options = {},
                         SessionStatus* status = nullptr);

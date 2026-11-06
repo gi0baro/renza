@@ -115,7 +115,7 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
     }
 }
 }
-// one table per device (a layer split runs the rope kernels on several): set and read for the current device
+// one table per device: set and read for the current device
 namespace {
 constexpr int kMropeDevices = 64;
 std::atomic<const int32_t*> mrope_tab[kMropeDevices] = {};

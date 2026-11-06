@@ -216,7 +216,7 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared) {
-    cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
+    cudaGetDevice(&device_);
     g_ = &g;
     ss_ = &ss;
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
@@ -544,10 +544,7 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
             opts += b;
         }
     if (!opts.empty())
-        std::fprintf(stderr, "strata mtp: hint: a smaller draft vocabulary needs less VRAM: %s. Start once with it - "
-                             "START-HERE.bat --draft-vocab en (Windows) or ./setup.sh --draft-vocab en - and the model "
-                             "keeps it (\"draft_vocab\" in its strata-*.json config); or a smaller --context in "
-                             "setup.\n",
+        std::fprintf(stderr, "strata mtp: hint: a smaller draft vocabulary needs less VRAM: %s.\n",
                      opts.c_str());
     else
         std::fprintf(stderr, "strata mtp: hint: this is already the smallest shipped draft vocabulary: a smaller "
@@ -599,8 +596,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             const int head_dev = head->device();
             if (head_dev >= 0 && head_dev != device_) {
-                // the main head is on another card (the drafter on the first stage of a layer split, 0.1.44): the rows are
-                // gathered where the head is and the subset copied over once
+                // the main head is on another card: the rows are gathered where the head is and the subset copied
+                // over once
                 void* tmp = nullptr;
                 int32_t* dv = nullptr;
                 bool ok_x = true;
@@ -780,7 +777,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
         // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope fused (bit-identical to the pair, rope_parity
-        // check 6; STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes). K rows of one token
+        // check 6; STRATA_NO_NORM_ROPE=1 keeps the two). K rows of one token
         // are consecutive in `pos`, tokens are NH apart, so a one-token window is the fusable case.
         const bool fuse_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
         if (T == 1 && fuse_nr) {
@@ -794,7 +791,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
                 else rope_neox_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, st_.cos_tab, st_.sin_tab, pos + t * NH, cs);
             }
         }
-        if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
+        if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0
             fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
             fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
         }
@@ -903,7 +900,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             return v == nullptr || std::atoi(v) != 0;
         }();
         // the shared expert only reads mixed_ / xq_ and writes shared_: a branch beside the router and the routed
-        // experts, joined before the combine (CUDA; HIP keeps one stream: STRATA_MTP_SHARED_BRANCH=0 does too)
+        // experts, joined before the combine (STRATA_MTP_SHARED_BRANCH=0 keeps one stream)
         static const bool branch_on = [] {
             const char* v = std::getenv("STRATA_MTP_SHARED_BRANCH");
             return v == nullptr || std::atoi(v) != 0;
@@ -976,7 +973,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         g_mp.stamp(12, cs);
         // ---- the final mixer and the main model's head
         if (head_mix_multi_on) {
-            // the window's rows in one read (CUDA; HIP keeps gr_read per row): bitwise the same sums
+            // the window's rows in one read: bitwise the same sums
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;

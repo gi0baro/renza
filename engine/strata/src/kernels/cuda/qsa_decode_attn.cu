@@ -84,7 +84,7 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
 }
 
 // Exact-intent score reduce-scatter: the same butterfly pairs as twelve warp_sum calls,
-// with 16 shuffle exchanges instead of 60. Used only by the opt-in gfx906 INT8
+// with 16 shuffle exchanges instead of 60. Used only by the INT8
 // query-swizzled specialization; softmax, value accumulation and merge are unchanged.
 __device__ __forceinline__ float reduce12_gfx906(const float (&part)[16], int lane) {
     float r8[8];
@@ -113,9 +113,7 @@ __device__ __forceinline__ int reduce12_head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
 }
 
-// The chunk kernel's body; `p` is the query's KV pools (the call's one set, or blockIdx.z's slot's set).
-// (the body is a device function so the batch window's rows kernel below can run it over each query's own pools without
-// the default kernel's signature, or the function-pointer types the pre-sm_75 / HIP selections build, changing)
+// The chunk kernel's body; `p` is the query's KV pools.
 template <int KV_MODE, bool QUERY_SWIZZLE, bool REDUCE12>
 __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, QsaAttnPools p,
                                                 const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
@@ -143,7 +141,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
         if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
         return;
     }
-    // Opt-in gfx906 batched attention: a bijective XOR of query dimensions in LDS only. It swaps the two
+    // A bijective XOR of query dimensions in LDS only. It swaps the two
     // float4 halves of lanes whose bit 2 is set, retaining 16-byte alignment and the 12 KB tile.
     // The scoring reads undo this permutation; FP operands and operation order are unchanged.
     for (int i = t; i < G * HD; i += THREADS) {

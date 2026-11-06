@@ -61,7 +61,7 @@ public:
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
-    /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
+    /// The draft layer's K/V state (read-only)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
@@ -79,12 +79,11 @@ public:
     /// for the drafter's stream (the caller orders on it: `stream()`).
     bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
                  bool sync = true);
-    /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
+    /// capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
-    /// A prompt read beside running batch windows (STRATA_PIPED_CONCURRENT): the prompt pass's graphs captured and its
-    /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
-    /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
+    /// The prompt pass's graphs captured and its input records sized for chunks of up to n rows now, with nothing in
+    /// flight.
     bool reserve_prefill(int64_t n, std::string& err);
     cudaStream_t stream() const { return cs_; }
 
@@ -166,7 +165,7 @@ private:
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
     int max_t_ = 0;
-    int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
+    int device_ = -1;   ///< the device `load` ran on: the public calls switch to it
     int max_drafts_ = 1 << 30;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
@@ -224,8 +223,7 @@ private:
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;
     float *mixed_ = nullptr, *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *bo_ = nullptr;
     float* xn_ = nullptr;
-    /// gr_read's scratch of the drafter's own (not the session's ss.block.gr: the last stage's verifier uses that one,
-    /// and with --pipeline-windows a chain and that stage's window can run on the card at once)
+    /// gr_read's scratch of the drafter's own (not the session's ss.block.gr).
     strata::kernels::GrWorkspace own_gr_;
     uint8_t* xq_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;

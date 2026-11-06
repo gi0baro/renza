@@ -305,7 +305,7 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
 /// what has not been picked.  The round is then the same block argmax with the same tie rule, so the list is the
 /// same list in the same order.  An empty round leaves (-inf, id 0) as before, and every round after it is empty
 /// in both versions (nothing after -inf beats -inf).  O(k x n_vocab) per row instead of O(k^2 x n_vocab), then warp
-/// 0 runs the tail.  `STRATA_SAMPLER_ONE_BLOCK=1`, and the fallback when the split path cannot run.
+/// 0 runs the tail.  The fallback when the split path cannot run.
 __global__ void __launch_bounds__(1024)
 sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
                          int history_len, const SamplerParams p, int* __restrict__ out) {
@@ -379,7 +379,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
 }
 
-// ---- THE SPLIT top_k.  `sampler_kernel` and the one-block kernel keep a row on ONE SM of 170 (5090) and walk its
+// ---- THE SPLIT top_k.  The one-block kernel keeps a row on ONE SM of 170 (5090) and walks its
 // 248,320 logits k times.  Here a warp keeps the top_k of 1,024 logits held in registers, four warps make a block of
 // 4,096 logits that merges their lists, and a row is 61 such blocks over the whole GPU; one warp per row then
 // merges the 61 lists and runs the tail.  Exact, because the first k of a union are within the first k of each part

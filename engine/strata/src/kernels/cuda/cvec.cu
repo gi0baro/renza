@@ -13,7 +13,7 @@ constexpr int MAXK = 16;   // n_embd up to 4096, held in registers between the d
 
 Cvec g_cvec;                 // the description; its device pointers are the uploading device's
 bool g_on_host = false;
-// the tables on every device that holds them (a layer split applies the vector on several)
+// the tables on every device that holds them
 constexpr int kDevices = 64;
 struct DevTables { float* dir = nullptr; float* s = nullptr; int* on = nullptr; };
 DevTables g_dev[kDevices];
@@ -153,7 +153,7 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                 int64_t inj_ld, bool write, void* stream) {
     if (!g_cvec.loaded() || T < 1) return;
     const DevTables& t = g_dev[cur_device()];
-    if (t.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device (cvec_replicate)");
+    if (t.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device");
     const dim3 grid((unsigned) g_cvec.hc, (unsigned) T);
     cvec_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(R, t.dir, t.s, t.on, g_cvec.mode, layer,
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,

@@ -200,7 +200,7 @@ struct GrMulti {
 };
 
 
-// S26 STRATA_QFUSE=1: the q8_1 image of `mixed`, written by the up kernels below. A q8_1 block is 32 columns and an
+// the q8_1 image of `mixed`, written by the up kernels below. A q8_1 block is 32 columns and an
 // up block owns UPM_COLS = 16, so the second of the two blocks that own a 32-column group (a per-group counter,
 // incremented after the block's writes are fenced, reset by that block for the next launch) reads the 32 values back
 // and quantizes them with native_quantize_q8_1_kernel's quantizer: one warp per token, the same XOR-tree max and sum,
@@ -281,11 +281,7 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
 //
 // TILEV = xn floats per token staged at a time.  The tile only changes the staging granularity: the lane's chunk
 // order (lane + 32*q within the tile, tiles ascending) is strictly increasing for either value, so the results are
-// bitwise identical to `gr_down_kernel` for both.  2560 stages 320 chunks of 8 per tile (10 per lane); cards whose
-// opt-in below 8 * 2560 * 4 B slices the tokens - sm_75 (64 KiB) carries 6 tokens of it - run TILEV 1280 instead,
-// which fits all eight tokens in one 40 KiB launch and stages 160 chunks of 8 (5 per lane, half the registers held
-// for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
-// of four tokens instead of one on sm_75.
+// bitwise identical to `gr_down_kernel` for both.  2560 stages 320 chunks of 8 per tile (10 per lane).
 template <int TILEV, int MAX_T = kFusedGrMaxT, bool Q8 = false>
 __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
     constexpr int TQ = TILEV / 8 / 32;      // uint4 weight chunks per lane per tile
@@ -400,7 +396,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
         for (int c = 0; c < HC; ++c) s += g[k][c][col];
         m.a[k].mixed[d0 + col] = s / (float) HC;
     }
-    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);
 }
 
 // ================================ #315: split / staged - the same arithmetic, split differently ==================
@@ -418,8 +414,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 //    cp.async in half-stream tiles, two in flight, so no thread waits on a chain of loads, and they sit in shared
 //    memory as two planes (floats 0-3 and 4-7 of every 8), so a warp's reads hit no bank twice.  The next tile's
 //    weights are loaded while the current one is used.  A tile is 160 = 5 x 32 chunks of 8, so a lane still
-//    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
-//    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
+//    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
 constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
 constexpr int HQ = H_TILE / 8 / 32;
@@ -553,20 +548,6 @@ __device__ __forceinline__ void cp_async_wait0() {
 #endif
 }
 
-// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
-__device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const float4 x1) {
-    float acc = 0.0f;
-    acc = fmaf(__uint_as_float(w.x << 16), x0.x, acc);
-    acc = fmaf(__uint_as_float(w.x & 0xffff0000u), x0.y, acc);
-    acc = fmaf(__uint_as_float(w.y << 16), x0.z, acc);
-    acc = fmaf(__uint_as_float(w.y & 0xffff0000u), x0.w, acc);
-    acc = fmaf(__uint_as_float(w.z << 16), x1.x, acc);
-    acc = fmaf(__uint_as_float(w.z & 0xffff0000u), x1.y, acc);
-    acc = fmaf(__uint_as_float(w.w << 16), x1.z, acc);
-    acc = fmaf(__uint_as_float(w.w & 0xffff0000u), x1.w, acc);
-    return acc;
-}
-
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
 __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t, int k0 = 0) {
     for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
@@ -581,7 +562,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = EXACT_T ? MAX_T : m.T;
-    // sm_75: a launch of EXACT_T groups of MAX_T tokens, one per blockIdx.y (gridDim.y 1: the whole launch); every
+    // a launch of EXACT_T groups of MAX_T tokens, one per blockIdx.y (gridDim.y 1: the whole launch); every
     // (row, token) is summed by one warp exactly as before - only more blocks share the card (#down-tg)
     const int k0 = EXACT_T ? (int) blockIdx.y * MAX_T : 0;
     const bool inject_block = blockIdx.x == DOWN_BLOCKS;
@@ -653,7 +634,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
 
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
 // stages n_tok * TILEV floats (2560), staged two tiles of n_tok * H_TILE.  The shared-memory
-// opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
+// opt-in is set here once per device.
 int down_chunk(bool staged, int* tile_out) {
     static bool attr[64] = {};
     static int chunk[64] = {};   // tokens the plain down kernel may carry in one launch on this card
@@ -710,11 +691,8 @@ int down_chunk(bool staged, int* tile_out) {
 
 // The multi read as `variant` (kHcPlain, kHcSplit or kHcStaged): the norm, the down projection in launches of as
 // many tokens as fit the card, the up projection; the profile's stamps after the norm and after the down projection.
-// kHcPlain is the default read exactly as before (never main's opt-in STRATA_GR_V3 path, which fused_gr_read_multi
-// takes first).
+// kHcPlain is the default read exactly as before (never main's opt-in STRATA_GR_V3 path).
 
-// the split norm with registers (gr_norm_split_fast_kernel): gfx12 only until another arch is measured;
-// STRATA_GR_NORM_FAST=0 / 1 forces it off / on
 bool norm_fast_on() {
     return false;
 }
@@ -804,7 +782,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             std::exit(1);
         }
     }
-    // S26 STRATA_QFUSE: every token needs its q8_1 destination and token 0 the counters; otherwise none is written
+    // every token needs its q8_1 destination and token 0 the counters; otherwise none is written
     bool q8 = a[0].q8_cnt != nullptr;
     for (int t = 0; t < n_tok; ++t) q8 = q8 && a[t].q8_mixed != nullptr;
     if (!q8)
@@ -812,7 +790,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
-    // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
+    // the default read: v1, or the bitwise-equal v2 / v3 this card's check accepted
     launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

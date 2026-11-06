@@ -104,7 +104,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
 }
 
 namespace {
-// The current device's compute capability as 10 * major + minor, per device (a layer split can mix cards); 0: not
+// The current device's compute capability as 10 * major + minor, per device; 0: not
 // known, read as "not an old card" so a failed query keeps the cuBLAS BF16 call.
 int current_cc() {
     static std::atomic<int> cc[64] = {};

@@ -102,7 +102,7 @@ __global__ void swiglu_quantize_q8_0_scaled_kernel(float* __restrict__ gate_up, 
     out[2 + lane] = (uint8_t) (int8_t) v;
 }
 
-// ---- THE SAME INTEGERS FROM FEWER INSTRUCTIONS.  `STRATA_OLD_GROUPED=1` keeps the kernels above.
+// ---- THE SAME INTEGERS FROM FEWER INSTRUCTIONS.
 //
 // **INSIDE A CHUNK, WHICH CODE MEETS WHICH ACTIVATION IN A `dp4a` WORD IS FREE.**  `s = sum_e code_e * x_e` and
 // `hx = sum_e x_e` are exact integer sums (|s| <= 32 * 3 * 128), so any grouping of the 32 products into words
@@ -386,7 +386,7 @@ void check(const char* who, void* stream) {
     (void) stream;
 }
 
-// The per-hit path's two projections, previous or new kernels (one warp per row, or per pair of rows).
+// The per-hit path's two projections (one warp per pair of rows).
 void launch_hit_gu(const uint8_t* blob_base, const int32_t* slot_index, long long blob_bytes,
                    const uint8_t* x_q8_0, const float* x_scales, float* gate_up, long long cap,
                    const int32_t* d_count, const int32_t* dst_index, int tok_div, cudaStream_t cs) {

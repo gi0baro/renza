@@ -55,7 +55,7 @@ public:
 
     /// `table_offset` is the byte offset of row 0 in the file and `n_rows` the row count; both come from a
     /// validated GGUF parse (PleTable::open checks the table exactly fills the file from there).
-    /// `io_thread` (default): a worker thread submits and reaps reads, so `issue` costs the caller no ReadFile
+    /// `io_thread` (default): a worker thread submits and reaps reads, so `issue` costs the caller no I/O
     /// calls. false: the caller's thread does it (A/B arm).
     /// `row_bytes`: one row's size in the file (90 IQ4_NL, 160 FP8), at most one page.
     bool open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,

@@ -9,7 +9,7 @@
 //
 // Safety: a slot is refilled only when every window that may have read it has finished: each plan reference stamps
 // the slot with the count of finished verify windows, and a slot is reusable once `depth` more windows finished
-// (STRATA_FS_DEPTH, default 4; --pipeline-windows 2 keeps at most two windows in flight).  A copy that has not landed
+// (STRATA_FS_DEPTH, default 4).  A copy that has not landed
 // is simply not used (the CPU computes the expert as before).  Not with STRATA_VERIFY_DEVICE_PLAN (the device would
 // plan resident layers without the host).
 //

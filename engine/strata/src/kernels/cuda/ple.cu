@@ -373,7 +373,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 void ple_block_projected(const float* projected_key, const float* projected_value, const float* hidden,
                          const float* hist_rows, const PleWeights& w, PleOut& out, void* scratch, void* stream) {
     if (!projected_key || !projected_value || !hidden || !hist_rows || !out.result || !scratch) return;
-    const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
+    const int n_embd = NG_N_EMBD, hc_dim = NG_HC_DIM;
     float* d_scratch = (float*) scratch;
     float* d_key = d_scratch;
     float* d_query = d_key + hc_dim;

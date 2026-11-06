@@ -27,7 +27,7 @@ void validate(const QsaShapes& s, const char* what) {
 }
 
 // One block = one 64-value group of one KV head of K (blockIdx.z = 0) or V (1); 64 threads, one value each.
-// MULTI (S26 STRATA_LFUSE): blockIdx.z = 2 * token + (K / V); token j reads step + j * step_stride and its rows at
+// MULTI: blockIdx.z = 2 * token + (K / V); token j reads step + j * step_stride and its rows at
 // kcur / vcur + j * cur_stride - every token's code is the single launch's
 template <bool MULTI = false>
 __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q,

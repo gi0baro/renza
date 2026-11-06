@@ -113,9 +113,9 @@ public:
     }
 
     // Every slot holds at least `bytes` from here on: grown now, by a caller that must not allocate later (a pinned
-    // allocation or free takes the driver's lock and can wait for the device: STRATA_PIPED_CONCURRENT grows the rings
-    // before a read whose windows run beside it).  On the device that is current, as acquire().  False: a slot could
-    // not be had (its uploads then grow it, or go up from the caller's memory, as before).
+    // allocation or free takes the driver's lock and can wait for the device).  On the device that is current, as
+    // acquire().
+    // False: a slot could not be had (its uploads then grow it, or go up from the caller's memory, as before).
     bool reserve(size_t bytes) {
         if (bytes == 0) return true;
         int cur = -1;

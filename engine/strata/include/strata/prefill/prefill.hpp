@@ -59,8 +59,8 @@ public:
     Prefill& operator=(const Prefill&) = delete;
 
     /// Frees every buffer, stream and event `init` made (as the destructor does) and starts over empty, so `init` can
-    /// run again - with a smaller chunk when the first one did not fit.  The stage range (`set_stage`) and the
-    /// callbacks stay.  The device `init` ran on must be current.
+    /// run again - with a smaller chunk when the first one did not fit.  The callbacks stay.  The device `init` ran on
+    /// must be current.
     void reset();
 
     /// `host_res`: the static residency table (n_layers x n_expert, slot or -1) or null; `cache` its slots.
@@ -84,15 +84,14 @@ public:
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
     /// is armed (3072 when STRATA_PREFILL_CPU_SHARE is set).
     static int64_t stream_all_min_tokens();
-    /// The stages of the prompt path from this one on (1 without a layer split).
     int stage_count() const;
-    /// The expert blobs this stage and the later ones copied host -> device so far (PrefillStats::experts_streamed).
+    /// The expert blobs this stage copied host -> device so far (PrefillStats::experts_streamed).
     int64_t chain_experts_streamed() const;
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
     /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
-    /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
+    /// fits it keeps 0.1.39's ring).  0 slots = none.  set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  `src`: init gets an
@@ -140,22 +139,20 @@ public:
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
 
-    /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
-    /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
-    /// earlier stage is a chunk or more ahead of the last one by the time `on_chunk` runs, so this is where a
-    /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
+    /// Called when a chunk has been read, with the position reached, while the state
+    /// is still at that chunk's end (its stream synchronized; just before `on_chunk`).
+    /// Runs with the device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
-    /// The first stage only, checked before every chunk but the first: true ends the run there as if the prompt
-    /// ended there.  `run` returns true once every stage has read the tokens before that chunk, and `stopped_at()`
-    /// says how many of the run's tokens that is (-1 when the run read them all).  A read beside the batch slots
-    /// (STRATA_PIPED_CONCURRENT) gives way to a waiting shorter request there.
+    /// Checked before every chunk but the first: true ends the run there as if the prompt ended there.
+    /// `run` returns true once the tokens before that chunk have been read, and `stopped_at()`
+    /// says how many of the run's tokens that is (-1 when the run read them all).
     std::function<bool()> stop_at_chunk;
     int64_t stopped_at() const { return stopped_at_; }
-    /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
-    /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
+    /// Grows this path's pinned upload slots to what a text chunk of `T` tokens uploads, so
+    /// a run of such chunks allocates no pinned memory (an allocation or free on the read's
     /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
     /// not be had (it then grows at first use, as before).
     bool reserve_uploads(int64_t T);
@@ -168,10 +165,9 @@ public:
     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
     /// together). The CPU reads them from RAM (the arena, the page-locked copy, or the mapped experts.bin's pages)
-    /// while the rest come over PCIe; their rows go to Dm's tail, as a peer's do. Not bit-identical to the GPU's rows
+    /// while the rest come over PCIe; their rows go to Dm's tail. Not bit-identical to the GPU's rows
     /// (the CPU's own activation format). Unset (default) or null: every expert on the GPU. Only for a pool no other
-    /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
-    /// for a chunk. Set before `init`.
+    /// thread runs meanwhile (no batch slots). Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.

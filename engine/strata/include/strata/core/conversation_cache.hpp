@@ -29,17 +29,12 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
-    // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
-    // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
-    // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
-    // chunks.  A periodic checkpoint taken inside such a segment keeps it, so a read that goes on from there reads the
-    // rest in the same chunks with the same loan.  Run-time only, like `pinned` (a layer split saves no session files).
     struct PromptPlan {
         int64_t chunk = 0, from = -1, to = -1, lend = 0;
         double pipe = 0.0;
         bool single = false, chunked = false;
     } plan;
-    // Ordinary layer-split checkpoints retain each device's running state.
+    // A layer split's later stages' running state, one part per stage (renza has no layer split: empty).
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
 
@@ -67,7 +62,7 @@ struct ConversationKvReuse {
     std::vector<ConversationKv> kv;
     // Original image extent for validation, and the earliest subsequent rewrite.
     int64_t captured_tokens = 0, unchanged_tokens = 0;
-    // With a layer split: the later stages' own retained K/V, one per stage, same extents (empty: none)
+    // A layer split's later stages' own retained K/V, one per stage, same extents (renza has no layer split: empty)
     std::vector<ConversationKvReuse> stages;
     size_t bytes() const {
         size_t n = kv.capacity() * sizeof(ConversationKv) + stages.capacity() * sizeof(ConversationKvReuse);
@@ -77,11 +72,11 @@ struct ConversationKvReuse {
     }
 };
 
-/// Layer-split parking: each running checkpoint holds the first stage's state and, in `stage_parts`, one part per
-/// later stage; a parked conversation keeps them in one image per stage.  `split` MOVES the checkpoints apart (no
-/// running state is copied): the complete ones (a part for each of `stages` stages) into `stage0` and `parts[k]`,
-/// every part carrying the checkpoint's ids / images / LRU stamp, the others aside; `merge` puts them back in their
-/// original order.  merge(split(x)) == x.
+/// Layer-split parking (renza has no layer split; the structures are kept): each running checkpoint holds the first
+/// stage's state and, in `stage_parts`, one part per later stage; a parked conversation keeps them in one image per
+/// stage.  `split` MOVES the checkpoints apart (no running state is copied): the complete ones (a part for each of
+/// `stages` stages) into `stage0` and `parts[k]`, every part carrying the checkpoint's ids / images / LRU stamp, the
+/// others aside; `merge` puts them back in their original order.  merge(split(x)) == x.
 struct ConversationCheckpointSplit {
     std::vector<ConversationCheckpoint> stage0;
     std::vector<std::vector<ConversationCheckpoint>> parts;   ///< [stage][checkpoint]
@@ -164,7 +159,7 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
-    // with a layer split, the later stages' own images, one per stage, in stage order
+    // a layer split's later stages' own images, one per stage, in stage order (renza has no layer split: empty)
     std::vector<SavedConversation> stage_images;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
@@ -227,7 +222,7 @@ public:
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
-    // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
+    // `stage_kv`: a layer split's later stages' restored K/V (one per stage), retained with the first's (renza: none).
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
                 std::vector<std::vector<ConversationKv>>&& stage_kv = {}) {
         reuse_ = {};

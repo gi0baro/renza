@@ -151,8 +151,8 @@ struct PleIoOptions {
                                      ///< ~335 MB (BF16); 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
     /// Mmap mode only (`--ple-io ram`): lock the whole mapped table in RAM at open, so no SSD read ever sits on
-    /// the prompt or token path. Needs RAM for the full table (28.8 GB IQ4_NL, 51.2 GB FP8). mlock on POSIX,
-    /// the process working-set minimum plus VirtualLock on Windows; `locked()` reports the outcome.
+    /// the prompt or token path. Needs RAM for the full table (28.8 GB IQ4_NL, 51.2 GB FP8). mlock on POSIX;
+    /// `locked()` reports the outcome.
     bool lock = false;
     /// Direct mode with the I/O worker only: keep the SSD awake while rows are asked for - one page of the table
     /// after this long without a read (0 = off), until `keepalive_window_s` after the last request for rows
@@ -236,12 +236,8 @@ bool ple_prefetch_enabled();
 // P2.S4 asks for `madvise(MADV_RANDOM)` on the mapping, and on Linux that is exactly right: a token gathers
 // 16 rows scattered over 28.8 GB, so read-ahead is pure waste and would evict useful pages.
 //
-// THERE IS NO LINUX, SO THERE IS NO MADV_RANDOM HERE.  Windows has no equivalent of the advice - the closest
-// is `FILE_FLAG_RANDOM_ACCESS` at CreateFile time, which suppresses the cache-manager's read-ahead for the
-// whole handle, and `PrefetchVirtualMemory` for the positive case.  `GgufFile` opens with neither, so this
-// build gets the DEFAULT sequential read-ahead on a random access pattern.  Saying so is the point: a
-// comment claiming MADV_RANDOM here would be a comment about code that does not run.  On Linux the advice
-// belongs in `GgufFile::open`, which this module does not own.
+// THERE IS NO MADV_RANDOM HERE.  The advice belongs in `GgufFile::open`, which this module does not own, and
+// that does not give it, so the mapping gets the DEFAULT sequential read-ahead on a random access pattern.
 // ------------------------------------------------------------------------------------------------------
 
 }  // namespace strata::kernels

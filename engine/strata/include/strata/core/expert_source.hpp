@@ -68,7 +68,7 @@ struct CgroupMemoryStat {
 /// Returns false when the required memory.stat counters were unavailable.
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
 
-/// #633: the RAM this process can get.  `available`: MemAvailable (Windows: the available physical memory), lowered
+/// #633: the RAM this process can get.  `available`: MemAvailable, lowered
 /// to the room under the tightest cgroup limit; `cgroup_limit`: that tightest limit itself (v2 memory.max of the group
 /// and its ancestors, or v1 memory.limit_in_bytes), ~0 when there is none - what a container can never exceed.
 struct HostMemory {
@@ -536,7 +536,7 @@ struct ExpertDispatch {
     PcieModel pcie_model;          ///< Verifier::set_pcie_balance: the PCIe count from measured costs
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
-    /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
+    /// (--pcie-frac, kind 1).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
     /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
     /// and the distinct experts behind them (neither copied nor computed)
@@ -645,10 +645,9 @@ public:
     /// CS-T, `budget_bytes` > 0 (`--resident-budget-gib`): only as many of those experts as fit `budget_bytes`, taken
     /// in `rank` order (the expert profile: the hottest after the GPU cache's), are copied; the rest stay on the
     /// mapped files (the SSD tier).  No lend region then (a lent slot's expert is read from the files).
-    /// Available memory is limited by both RAM and commit capacity on Windows.
     /// #467: `budget_bytes` = `kResidentWhatFits` sizes that path from available memory minus headroom and the #403
     /// margin - the soft --resident-experts mode's second try when the whole complement does not fit;
-    /// false when not even one expert fits.  On Windows the mapped experts leave the working set before any reading.
+    /// false when not even one expert fits.
     static constexpr uint64_t kResidentWhatFits = ~0ull;
     bool pin_cache_complement(
         const ExpertCache& cache, std::string& err, bool pin = true,
@@ -688,7 +687,7 @@ public:
     uint8_t* exchange_buffer(int64_t q, int64_t layer = -1) const;
     /// Requires `has_resident(layer, in)`, `!has_resident(layer, out)` and `exchange_buffer(q)` holding out's blob.
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
-    /// --pipeline-windows: size the exchange table now, so a `stage_exchange` on the adaptive tier's thread never
+    /// size the exchange table now, so a `stage_exchange` on the adaptive tier's thread never
     /// reallocates it under a concurrent `blob` (the pool reads it while windows are in flight).
     void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
@@ -735,8 +734,7 @@ public:
     double file_ms() const { return (double) file_us_.load(std::memory_order_relaxed) / 1000.0; }
     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
-    /// #286: read the experts straight from the drive (Windows: FILE_FLAG_NO_BUFFERING, overlapped; Linux: O_DIRECT and
-    /// the kernel's asynchronous reads) instead of
+    /// #286: read the experts straight from the drive (O_DIRECT and the kernel's asynchronous reads) instead of
     /// through the mapped files - the GGUF in place, or a pack's experts.bin - when the file cache could not keep them
     /// beside `ram_bytes` (the RAM budget), cached now or not (their mapped pages would land in the working set); see
     /// experts_unbuffered.  The mapped reads' page faults are one small request each, and the pages they bring in
@@ -751,17 +749,10 @@ public:
     /// decode's choice: re-routed experts come back from it), the prompt path's batched stager reads (copy_blobs) go
     /// unbuffered instead - the same bytes, read in merged O_DIRECT requests.  False when not opened (and why).
     bool open_prompt_direct(std::string& why);
-    /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
-    /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
-    /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
-    /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
+    /// Close the mapped view once startup no longer needs it (a Windows measure: NTFS runs the unbuffered reads of a
+    /// mapped file one at a time).  Returns whether the view was closed; `why` says why not (always, on Linux).
     bool drop_mapping(std::string& why);
-    /// Windows, experts.bin, a file tier that reads through the file cache (--resident-experts): the startup reads -
-    /// the GPU cache's fill from the profile and the RAM copy (pin_cache_complement) - go unbuffered (read_direct)
-    /// with the view closed meanwhile.  Through the mapping they put the file's pages in the working set beside the
-    /// RAM copy, and on a PC short of RAM that pages other memory out.  The bytes and their places are the same.
-    /// end_startup_unbuffered maps the view again and closes the unbuffered handles and the stage buffers, as before
-    /// the startup.  STRATA_STARTUP_UNBUFFERED=0: the mapped copy (A/B).  False (and `why`) when it does not apply.
+    /// The startup reads unbuffered with the view closed (Windows only).  False (and `why`) when it does not apply.
     bool begin_startup_unbuffered(std::string& why);
     /// False when the view could not be mapped again: then the file tier stays unbuffered, `why` says so.
     bool end_startup_unbuffered(std::string& why);
@@ -779,8 +770,6 @@ public:
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     void note_async_read(const uint8_t* blob, void* stream) override;
-    /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
-    /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
     uint64_t release(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
@@ -794,8 +783,8 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
-    /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
-    /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
+    /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (madvise(WILLNEED)), skipping the RAM
+    /// copy's.
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
@@ -822,7 +811,7 @@ public:
     void set_io_prefetch(bool on, int threads);
     bool io_prefetch() const { return io_pf_; }
     /// blob() hands out stage buffers it recycles (the GGUF in place, an unbuffered source, the I/O read-ahead): one
-    /// thread at a time (STRATA_PIPED_CONCURRENT is off with such a source)
+    /// thread at a time
     bool stages_blobs() const { return staged(); }
     /// Counts the cached / uncached bytes of every blob read from the files (mincore, page-granular).  Free with
     /// io_prefetch; otherwise opt in with STRATA_IO_STATS=1 (the check costs a few microseconds per blob).
@@ -852,15 +841,14 @@ private:
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
-    /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
-    /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
+    /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (io_submit)
+    /// into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
     bool open_direct(std::string& why);
-    /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
-    std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    std::vector<void*> direct_;               ///< #286: per file, an O_DIRECT fd
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
@@ -1063,7 +1051,7 @@ private:
 /// layout's type and dimensions, and inside the file.  `native` is the --native shard (see set_gguf).
 bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// Fills `dst` (lay.total bytes, the experts.bin layout) from the GGUF files, one role at a time.
-/// `unbuffered`: each chunk read past the file cache (Windows); `ready`: layer l is written only once
+/// `ready`: layer l is written only once
 /// *ready > l + 1 (an arena that is still being registered).
 /// `pad` (optional): the destination is the page-aligned padded layout (pin by need), see PadMap.
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,

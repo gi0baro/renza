@@ -55,12 +55,12 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
 /// gdn_step_norm_multi's commit (n_keep set, no outputs).  Every layer's arithmetic is the per-layer call's, so the result
 /// is bitwise the loop of per-layer calls.  Returns false (nothing launched) when the per-layer commit would not take the
-/// state-only kernel (STRATA_GDN_SPLIT=1, STRATA_GDN_COMMIT_SPLIT=0, STRATA_DBG_GDN=1): the caller then keeps the loop.
+/// state-only kernel (STRATA_GDN_COMMIT_SPLIT=0): the caller then keeps the loop.
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
-/// outstanding at once (the split verify window keeps two).
+/// outstanding at once (the split verify window kept two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// wait_flag_ge, also writing the GPU's clock (ns, gpu_stamp's) as the kernel starts into *t_in and as it returns
 /// into *t_out (either may be null): the verify window's PCIe-share balance, at no extra launch.
@@ -143,11 +143,10 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
                         void* stream);
 /// #879 guard: flags[t * kNonfiniteBlocks + b] = 1 when slice b of row t (n floats a row) holds a NaN or an infinity,
 /// else 0, for n_rows rows.  Every word is written on every launch (nothing to clear between windows), so `flags` can
-/// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA and HIP.
+/// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA.
 inline constexpr int kNonfiniteBlocks = 16;
 void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
-/// True where row_top_prob_split runs as its own kernel (CUDA; AMD keeps the one-block row_top_prob, so it calls
-/// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.
+/// True where row_top_prob_split runs as its own kernel.  STRATA_MULTI_BLOCK_ARGMAX=0: off.
 bool multi_block_head_ops();
 /// True where the verify head's and the draft's greedy pick should be argmax_rows: sm_80 to sm_89 (the one-block
 /// kernel is slow there; other cards keep sample_tokens).

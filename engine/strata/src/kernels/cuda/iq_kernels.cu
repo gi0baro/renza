@@ -644,7 +644,7 @@ __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w
 // scale as a float) and `apply` (the activation loads, the dp4a chain in the same order, the same integer scale
 // step and the same float expression).  `apply(load(...))` does the dot's integer and float operations in the same
 // order on the same values, so a column of the kernels below is BITWISE equal to the same column of mmvq_kernel /
-// native_gu_kernel / native_down_kernel (iq_multi_parity checks it; STRATA_OLD_IQ_MMVQ=1 keeps the old kernels).
+// native_gu_kernel / native_down_kernel (iq_multi_parity checks it).
 template<int TY> struct Split;
 // Formats with a Split below take the decode-once kernels; the others (Q4_K, Q5_K, Q5_1, Q8_0: UD-Q4_K_XL) the
 // per-entry ones, which call Fmt<TY>::dot per column exactly as before #242 (the launchers test kSplit at compile
@@ -764,7 +764,7 @@ template<> struct Split<18> {   // IQ3_XXS
         const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
         const uint8_t* q3 = (const uint8_t*) &q3_packed;
         const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
-        const uint32_t* grid_lut;   // the same 256 words either way (expdec stages them)
+        const uint32_t* grid_lut;   // the same 256 words either way
         if constexpr (STAGE_GRID) grid_lut = s_grid;
         else grid_lut = iq3xxs_grid;
         W r;
@@ -801,7 +801,7 @@ template<> struct Split<21> {   // IQ3_S
         const int qh = bq3->qh[iqs / 2];
         const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
         const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
-        const uint32_t* grid_lut;   // the same 512 words either way (expdec stages them)
+        const uint32_t* grid_lut;   // the same 512 words either way
         if constexpr (STAGE_GRID) grid_lut = s_grid;
         else grid_lut = iq3s_grid;
         W r;
@@ -1225,8 +1225,8 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 }
 
 // native_gu_kernel with the group's entries taken GRP_NC at a time, each weight part decoded once per pass.
-// A group has at most one entry per token of the window (kVerifyMaxT = 8; setup writes --spec 4, and a split window
-// has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
+// A group has at most one entry per token of the window (kVerifyMaxT = 8; setup writes --spec 4),
+// so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
 constexpr int GRP_NC = 4;
 
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true>
@@ -1934,7 +1934,7 @@ bool g_stage_grid = [] {
 }();
 // The single-matrix mmvq (128-thread blocks, one per 4 rows) pays the 2-8 KB staging per block: on the RTX 5070 its
 // IQ2_XS / IQ2_S / IQ1_M calls were 10-20% slower staged at 3-8 columns (iq_multi_parity --bench), while the grouped
-// expert kernels gain.  So mmvq stages only with STRATA_IQ_STAGE_GRID_MMVQ=1 (bitwise the same either way).
+// expert kernels gain.
 
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 void launch_mmvq_multi_nc(dim3 grid, dim3 block, cudaStream_t s, const uint8_t* W, size_t rb, const block_q8_1* X,

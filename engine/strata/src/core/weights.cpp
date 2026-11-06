@@ -71,9 +71,6 @@ const char* file_name(int id) {
     }
 }
 
-/// UTF-16 path for CreateFile-free portability: the loader uses `std::fopen`, which on Windows takes an ANSI
-/// path.  The pack lives beside the executable in practice, but a pack under a user directory with a
-/// non-ASCII name would silently fail to open, so the caller gets the errno rather than a null pointer.
 bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
     if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
     if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }

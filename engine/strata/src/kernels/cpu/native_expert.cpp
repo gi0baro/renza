@@ -127,7 +127,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // illegal instruction, not a slow path.  The gate sat next to `avx512` above, which does test
     // cpu_avx512_ok(), and that asymmetry is what let a pre-Haswell CPU reach iq256_gu_rows.
     // Without it this falls through to ggml-cpu's vec_dot below, which is compiled for whatever
-    // baseline the build selected (AVX1 here) and covers the same types - IQ2_XXS and IQ2_S among
+    // baseline the build selected and covers the same types - IQ2_XXS and IQ2_S among
     // them.  That path loops over tokens itself, so it is correct for any `nt`, not just one.
     static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152

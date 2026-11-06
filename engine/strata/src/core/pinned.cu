@@ -17,8 +17,7 @@
 #include <mutex>
 #include <thread>
 
-// Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
-// spelling is not the same on the two platforms the engine builds for.
+// Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB).
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
 
 #include <fcntl.h>
@@ -63,8 +62,7 @@ uint64_t free_huge_bytes() {
 
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
-    // STRATA_NO_LARGEPAGES=1 is the same-run A/B switch the Windows branch documents; honor it
-    // here too, so the large-page path can be compared without changing the pool or rebooting.
+    // STRATA_NO_LARGEPAGES=1: the large-page path can be compared without changing the pool or rebooting.
     if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
         note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
     } else {
@@ -169,7 +167,7 @@ bool clear_error() { (void) cudaGetLastError(); return true; }
 int arena_pin_cap_gib() {
     const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
     if (e == nullptr || *e == '\0') return -1;
-    if (std::string(e) == "auto") return -2;   // #243: the Windows shared-memory budget sets the sliced pin's cap
+    if (std::string(e) == "auto") return -2;
     const int v = std::atoi(e);
     return v < 0 ? -1 : v;
 }
@@ -206,7 +204,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
         const int env_gib = arena_pin_cap_gib();
         uint64_t cap = max_pinned_bytes;
-        std::string cap_why = "by the engine (multi-GPU under WDDM, or remote experts)";
+        std::string cap_why = "by the engine";
         if (cap == 0 && env_gib > 0) {
             cap = (uint64_t) env_gib << 30;
             cap_why = "by STRATA_ARENA_PIN_GIB";
@@ -269,9 +267,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // It is the same trap `gr.cu` warns about for ASYNC faults, in the other direction: a synchronous
             // failure is sticky too, and it lies about where it happened just as convincingly.
             (void) cudaGetLastError();
-            // Plan v0.3 P0.1: keep it RESIDENT instead. Unpinned, Windows trims the arena under memory pressure
-            // and the CPU pool's rate then depends on the OS; locking it through the working set needs no
-            // special privilege. STRATA_ARENA_LOCK=0 is the A/B arm.
+            // Plan v0.3 P0.1: keep it RESIDENT instead. STRATA_ARENA_LOCK=0 is the A/B arm.
             const char* env = std::getenv("STRATA_ARENA_LOCK");
             if (backing == PageBacking::LargePages) {       // #779: large pages cannot be paged out: nothing to lock
                 note = "large pages are resident without a lock; " + note;

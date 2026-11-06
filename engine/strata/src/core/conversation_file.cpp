@@ -66,8 +66,7 @@ uint64_t load64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v;
 
 // ---- file I/O in aligned 16 MiB blocks.  Linux: O_DIRECT when the filesystem takes it (no page cache, so a
 // 1.2 GB session neither evicts other files nor is charged to the engine's memory cgroup), buffered I/O otherwise
-// (tmpfs, a filesystem that refuses an aligned direct transfer, or STRATA_SESSION_BUFFERED=1).  Windows and other
-// systems: ordinary buffered I/O, same blocks.
+// (tmpfs, a filesystem that refuses an aligned direct transfer, or STRATA_SESSION_BUFFERED=1).
 constexpr size_t kAlign = 4096, kBlock = 16u << 20;
 struct AlignedFree { void operator()(uint8_t* p) const { std::free(p); } };
 using Aligned = std::unique_ptr<uint8_t, AlignedFree>;

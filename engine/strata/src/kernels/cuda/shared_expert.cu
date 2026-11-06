@@ -70,11 +70,6 @@ __global__ void native_swiglu_kernel(const float* gate, const float* up, float* 
 }
 
 
-__global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = f16_from_f32(in[i]);
-}
-
 // The per-token scalar gate: sigmoid(dot(x, w)) with w = `ffn_gate_inp_shexp` (n_embd,).
 //
 // **ONE THREAD WAS THE LARGEST SINGLE KERNEL IN THE MODEL, AND THE COMMENT DEFENDING IT SAID WHY IT SHOULD
@@ -88,10 +83,10 @@ __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict
 // whose memory floor is 0.009 ms.  It is seven kernels, and six of them are GEMVs or elementwise passes over
 // 640-2560 elements.  This is the one that cannot be explained by bandwidth.
 //
-// THE DOUBLE ACCUMULATOR IS KEPT.  `ref/gr.py` reduces in float64 and `block_sum` in `gr.cu` exists for the
-// same reason - the summation order of a tree is not the reference's, so the defence is enough precision that
-// the order stops mattering.  What changes is the CHAIN: ten terms per thread instead of 2560, then a
-// tree-reduce.  Through a sigmoid, a 1e-16 relative difference in the dot is not a difference.
+// THE DOUBLE ACCUMULATOR IS KEPT.  `ref/gr.py` reduces in float64 - the summation order of a tree is not the
+// reference's, so the defence is enough precision that the order stops mattering.  What changes is the CHAIN: ten
+// terms per thread instead of 2560, then a tree-reduce.  Through a sigmoid, a 1e-16 relative difference in the dot
+// is not a difference.
 //
 // **BOTH OPERANDS ARE BF16, AND THAT IS THE REFERENCE'S CONTRACT, NOT A STORAGE DETAIL.**  `gate_inp_shexp` is a
 // BF16 weight, so ggml converts the activation to its `vec_dot_type` - BF16 - exactly as it does for the router
@@ -136,9 +131,6 @@ __global__ void native_scalar_sigmoid_kernel(float* gate) {
     // Match the single-token CUDA sigmoid's FP32 fast-math operations without changing legacy kernels'
     // compilation flags. The dot product was already reduced by the pinned native MMVF implementation.
     gate[0] = __fdividef(1.0f, 1.0f + __expf(-gate[0]));
-}
-__global__ void native_scalar_sigmoid_multi_kernel(float* gate) {   // thread t = token t, same expression
-    gate[threadIdx.x] = __fdividef(1.0f, 1.0f + __expf(-gate[threadIdx.x]));
 }
 
 /// The MoE block's final combination.  See the header for the two readings it exists to pin.
@@ -218,13 +210,13 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
-    // the activation's q8_1: the caller's (STRATA_VERIFY_QDEDUP, x_q8_1_ready) or the descriptor's, else quantized here
+    // the activation's q8_1: the caller's (x_q8_1_ready) or the descriptor's, else quantized here
     const void* x_q8_1 = x_q8_1_ready ? x_q8_1_ready : nw.x_q8_1;
     if (!x_q8_1) {
         native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
     }
-    // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
+    // gate_deferred: gate and up in one launch where the pair applies (bitwise the two calls)
     if (!(pair && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
         native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);

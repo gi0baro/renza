@@ -1136,7 +1136,7 @@ bool g_multi_exact = true;   // until the upstream layout is timed on an idle GP
 // B6 STRATA_B6_MMVQ_ROWS (lab, default 0 = off): see native_mmvq_set_b6_rows
 int g_b6_rows = [] { const char* v = std::getenv("STRATA_B6_MMVQ_ROWS"); return v ? std::atoi(v) : 0; }();
 
-// S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
+// PAIR: blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
 template<typename F, int NCOLS, int NW, int ROWS, bool PAIR = false>
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
@@ -1464,12 +1464,12 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
 
 // ============================ ncols = 2..4 from interleaved activations (fork F4, Eddoursul) ============================
 //
-// `native_quantize_q8_1_il` also writes the columns interleaved (native_mmvq.hpp), so one load reads the same int of
-// every column. A warp takes R rows and walks their blocks in the chunks of the exact layout above - its lane l's chunk
-// m is what thread 32 (m % 4) + l does in iteration m / 4 - with a sum per virtual warp, added in warp order before the
-// xor tree; each weight block is decoded once (the traits' `load`) and every column takes the single-column dot's own
-// expression (the same *_q8_dot_impl calls), so each value is bitwise the multi-column kernel's. K-quants read the
-// block-major copy; IQ4_XS, whose lanes read the same int of consecutive blocks, the position-major one.
+// One load reads the same int of every column. A warp takes R rows and walks their blocks in the chunks of the exact
+// layout above - its lane l's chunk m is what thread 32 (m % 4) + l does in iteration m / 4 - with a sum per
+// virtual warp, added in warp order before the xor tree; each weight block is decoded once (the traits' `load`) and
+// every column takes the single-column dot's own expression (the same *_q8_dot_impl calls), so each value is bitwise
+// the multi-column kernel's. K-quants read the block-major copy; IQ4_XS, whose lanes read the same int of
+// consecutive blocks, the position-major one.
 struct IlIQ4XS {
     using F = IQ4XSTraits;
     static constexpr bool PM = true;

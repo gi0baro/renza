@@ -25,7 +25,6 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
                               int rows, int head_dim, int n_rot, float epsilon,
                               const RopeScaling& scaling, const int* positions, void* stream);
 /// Whether callers should take the fused kernel (and the in-place rope's 32-thread launch) for this geometry. On the
-/// CUDA build it is on unless STRATA_NO_NORM_ROPE=1; on the HIP build it is off until the AMD parity check passes there
-/// (rope_parity check 6) and only STRATA_NORM_ROPE=1 turns it on.
+/// CUDA build it is on unless STRATA_NO_NORM_ROPE=1.
 bool native_norm_rope_usable(int head_dim, int n_rot);
 }

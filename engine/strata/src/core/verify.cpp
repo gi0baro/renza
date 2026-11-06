@@ -79,12 +79,12 @@ const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: pe
 
 // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
 // overlap pays off on CUDA, where it was added (cfd3b72).  On HIP a cross-stream event dependency costs more than the
-// shared expert takes to run, so there the fork starts off: same binary, same 48,067-token prompt, three runs each on a
-// Radeon AI PRO R9700 (gfx1201, ROCm 6.4.3), the fork off decodes at 62.9 t/s against 43.4 t/s with it on.  The
+// shared expert takes to run, so there the fork started off: same binary, same 48,067-token prompt, three runs each on
+// a Radeon AI PRO R9700 (gfx1201, ROCm 6.4.3), the fork off decodes at 62.9 t/s against 43.4 t/s with it on.  The
 // profiler turns the fork off to time the stages, so a profiled run never showed that.  #816 reports the same fall on a
-// gfx1030 (RX 6800, Windows, 42.5 -> 56.4 t/s).  STRATA_SH_STREAM overrides either default: `=1` forks, `=0` does not.
+// gfx1030 (RX 6800, Windows, 42.5 -> 56.4 t/s).  STRATA_SH_STREAM overrides the default: `=1` forks, `=0` does not.
 // Strix Halo (gfx1151, unified memory) is the exception: the fork pays there (+1.8% UD-IQ4_XS, +6.7% UD-Q4_K_XL decode
-// at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1.  Read on first use, after that table ran.
+// at 8K, ids identical).
 bool sh_stream_on() {
     static const bool on = [] {
         if (const char* v = std::getenv("STRATA_SH_STREAM")) return v[0] != '0';
@@ -94,10 +94,10 @@ bool sh_stream_on() {
 }
 
 // A one-token window always keeps its token, so its graph advances the sequence state itself (the GDN conv history
-// and recurrence state) and Verifier::commit launches no commit graph after it (eddoursul's fork, F7).  CUDA only:
-// HIP keeps the commit graph after every window (STRATA_ONE_TOKEN_COMMIT=0 does too).
-// The head's hyper-connection read for the window's tokens in one launch set (CUDA; HIP keeps gr_read per token;
-// STRATA_HEAD_MIX_MULTI=0 does too): bitwise the same sums.
+// and recurrence state) and Verifier::commit launches no commit graph after it (eddoursul's fork, F7).
+// STRATA_ONE_TOKEN_COMMIT=0 keeps the commit graph after every window.
+// The head's hyper-connection read for the window's tokens in one launch set (STRATA_HEAD_MIX_MULTI=0 keeps gr_read
+// per token): bitwise the same sums.
 bool head_mix_multi_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
@@ -106,12 +106,10 @@ bool head_mix_multi_enabled() {
     return on;
 }
 
-// 143-amdk: STRATA_FUSE_CONVAB=1 - the GDN conv and the a/b projections in one launch.  Opt-in: measured -0.3% on gfx1201 (the a/b dot chain is the longer one).
 bool fuse_convab_on() {
     return false;
 }
 
-// 143-amdk: STRATA_FUSE_HITS - moe_hit_add folded into the combine (gfx12 default; =0 / 1 forces off / on)
 bool fuse_hits_on() {
     return false;
 }
@@ -154,7 +152,7 @@ std::atomic<const Verifier*> g_diag_verifier{nullptr};
 void diag_active_verifier(std::FILE* f) {
     if (const Verifier* v = g_diag_verifier.load()) v->diag(f);
 }
-// #267: every live verifier (a layer split has one per stage), for the release before the engine ends
+// #267: every live verifier, for the release before the engine ends
 constexpr int kLiveMax = 16;
 std::atomic<Verifier*> g_live[kLiveMax];
 void release_live_verifiers(std::FILE* f) {
@@ -264,7 +262,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
     }
     release_gpu_fn().store(&release_live_verifiers);
-    cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+    cudaGetDevice(&device_);
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     wt_ = &wt;
     g_ = &g;
@@ -297,7 +295,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (le_ < 0) le_ = g.n_layers;
     if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || le_ < g.n_layers) {
-        err = "verify: the stage's layer range or its hand-off buffers are wrong";
+        err = "verify: the stage's layer range is wrong";
         return false;
     }
     const WeightRef* wo = wt.find("output.weight");
@@ -534,8 +532,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
 
-    // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
-    // residual, pending write and inject (see set_stage)
+    // ---- the embeddings, broadcast to the hc streams
     if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
@@ -754,7 +751,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, sx);
                 };
                 // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope in one launch, bit-identical to the pair
-                // (rope_parity check 6); STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes
+                // (rope_parity check 6); STRATA_NO_NORM_ROPE=1 keeps the two
                 const bool fuse_nr = native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
                     if (fuse_nr && native_norm_rope_usable(cols, (int) s.n_rot)) {
@@ -1336,7 +1333,7 @@ bool Verifier::capture_commit(std::string& err) {
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         // engine-latency (STRATA_COMMIT_BATCH, default on; =0 keeps the per-layer loop): every GDN layer's conv history and
         // state in two launches instead of two per layer (~70 graph nodes fewer; the same arithmetic per layer, bitwise).
-        // The commit runs between a window and the draft round, which on HIP waits for it.
+        // The commit runs between a window and the draft round.
         static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return !e || e[0] != '0'; }();
         bool gdn_batched = false;
         if (commit_batch) {
@@ -1481,7 +1478,7 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
     const auto gap = [](unsigned long long to, unsigned long long from) {
         return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
     };
-    // only this stage's layers [lb_, le_) are ever stamped (a layer split); the head only on the last stage
+    // only layers [lb_, le_) are ever stamped
     for (int64_t l = lb_; l < le_; ++l) {
         const int kind = is_qsa_layer(g, l) ? 1 : 0;
         unsigned long long prev = at(l, 0);
@@ -1557,7 +1554,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
         }
     }
-    std::optional<HostGraphLaunch> launch_o;   // (not set when the previous stage launched this window already)
+    std::optional<HostGraphLaunch> launch_o;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     ms_host += ms_since(t0);
     if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
@@ -1766,20 +1763,19 @@ void Verifier::set_plan_slot(int grp) {
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
 void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
-    volatile long* f = (volatile long*) flag;
     uint32_t cur = __atomic_load_n((uint32_t*) flag, __ATOMIC_SEQ_CST);
     while (cur < value && !__atomic_compare_exchange_n((uint32_t*) flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
 }
 
 // Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
 // GPU its VRAM experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe
-// groups).  Staging is split between the two token groups of a split window.
+// groups).
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
     if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
     v->copy_used_ = true;
-    uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
+    uint8_t* stage = (uint8_t*) v->sink_.staging;
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
     // the loop the engine always ran, errors unchecked (it never stops the engine).  A batch mode whose uploads
     // cannot be submitted stops the engine: flag B must not release the consumers to expert weights that were never
@@ -1913,7 +1909,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             commit_pending_ = true;
         }
     }
-    if (ple_stage())   // stages that share one session must advance it once
+    if (ple_stage())
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
             ss_->ple_prev[1] = last_tokens_[t];

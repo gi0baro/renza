@@ -54,7 +54,6 @@ namespace strata::core {
 /// Configure before session capture; captured graphs retain the selected implementation.
 /// Does not change GR, PLE or the shared expert's scalar gate.
 void layer_set_native_bf16(bool enabled);
-// Diagnostic vector-attention adapter; configure before capture, context <=256.
 
 /// Every buffer one GDN layer needs, carved from an arena ONCE.  Sizes are functions of `ModelGeometry`, and
 /// `gdn_buffers_bytes` returns the total so a caller can size the arena before committing.
@@ -223,7 +222,7 @@ struct QsaState {
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
     bool kv_hybrid = false;
     /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
-    /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
+    /// back: always for Q4_0
     bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;

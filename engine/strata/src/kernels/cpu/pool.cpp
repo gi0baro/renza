@@ -60,8 +60,8 @@ int planned_host_core(PoolAffinity affinity) { return detect_cpu_topology(true, 
 static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
-    // load/store bandwidth, so a worker on each would put two workers on one core, as the Windows branch above
-    // explains.  sysfs names each CPU's (package, core); the first allowed CPU of each pair is kept, so a taskset
+    // load/store bandwidth, so a worker on each would put two workers on one core.
+    // sysfs names each CPU's (package, core); the first allowed CPU of each pair is kept, so a taskset
     // that leaves out the first sibling still gets its core.  Without sysfs every allowed CPU counts, as before.
     auto topo_read = [](int cpu, const char* what) -> long {
         char path[96];
@@ -184,7 +184,7 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
     };
 
     if (affinity == PoolAffinity::All || !topo.is_hybrid) {
-        if (topo.is_hybrid)   // #642: the P-cores first (see the Windows branch)
+        if (topo.is_hybrid)   // #642: the P-cores first
             std::stable_sort(all_cpus.begin(), all_cpus.end(),
                              [&](const CoreLinux& x, const CoreLinux& y) {
                                  return is_e(x) != is_e(y) ? !is_e(x) : x.cap > y.cap;

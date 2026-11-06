@@ -39,7 +39,7 @@ struct FusedGrArgs {
     const uint8_t* q8_down = nullptr;  ///< Q8_0 [hc_lr][hc*n_embd]
     const uint8_t* q8_up = nullptr;    ///< Q8_0 [hc*n_embd][hc_lr]
     const uint8_t* q8_inject = nullptr;///< Q8_0 [hc][hc*n_embd]
-    /// S26 STRATA_QFUSE=1 (fused_gr_read_multi, the default and Q8_0 reads): also write `mixed`'s q8_1 image here (the
+    /// fused_gr_read_multi (the default and Q8_0 reads): also write `mixed`'s q8_1 image here (the
     /// bytes native_quantize_q8_1 would write); q8_cnt = n_embd / 32 zeroed counters owned by the caller (token 0's)
     uint8_t* q8_mixed = nullptr;
     unsigned* q8_cnt = nullptr;

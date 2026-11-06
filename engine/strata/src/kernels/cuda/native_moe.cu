@@ -31,7 +31,7 @@
 namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
-// GATED (S26 STRATA_LFUSE): `shared` is the shared expert's unscaled output and sg its raw gate logit per token;
+// GATED: `shared` is the shared expert's unscaled output and sg its raw gate logit per token;
 // the row is scaled here as shared_expert_multi did (native_scalar_sigmoid_multi_kernel's expression, then one
 // rounded multiply = scale_rows_kernel's `out *= g`), then added as before
 template<bool ZADD = false, bool GATED = false>

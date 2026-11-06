@@ -10,7 +10,7 @@
 //
 // for l in [first, last].  `d` is the GGUF's `direction.<src>` times the file's scale (summed over files), with
 // src = l (per-layer) or one fixed layer (single:L, project mode only), exactly as llama.cpp's loader places it;
-// layer 0 has no direction.  Off unless a vector is loaded (--control-vector-scaled); a loaded one is switched
+// layer 0 has no direction.  Off unless a vector is loaded; a loaded one is switched
 // per request through a device flag, so the captured graphs are the same either way.  With the flag off the
 // result is bit-identical to the engine without a vector: the kernel then only applies the pending residual
 // write, with the fused read's own arithmetic.

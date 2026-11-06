@@ -10,7 +10,7 @@ namespace strata::core {
 // The RAM a runtime allocation (parking a conversation, saving or restoring a session file) may still take.
 //
 // available_host_bytes() is the smallest of
-//   * MemAvailable (Windows: the available physical memory);
+//   * MemAvailable;
 //   * the room under every memory limit of this process's cgroup and of each ancestor visible under
 //     /sys/fs/cgroup (cgroup v2: memory.max and memory.high, each minus usage; cgroup v1:
 //     memory.limit_in_bytes minus memory.usage_in_bytes);
@@ -59,7 +59,7 @@ uint64_t memory_limit_bytes();
 /// Linux: reads `paths`.  `explicit_limit` 0 = no operator cap.  nullopt when the RAM cannot be determined.
 std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& paths, uint64_t explicit_limit);
 
-/// The real files (Windows: GlobalMemoryStatusEx) and the cap set by set_memory_limit_bytes().
+/// The real files and the cap set by set_memory_limit_bytes().
 std::optional<HostMemoryReading> sample_host_memory();
 
 std::optional<uint64_t> available_host_bytes();

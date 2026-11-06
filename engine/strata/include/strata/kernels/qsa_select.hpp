@@ -35,8 +35,6 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                                                      ///< batch's largest n_bid + 1; not for a captured graph)
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
-/// On AMD it is the gfx12 (RDNA4) WMMA kernel (a three-way bf16 split, six products); false on any other AMD target.
-/// On CUDA below sm_80 (no TF32 tensor cores) it is an FP32 tiled kernel, also not bitwise, and only with STRATA_SELECT_SIMT=1 (otherwise false).
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
@@ -47,15 +45,14 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                                                    ///< the same contract as qsa_block_scores's). The register kernel is
                                                    ///< chosen by this, not by the capacity max_blocks (a long
                                                    ///< --max-context otherwise sends every short prompt to the slow one).
-                                                   ///< CUDA uses the bound only on sm_75; HIP keeps its existing policy.
                                                    ///< Omit it for captured graphs whose context can grow after capture.
 /// The probe left of the sm_90+ cluster top-k: launches nothing and returns false (true when nq <= 0); its first call
 /// per device clears the thread's pending CUDA error. qsa_block_topk calls it for up to 16 queries unless
 /// STRATA_QSA_CLUSTER=0.
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                             const QsaShapes& s, int32_t* ids, void* stream);
-/// The original kernel (256 threads, one shared histogram, keys read from memory on every radix pass), for tests and
-/// STRATA_TOPK_OLD=1: the same ids.
+/// The original kernel (256 threads, one shared histogram, keys read from memory on every radix pass), for tests:
+/// the same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);
 

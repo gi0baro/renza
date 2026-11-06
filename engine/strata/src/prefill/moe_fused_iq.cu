@@ -64,7 +64,7 @@ constexpr int GU_ROWS_K = 2560, D_ROWS_K = 640;   // K of gate/up (n_embd) and o
 constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_S = GGML_TYPE_IQ2_S,
               T_IQ3_XXS = GGML_TYPE_IQ3_XXS, T_IQ3_S = GGML_TYPE_IQ3_S, T_IQ4_XS = GGML_TYPE_IQ4_XS,
               T_IQ4_NL = GGML_TYPE_IQ4_NL, T_Q2_0 = GGML_TYPE_Q2_0,
-              // Aurora (opt-in, HIP gfx11 only): Unsloth UD-Q4_K_XL's experts - gate/up Q4_K (one layer Q5_K), down Q5_1
+              // Unsloth UD-Q4_K_XL's experts - gate/up Q4_K (one layer Q5_K), down Q5_1
               // (five layers Q8_0).  Their weights are w = d_w q + m_w (a minimum), so a sub-block's dot is
               //   sum w x = d_x (d_w sum q a + m_w sum a):
               // the activation blocks carry sum a per 32 values in their eight spare bytes (quant_act_nat_kernel and
@@ -81,8 +81,6 @@ __host__ __device__ constexpr int block_bytes(int t) {
     return t == T_IQ2_XXS ? 66 : t == T_IQ2_XS ? 74 : t == T_IQ2_S ? 82 : t == T_IQ3_XXS ? 98 : t == T_IQ3_S ? 110
          : t == T_IQ4_XS ? 136 : t == T_Q4_K ? 144 : t == T_Q5_K ? 176 : t == T_Q5_1 ? 24 : t == T_Q8_0 ? 34 : 18;
 }
-// the formats with a minimum (w = d q + m), and the raw words a sub-block's load stage holds
-__host__ __device__ constexpr bool has_min(int t) { return t == T_Q4_K || t == T_Q5_K || t == T_Q5_1; }
 __host__ __device__ constexpr int raw_words(int t) {
     return t == T_Q4_K ? 10 : t == T_Q5_K ? 18 : t == T_Q5_1 ? 6 : t == T_Q8_0 ? 9 : 5;
 }
@@ -596,7 +594,7 @@ unsigned blocks(int64_t n, int per) { return (unsigned) ((n + per - 1) / per); }
 // per device: whether every kernel here runs (sm_80+, device code in this build, fits), and their occupancy
 struct DevInfo {
     bool done = false, ok = false;
-    bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
+    bool w12 = false;
     int sms = 0, occ = 1;
 };
 std::mutex g_mu;
@@ -631,17 +629,12 @@ const DevInfo& dev_info() {
     int occ = 1 << 20;
     d.ok = setup_one<T_IQ2_XXS, true>(occ) && setup_one<T_IQ2_XS, true>(occ) && setup_one<T_IQ2_S, true>(occ) &&
            setup_one<T_IQ3_XXS, true>(occ) && setup_one<T_IQ3_S, true>(occ) && setup_one<T_IQ4_XS, true>(occ) &&
-           setup_one<T_Q2_0, false>(occ) && setup_one<T_IQ4_NL, false>(occ);   // (Q2_0 gate/up is the Turing opt-in's only)
+           setup_one<T_Q2_0, false>(occ) && setup_one<T_IQ4_NL, false>(occ);
     d.occ = d.ok ? occ : 1;
     cudaGetLastError();
     return d;
 }
 
-// STRATA_PF_F16=1 (gfx11): the formats native_f16_kernel takes
-bool f16_gu(int t) {
-    return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;
-}
-bool f16_d(int t) { return t == T_Q2_0 || t == T_IQ4_NL || t == T_Q8_0; }
 bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
         ;
@@ -650,9 +643,6 @@ bool d_covered(int t) {
     return t == T_Q2_0 || t == T_IQ4_NL
         ;
 }
-// d_covered on this device: STRATA_PF_F16=1 also takes Q8_0 down on gfx11 without STRATA_PF_FUSED_KQ - the F16 kernel
-// has no minimum term, and its output already differs from the int8 kernels' (UD-IQ4_XS: the five Q8_0-down layers
-// would otherwise leave the fused path for MMQ).
 bool d_covered_on(int t, const DevInfo& d) {
     (void) d;
     return d_covered(t);
@@ -690,17 +680,13 @@ bool native_supported(int gu_type, int d_type) {
         const char* v = std::getenv("STRATA_PF_FUSED_NATIVE");
         return v != nullptr && v[0] == '0';
     }();
-    // gfx12: fused::available() (the Q2_0 pack's expert_w11_kernel, not ported) stays false, so requested() does too; the
-    // same opt-in (STRATA_PF_FUSED=1) is read here.  Every other device: requested() as before.
-    // unset: on by default on gfx12 for IQ3_S and IQ3_XXS gate/up only (R9700: prompt +13..+20%, first-token KL against the FP16 prompt
-    // path equal to MMQ's within noise, 96 prompts each); STRATA_PF_FUSED=0 turns it off, =1 keeps the opt-in for every covered format
     static const int env = [] {
         const char* v = std::getenv("STRATA_PF_FUSED");
         return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0);
     }();
     if (off || env == 0 || !gu_covered(gu_type)) return false;
-    if (env < 0) return false;   // the default is gfx12 (HIP) only
-    if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS) return false;   // default: only these two
+    if (env < 0) return false;
+    if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS) return false;
     const DevInfo& d = dev_info();
     if (!d.ok || !d_covered_on(d_type, d)) return false;
     if (env < 0) return d.w12;

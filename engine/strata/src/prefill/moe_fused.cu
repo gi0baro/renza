@@ -56,8 +56,7 @@ constexpr size_t smem_bytes(bool gu) {
 
 // the stored position of value k of a 32-value half-block (see "The K order")
 __host__ __device__ __forceinline__ int perm32(int k) { return 8 * (k & 3) + 4 * (k >> 4) + ((k & 15) >> 2); }
-// where value k of a 32-value half-block is stored: perm32 for the CUDA kernel; on HIP the gfx11 WMMA kernel's order
-// (value 4b + t of a 16-value word at 4t + b: see expert_w11_kernel)
+// where value k of a 32-value half-block is stored: perm32
 __host__ __device__ __forceinline__ int act_pos(int k) {
     return perm32(k);
 }

@@ -16,8 +16,7 @@
 namespace strata::prefill::mmq {
 namespace {
 #if defined(STRATA_MMQ_KQUANTS)
-// MODEL-UPDATE Phase 1: the K-quant products through MMQ are opt-in at run time (STRATA_MMQ_KQ=1); on CUDA their
-// kernels are the strata_kq library, opened only then
+// MODEL-UPDATE Phase 1: the K-quant products through MMQ are opt-in at run time (STRATA_MMQ_KQ=1).
 bool kq_ok() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MMQ_KQ");
@@ -140,7 +139,7 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
             return true;
 #ifdef STRATA_MMQ_KQUANTS
-        // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
+        // Unsloth's UD-Q4/Q5/Q6_K_XL experts
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
             return kq_ok();
 #endif

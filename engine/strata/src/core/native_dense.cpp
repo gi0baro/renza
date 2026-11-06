@@ -81,9 +81,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 // The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
-// reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not
-// on the card when the split search prices that stage, and `load` runs one cudaMalloc per matrix (#1238).  The two
-// have to stay in step.  A repeated name is skipped rather than refused (`load` refuses it).
+// reading the GGUF headers and the canonical table only, so it needs no device.
+// The two have to stay in step.  A repeated name is skipped rather than refused (`load` refuses it).
 bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
                                    int64_t lb, int64_t le, uint64_t& out, std::string& err) {
     out = 0;
@@ -230,7 +229,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
-                // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
+                // #326: the pack keeps an unquantized key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||

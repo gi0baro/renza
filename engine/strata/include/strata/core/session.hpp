@@ -92,9 +92,9 @@ struct SessionState {
 /// requires ZERO token-path allocations - a `cudaMalloc` that happened on the first token of a longer sequence
 /// would satisfy every test here and fail that one.
 ///
-/// [layer_lo, layer_hi) carves only that range's per-layer state (a split stage runs a slice of the model);
+/// [layer_lo, layer_hi) carves only that range's per-layer state;
 /// the default full range is byte-identical to the old whole-model carve.  Pure arithmetic - safe to call for
-/// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
+/// a candidate range before anything is allocated.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.

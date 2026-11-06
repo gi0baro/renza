@@ -644,7 +644,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
 #undef PA2_PART
 bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs this on several)
+    static bool attr[64] = {};   // the shared-memory opt-in is per device
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) return false;
@@ -708,7 +708,7 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
-    bool turing = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
+    bool turing = false;   // per call, from the CURRENT device
     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
         // keeps the old kernel.

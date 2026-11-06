@@ -43,7 +43,7 @@ constexpr int MAX_SHARED_HALVES = 4096;      // 8 KB of shared for x; n_embd 256
 // byte -> the four code values with the -1 bias already applied, in element order (bits 0,2,4,6).
 __constant__ float c_codes[256][4];
 
-bool g_lut_ready[64] = {};   // per device: __constant__ memory is per device (a layer split runs on two)
+bool g_lut_ready[64] = {};   // per device: __constant__ memory is per device
 
 void ensure_lut() {
     int dev = 0;

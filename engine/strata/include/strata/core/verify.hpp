@@ -100,16 +100,13 @@ public:
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return n_vocab_; }
-    /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
+    /// #879 GUARD: the first row of the last finished window (run) whose head
     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
     /// checks its T rows on the device beside the greedy pick (logits_nonfinite_rows into mapped flags, read after
-    /// the sync the window already does: no extra sync).  On the stage with the head (a layer split asks the last
-    /// stage).  STRATA_NAN_GUARD=0: off (always -1).  STRATA_NAN_INJECT=<n>[,<n>...] (debug): the n-th window the
-    /// guard checks in this process (counted from 1 over every stage-with-head verifier: prompt-tail windows, decode
-    /// windows and batch windows alike) reports row 0 as non-finite, so the whole response can be tested.
+    /// the sync the window already does: no extra sync).  STRATA_NAN_GUARD=0: off (always -1).
     int nonfinite_row() const { return nf_row_; }
     int64_t nonfinite_pos() const { return nf_pos_; }
-    /// Row t of the last window (a batch window: each slot's own rows) held a non-finite logit.
+    /// Row t of the last window held a non-finite logit.
     bool nonfinite_in(int t) const {
         return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
     }
@@ -180,8 +177,7 @@ public:
     /// "pos target logprob top top_logprob hit extra_logprob target_logprob_without_extra" - where row t is the
     /// distribution at pos0 + t, targets[t] is the token at pos0 + t + 1, extra_logprob is the log-probability of
     /// `extra_id` in the same row, and the last column is the target's log-probability in that row renormalized
-    /// over every token but `extra_id` (both nan when they do not apply).  A layer split's earlier stage forwards
-    /// to the stage that holds the head.
+    /// over every token but `extra_id` (both nan when they do not apply).
     bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                          std::string& err);
 
@@ -197,7 +193,7 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
-    /// Called before every window this verifier launches (run, the batch and pipelined launches): the device's
+    /// Called before every window this verifier launches (run): the device's
     /// residency table catches up with the host's (the adaptive tier's evictions while its copies are in flight).
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
@@ -241,12 +237,12 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
-    int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
+    int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
     /// #871: the zero-doorbell graph plans from the device residency table alone, so it is only right while every
     /// expert of the stage is in VRAM.  A prompt loan, a VRAM shrink or an adaptive swap marks some -1 for a while:
-    /// every window then runs the doorbell graph (exec_nr_ / the batch key's top bit), the same as a stage that never
+    /// every window then runs the doorbell graph (exec_nr_), the same as a stage that never
     /// was all-resident.  refresh_ar() looks at the host table before each window.
     bool ar_off_ = false;
     bool ar_on() const { return all_resident_ && !ar_off_; }
@@ -256,7 +252,7 @@ private:
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
-    int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
+    int64_t lb_ = 0, le_ = -1;           ///< the layers this verifier runs (-1: to the last)
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
@@ -301,7 +297,7 @@ private:
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
-    void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
+    void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags -> nf_row_
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k

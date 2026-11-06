@@ -2,10 +2,9 @@
 
 #include <cstdint>
 
-// A layer split's prompt-path ring and the lend slots sized from it, kept apart from the engine so they can be tested
-// on the CPU (header-only, like pipeline_gate.hpp).
+// The lend slots, kept apart from the engine so they can be tested on the CPU.
 //
-//  2. split_lend_slots: how many tail slots of a cache `need` bytes take - the scan's own arithmetic, used for the
+//  split_lend_slots: how many tail slots of a cache `need` bytes take - the scan's own arithmetic, used for the
 //     RAM-copy region and for the borrow itself so the two cannot disagree.
 namespace strata::program {
 

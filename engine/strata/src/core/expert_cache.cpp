@@ -184,7 +184,7 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
               std::fwrite(table.data(), 4, table.size(), f) == table.size();
     ok = (std::fclose(f) == 0) && ok;
     std::error_code ec;
-    if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (MoveFileEx / rename(2))
+    if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (rename(2))
     if (!ok || ec) {
         std::filesystem::remove(tmp, ec);
         err = "write_expert_profile: cannot write " + path;

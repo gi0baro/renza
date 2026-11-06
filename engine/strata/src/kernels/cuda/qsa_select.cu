@@ -441,8 +441,6 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
 // neighbours at a time.  The cells are emitted ascending in the order (warp, row, lane): warp w holds the `per` rows
 // of 32 consecutive blocks from block w * 32 * per.  block_topk_kernel's selection rule (radix threshold, ties to the
 // lowest index): identical ids.
-// campaign3: also compiled on HIP (gfx11: plain shared/atomic code, no sm_90 features; the dispatch still needs
-// reach > fit, i.e. the deep contexts where the ref radix was the only option on AMD).
 __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                int64_t cap, int32_t* __restrict__ ids) {
@@ -678,7 +676,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         }
         if (cc_major[dev] < 8) return false;
     }
-    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs it on several)
+    static bool attr[64] = {};   // the shared-memory opt-in is per device
     int adev = 0;
     cudaGetDevice(&adev);
     const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
@@ -743,7 +741,7 @@ void topk_split_device() {
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
     // keys in registers when every query's blocks fit (contexts up to ~135K cells), else (CUDA) the same threads
-    // reading them from memory; the same ids. STRATA_TOPK_OLD=1: the original kernel
+    // reading them from memory; the same ids.
     if (nq <= 0) return;
     // STRATA_QSA_CLUSTER=0: no call to qsa_block_topk_cluster
     static const bool cluster = [] {
@@ -766,8 +764,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }
-    // campaign3: on HIP too (was CUDA-only; gfx11 has no sm_90 cluster path and fell to the ref radix past the
-    // register kernel's reach - the deep-decode top-k cost).  Same ids as the ref kernel.
+    // Same ids as the ref kernel.
     if (reach > fit)   // past the register kernel's reach
         block_topk_wide_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     else

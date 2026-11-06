@@ -10,7 +10,7 @@
 //   0  one cudaMemcpyAsync per blob: exactly the loop the engine always ran
 //   1  cudaMemcpyBatchAsync (CUDA 13+, groups of 2..128), the copies in any order, the batch in the stream's
 //   2  as 1, plus CUDA 13.4's cudaMemcpyFlagPreferOverlapWithCompute (a hint)
-// Every other build (HIP, CUDA before 13) and every single copy or group over 128 takes the loop.  A batch the
+// Every other build (CUDA before 13) and every single copy or group over 128 takes the loop.  A batch the
 // runtime refuses is redone as the loop (with one warning), never dropped: readiness is signalled only for
 // uploads that were submitted.
 #include <cuda_runtime.h>

@@ -11,10 +11,10 @@
 // launch cost of ~3.6 us is 5.6 ms - most of the 10.4 ms the tier is supposed to save. So the hits are grouped
 // into ONE launch per projection:
 //
-//     1. `gu_kernel`    n_hits x 2 x FF rows   - gate and up, together
-//     2. `swiglu_kernel` n_hits x FF           - silu(gate) * up
-//     3. `quantize_q8_0` (the existing one)    - the down weight's own activation contract
-//     4. `down_kernel`   n_hits x H rows
+//     1. `gu_pair_kernel`   n_hits x 2 x FF rows   - gate and up, together
+//     2. `swiglu_kernel`    n_hits x FF            - silu(gate) * up
+//     3. `quantize_q8_0` (the existing one)        - the down weight's own activation contract
+//     4. `down_pair_kernel` n_hits x H rows
 //
 // **four launches per layer, not five per expert.**
 //

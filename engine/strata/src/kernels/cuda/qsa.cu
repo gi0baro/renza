@@ -664,7 +664,7 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
     // then index past it at token 500.  The kernel reads the real count from `step`, so a larger allocation is
     // exactly what it wants.  The opt-in therefore happens once, for the capacity.
     const size_t smem = (size_t) (max_ids + 32) * sizeof(float);
-    // per DEVICE: the opt-in is a device setting (a layer split runs this on two cards)
+    // per DEVICE: the opt-in is a device setting
     static size_t s_configured_dev[64] = {};
     int cur_dev = 0;
     cudaGetDevice(&cur_dev);

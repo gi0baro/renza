@@ -188,7 +188,7 @@ int main() {
         check(session_file_write(again.string(), original, id, written, error), "second write");
         check(slurp(again) == slurp(good), "format is deterministic");
     }
-    // saving over an existing file replaces it (MoveFileExW on Windows, rename elsewhere)
+    // saving over an existing file replaces it (rename)
     {
         const fs::path over = dir / "over.bin";
         spit(over, std::vector<char>(100, 'o'));

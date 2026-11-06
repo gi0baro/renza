@@ -8,8 +8,8 @@
 
 namespace strata::kernels {
 
-/// The probe left of programmatic dependent launch (sm_90+, opt-in STRATA_DF_PDL): always false here; its first call
-/// per device reads STRATA_DF_PDL and clears the thread's pending CUDA error.
+/// The probe left of programmatic dependent launch (sm_90+): always false here; its first call
+/// per device clears the thread's pending CUDA error.
 bool pdl_supported();
 
 #if defined(__CUDACC__)

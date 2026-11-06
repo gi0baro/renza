@@ -406,15 +406,14 @@ void log_complement_memory(const char* stage, uint64_t requested) {
     (void) requested;
 }
 
-/// #286: an unbuffered file handle - a HANDLE on Windows, an O_DIRECT descriptor (as a pointer-sized integer) on Linux.
+/// #286: an unbuffered file handle - an O_DIRECT descriptor (as a pointer-sized integer) on Linux.
 void close_direct(void* h) {
     ::close((int) (intptr_t) h);
 }
 
 /// #286/#577: whether the file tier reads its `read_bytes` unbuffered, beside `arena_bytes` of RAM copy still to be
-/// taken.  Windows times probe reads too (experts_unbuffered); on Linux the same rule as its `cache_counts = false`
-/// arm decides: whether the file cache could keep those bytes at all, from MemAvailable and the tightest cgroup
-/// limit (host_available_memory).  STRATA_UNBUFFERED_LOAD=1 / 0 forces it either way, as on Windows.
+/// taken.  Whether the file cache could keep those bytes at all, from MemAvailable and the tightest cgroup
+/// limit (host_available_memory).  STRATA_UNBUFFERED_LOAD=1 / 0 forces it either way.
 bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_bytes, uint64_t read_bytes,
                           std::string& why) {
 #if defined(__linux__)
@@ -432,9 +431,8 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
     // serves most of the repeats, and beat the unbuffered reads at every room measured (it reads 2 to 7 times less from
     // the drive).  `avail` already has what this process and the cgroup hold taken off, so 1 GiB is left for the rest.
     // #1752 (KevinX8): ROCm queues are suspended while the kernel reclaims around the process's HMM-tracked arena
-    // (#1691) on an MI50 (gfx906): the cached reads churn the page cache and reclaim unmaps the arena, so the gfx906
-    // backend keeps the old room >= read_bytes rule.  Other HIP cards (gfx1201 measured: not affected) keep the new
-    // rule; STRATA_FILE_CACHE_OLD_RULE=1 / 0 forces the old rule on / off on any Linux build.
+    // (#1691) on an MI50 (gfx906): the cached reads churn the page cache and reclaim unmaps the arena.
+    // STRATA_FILE_CACHE_OLD_RULE=1 / 0 forces the old room >= read_bytes rule on / off on any Linux build.
     bool old_rule = false;
     if (const char* r = std::getenv("STRATA_FILE_CACHE_OLD_RULE"); r != nullptr && r[0] != '\0') old_rule = r[0] != '0';
     const bool keepable = old_rule
@@ -1064,7 +1062,7 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
 // its blob has not been asked for during `kStageAge` layers (begin_layer) or 256 assemblies, whichever comes
 // first, and never while it is being filled: the pool computes a layer's misses before it starts the next, and a
-// fill (the GPU cache at startup, an adaptive swap, a helper GPU) copies the blob right away.
+// fill (the GPU cache at startup, an adaptive swap) copies the blob right away.
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
@@ -1469,10 +1467,10 @@ bool FileExpertSource::map_view(std::string& why) {
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #if defined(__linux__)
     // Linux: O_DIRECT descriptors (open_direct) and the kernel's asynchronous reads - every window of the batch is
-    // queued with one io_submit before the first wait, so the drive sees the batch as one queue, as the overlapped
-    // ReadFiles above do.  No NTFS here: windows are merged only where they touch (the 4 KiB rounding of adjacent
-    // slices, consecutive experts of a role), never across a gap that would be read for nothing.  Each thread has its
-    // own context and aligned buffer, kept for its next batch, so concurrent batches never see each other's events.
+    // queued with one io_submit before the first wait, so the drive sees the batch as one queue.  Read windows are
+    // merged only where they touch (the 4 KiB rounding of adjacent slices, consecutive experts of a role), never
+    // across a gap that would be read for nothing.  Each thread has its own context and aligned buffer, kept for its
+    // next batch, so concurrent batches never see each other's events.
     constexpr uint64_t kSector = 4096, kMerge = 32ull << 20;
     constexpr long kDepth = 256;   // requests in flight per thread; a larger batch is read in waves of this many
     struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
@@ -2076,7 +2074,7 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
-        // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
+        // they fit, the rest left on the mapped files.
         uint64_t physical = 0;
         if (!available_memory_bytes(physical, &budget_commit)) {
             err = "FileExpertSource: cannot determine available memory for --resident-budget-gib";
@@ -3241,9 +3239,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_skipped;
                 continue;
             }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
+            if (kind[i] >= 0) {             // CUDA0 or PCIe
                 if (kind[i] == 0) ++d.cache_hits;
-                else ++d.offload_entries;                       // #588: PCIe or another GPU
+                else ++d.offload_entries;                       // #588: PCIe
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
                 if (!(gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1)))
                     std::memset(row, 0, (size_t) H * sizeof(float));
@@ -3486,8 +3484,6 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.  Each role
 // is read from its own file (native_experts.txt v4: a shard boundary can fall inside a layer; per role as in
 // #255, gopinath87607).  The caller checks the spans first (check_experts_gguf).
-// `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
-// an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered, const std::atomic<int>* ready, const PadMap* pad) {
     // where blob (l, e) goes in `dst`: packed (experts.bin) or the padded layout of pin by need
@@ -3681,10 +3677,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
-    // #285: on Windows the per-layer registration runs on a thread ahead of the readers, which wait for their
-    // layer's slice (the whole arena registered before the load cost ~2.5 s at 33 GiB of 4 KB pages, not hidden).
-    // Only where the whole arena would be registered: no cap (STRATA_ARENA_PIN_GIB, multi-GPU), no shared arena.
-    // Linux keeps the whole-arena pin (#253). OPT-IN (STRATA_DEFERRED_REGISTER=1): on the RTX 5070 / Windows the
+    // Linux keeps the whole-arena pin (#253). On the RTX 5070 / Windows the
     // arena registered per layer before it is filled decoded ~10% slower than the old order (whole-arena try, sliced
     // fallback after the load) with identical output; the start-time gain does not pay for that.
     const bool deferred = false;
@@ -3698,8 +3691,6 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
-    // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
-    // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
     std::vector<std::string> files;
     if (from_gguf) {
         for (int64_t l = 0; l < n_layers; ++l)

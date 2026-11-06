@@ -197,7 +197,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
                                   const ModelGeometry& g, std::string& error, bool queued) {
     // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two
-    // sessions carved alike on the same device (a stage's own session and its batch slots): the same bytes into
+    // sessions carved alike on the same device: the same bytes into
     // the same places, through copy() like the restore (the private non-blocking stream, complete on return unless
     // `queued`: then the caller synchronizes the device).
     ConversationStateSizes zf, zt;
@@ -389,7 +389,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     return ConversationRestore::restored;
 }
 
-// the draft layer's K/V included (the stage that owns the draft head, or no layer split)
+// the draft layer's K/V included
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                  const QsaState& draft, size_t& bytes, std::string& error) {
     return conversation_snapshot_bytes(view, ss, g, &draft, bytes, error);
@@ -406,7 +406,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 }
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
                                     const QsaState& draft, std::string& error) {
-    // the whole-session form: a layer split's image (stage images) is restored stage by stage, never through here
+    // the whole-session form: stage images are not restored through here
     if (!image.stage_images.empty()) return fail(error, "a layer split's image restored as a single session");
     return conversation_snapshot_validate(image, ss, g, &draft, error);
 }
@@ -422,7 +422,7 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& ss, const ModelGeometry& g,
                                                           const QsaState* draft, std::string& error) {
-    // a layer split's image (stage images) is restored stage by stage, never in part
+    // stage images are never restored in part
     if (!image.stage_images.empty()) {
         fail(error, "a layer split's image restored as a single session");
         return ConversationRestore::invalid;

@@ -2,7 +2,7 @@
 // the shape the kernels are compiled for.
 //
 // A model file's geometry is read from its own metadata (`strata::read_geometry`, gguf_reader.hpp), and the
-// engine passes that struct everywhere it needs a dimension.  The CUDA/HIP kernels still fix most of these
+// engine passes that struct everywhere it needs a dimension.  The CUDA kernels still fix most of these
 // numbers at compile time (`constexpr int N = 2560` and the like); `kCompiledGeometry` is that shape, written
 // once, and each kernel that pins a number `static_assert`s it against this struct.  So a kernel and this file
 // cannot drift apart without the build failing, and a model file of another shape is refused at load with the
