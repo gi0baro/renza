@@ -55,7 +55,6 @@ namespace strata::core {
 /// Does not change GR, PLE or the shared expert's scalar gate.
 void layer_set_native_bf16(bool enabled);
 // Diagnostic vector-attention adapter; configure before capture, context <=256.
-void layer_set_native_flash_attn_short(bool enabled);
 
 /// Every buffer one GDN layer needs, carved from an arena ONCE.  Sizes are functions of `ModelGeometry`, and
 /// `gdn_buffers_bytes` returns the total so a caller can size the arena before committing.
@@ -309,8 +308,6 @@ uint64_t qsa_kv_host_bytes();
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
-/// INT8 K/V through the Hadamard rotation (off by default: STRATA_KV_ROT=1)
-void qsa_set_kv_int8_rotate(bool enabled);
 bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);

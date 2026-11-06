@@ -158,11 +158,6 @@ public:
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
-    /// The pieces (up to 3) a blob consists of when the source can hand them out where they already are - the GGUF
-    /// mapped in place keeps an expert's gate, up and down in three tensors - so the caller can copy each straight to
-    /// its destination instead of `blob_stable` assembling a staging copy first.  0: not available for this
-    /// (layer, expert) - take `blob_stable`.  The pointers stay valid as long as the source is open.
-    virtual int blob_parts(int64_t layer, int64_t expert, BlobPart* out) { (void) layer; (void) expert; (void) out; return 0; }
     /// The caller has queued an asynchronous copy out of `blob` (a pointer this source handed out) on `stream` (a
     /// cudaStream_t): the source must not overwrite or recycle that memory until the copy has finished.  A source whose
     /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
@@ -559,10 +554,6 @@ struct ExpertDispatch {
     bool evict_sync = false;
     bool res_dirty = false;
     std::vector<int32_t> res_dirty_idx;
-    /// STRATA_ADAPT_CHECKRES: the device's residency table as read back before the window; a layer with CPU experts
-    /// whose routed ids all look resident there publishes no activation (doorbell_publish_res) - counted
-    const int32_t* dres_check = nullptr;
-    int64_t stale_x = 0;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
@@ -787,7 +778,6 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
-    int blob_parts(int64_t layer, int64_t expert, BlobPart* out) override;
     void note_async_read(const uint8_t* blob, void* stream) override;
     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
@@ -890,12 +880,7 @@ private:
     // reused only once `kStageAge` layer changes have passed since its blob was last asked for, so a pointer holds
     // through the layer it was asked in and the next ones (the pool computes a layer's misses before the next).
     static constexpr uint64_t kStageAge = 3;
-    // A stage buffer feeds cudaMemcpyAsync (the cache fill), so it is cudaHostAlloc'd where the driver allows:
-    // a pageable source would be staged through the driver's bounce buffer - an extra copy at a fraction of
-    // the transfer rate, with the calling thread doing it.  `pinned` picks the free (defined in the .cpp: the
-    // header has no cuda_runtime.h).
     struct StageBufFree {
-        bool pinned = false;
         void operator()(uint8_t* p) const noexcept;
     };
     std::mutex stage_mu_;
@@ -917,7 +902,6 @@ private:
     uint64_t epoch_ = 0;
     int64_t last_layer_ = -1;
     bool stage_grew_ = false;
-    bool stage_pin_said_ = false, stage_pin_failed_said_ = false;   ///< the one-time notes in claim_stage
     // #1237: per stage buffer, the event recorded after the last asynchronous copy out of it (note_async_read); a
     // buffer is refilled only once that event has completed.  cudaEvent_t, stored untyped (no cuda_runtime.h here).
     std::vector<void*> stage_ev_;
@@ -1019,7 +1003,7 @@ public:
     /// Allocates and loads `<pack_dir>/experts.bin`.  Prints nothing; the caller reports `note()` and the load
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
-              uint64_t max_pinned_bytes = 0, const std::string& shared_arena_file = {});
+              uint64_t max_pinned_bytes = 0);
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
@@ -1038,20 +1022,6 @@ public:
     bool pcie_layer(int64_t layer) const override;
     void prefetch(int64_t layer, int64_t expert) override;
     uint64_t release(int64_t layer, int64_t expert) override;
-
-    /// Pin by need (STRATA_PIN_BY_NEED=1): BEFORE open(), the (layer, expert) pairs worth pinning, by decreasing
-    /// priority - the profile's ranked pairs the GPU cache will NOT hold, then the unranked ones.  open() merges
-    /// neighbours into byte ranges and registers only those (PinnedArena::ByNeed); pinned()/device_alias()/pcie_layer()
-    /// then follow the registered ranges instead of a prefix.  Never called: the old prefix pinning, unchanged.
-    /// `n_first`: the first n_first pairs are the non-resident estimate; the rest (the pairs taken as GPU-resident, which
-    /// only get what the cap leaves over) never merge into a run with them, so their ranges come after all of the first.
-    void set_pin_priority(std::vector<std::pair<int32_t, int32_t>> ranked, size_t n_first = (size_t) -1) {
-        pin_pairs_ = std::move(ranked);
-        pin_first_ = n_first;
-        pin_by_need_ = true;
-    }
-    /// Pin by need, after open(): the registered ranges (0 when the prefix rule, or nothing, is in force)
-    size_t pin_ranges() const { return pin_start_.size(); }
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -1083,22 +1053,8 @@ private:
     double load_read_s_ = 0.0;
     double load_copy_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
-    // pin by need: set_pin_priority's pairs, and (after open) the registered ranges - sorted starts, ends and the
-    // device alias of each start - plus pcie_layer's answer per layer.  `ranges_` false = the prefix rule above.
-    bool pin_by_need_ = false;
-    bool ranges_ = false;
-    // pin by need: the arena's page-aligned blob stride (see PadMap); `padded_` false = the packed experts.bin layout
-    bool padded_ = false;
-    PadMap pad_;
     /// where blob (layer, expert) starts in the arena: the ONE address function of this class
     uint64_t arena_off(int64_t layer, int64_t expert) const;
-    std::vector<std::pair<int32_t, int32_t>> pin_pairs_;
-    size_t pin_first_ = (size_t) -1;   // pin_pairs_[0, pin_first_) are the first tier (see set_pin_priority)
-    std::vector<uint64_t> pin_start_, pin_end_;
-    std::vector<const uint8_t*> pin_dev_;
-    std::vector<uint8_t> layer_pcie_;
-    /// index of the registered range holding [off, off + len), or -1
-    int64_t pin_range_of(uint64_t off, uint64_t len) const;
     std::string gguf_;
 };
 

@@ -25,7 +25,6 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_rope.hpp"
-#include "strata/kernels/native_flash_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -94,7 +93,6 @@ bool plane_ptrs(const WeightRef& r, const std::string& name, Planes& out, std::s
 if (r.code_bits != 2 && r.code_bits != 4 && r.code_bits != 8) {        err = name + ": code_bits " + std::to_string(r.code_bits) + " is not an S2/S4/S8 form";        return false;    }    const uint64_t end = r.codes_bytes + r.scales_bytes + r.offset_bytes;    if (r.codes_bytes == 0 || r.scales_bytes == 0 || end != r.bytes) {        char buf[320];        std::snprintf(buf, sizeof buf,                      "%s: the planes add up to %llu B but the tensor is %llu B (codes %llu, scales %llu, "                      "offsets %llu) - what the loader recorded is not the layout that was loaded",                      name.c_str(), (unsigned long long) end, (unsigned long long) r.bytes,                      (unsigned long long) r.codes_bytes, (unsigned long long) r.scales_bytes,                      (unsigned long long) r.offset_bytes);        err = buf;        return false;    }    if (r.has_offset != (r.offset_bytes != 0)) {        err = name + ": has_offset is " + std::to_string(r.has_offset ? 1 : 0) + " but the offset plane is " +              std::to_string(r.offset_bytes) + " B";        return false;    }    const uint8_t* base = (const uint8_t*) r.data;    out.codes = base;    out.scales = (const float*) (base + r.codes_bytes);    out.offset = r.offset_bytes ? (const float*) (base + r.codes_bytes + r.scales_bytes) : nullptr;    return true;}
 constexpr int TPR = 32;
 bool native_bf16_projections = false;
-bool native_flash_attn_short = false;
 
 void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weights, float* out,
                   int64_t n_in, int64_t n_out, bool split, void* stream) {
@@ -177,10 +175,8 @@ if (w.has_offset || p.offset != nullptr) {            err = name + ": an S2 form
 if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);        return true;    }    s_gemv_q8k_split(xq8k, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);    return true;}}
 // namespace
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
-void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
-namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false; }
+namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
-void qsa_set_kv_int8_rotate(bool enabled) { g_kv_int8_rot = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
 void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
 bool qsa_kv_q4() { return g_kv_q4; }
@@ -483,7 +479,7 @@ bool layer_verify_compatible(std::string& why) {
     if (!native_bf16_projections) why = "the native BF16 projections are off";
     else if (!g_fused_gr) why = "the fused hyper-connection read is off";
     else if (!g_fused_gdn || !strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
-    else if (!g_fast_attn || native_flash_attn_short) why = "the split-K decode attention is off";
+    else if (!g_fast_attn) why = "the split-K decode attention is off";
     else if (!g_fast_select) why = "the block top-k selection is off";
     else if (!strata::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
     else return true;
@@ -524,7 +520,7 @@ uint64_t g_kv_host_bytes = 0;
 // under_wddm() does (/dev/dxg, the device its GPU goes through to the Windows driver), the copy is anonymous memory
 // registered Portable|Mapped before any page is touched, which also leaves WSL's small cudaHostAlloc budget to the
 // staging buffers. Elsewhere cudaHostAlloc stays first. Either way the other method is the fallback when the first
-// is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first. Like the cudaHostAlloc
+// is refused. Like the cudaHostAlloc
 // copy it lives as long as the process.
 uint8_t* kv_host_alloc(uint64_t bytes) {
     auto host_alloc = [](uint64_t n) -> uint8_t* {
@@ -534,8 +530,6 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
         return nullptr;
     };
     static const bool register_first = [] {
-        const char* e = std::getenv("STRATA_KV_HOST_REGISTER");
-        if (e != nullptr && (e[0] == '0' || e[0] == '1')) return e[0] == '1';
         return std::filesystem::exists("/dev/dxg");
     }();
     auto register_anon = [](uint64_t n) -> uint8_t* {
@@ -745,7 +739,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_int8 = false;
         st.kv_q4 = false;
     }
-    st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
+    st.kv_rot = st.kv_q4;   // K8V4 rotates only V (below)
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
@@ -1177,7 +1171,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
-    if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
+    if (g_fast_attn && dump == nullptr) {
         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
         strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
     } else {
@@ -1190,20 +1184,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     else if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
     else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
     else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
-    if (native_flash_attn_short) {
-    if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
-        err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
-        return false;
-    }
-    try {
-        native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
-            (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
-    } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
-    if (cudaMemcpyAsync(st.host_step + kStepCount, st.attention_status, sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
-        err = v.name("native_flash_attn") + ": status readback failed"; return false;
-    }
-} else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
+    qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
@@ -1452,12 +1433,12 @@ st_begin(layer, 0, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
-        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1);
-        fa.w_up = NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1); fa.s_down = w_down[0]->q8_scale; fa.s_up = w_up[0]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[0]->data;
+        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = (const uint16_t*) w_down[0]->data;
+        fa.w_up = (const uint16_t*) w_up[0]->data; fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    if (w_down[0]->q8_scale || w_up[0]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[0]->data, NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1), (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    gr_read(R, (const float*) w_norm[0]->data, (const uint16_t*) w_down[0]->data,            (const uint16_t*) w_up[0]->data, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
@@ -1475,12 +1456,12 @@ st_begin(layer, 3, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
-        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1);
-        fa.w_up = NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1); fa.s_down = w_down[1]->q8_scale; fa.s_up = w_up[1]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[1]->data;
+        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = (const uint16_t*) w_down[1]->data;
+        fa.w_up = (const uint16_t*) w_up[1]->data; fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    if (w_down[1]->q8_scale || w_up[1]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[1]->data, NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1), (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    gr_read(R, (const float*) w_norm[1]->data, (const uint16_t*) w_down[1]->data,            (const uint16_t*) w_up[1]->data, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 3, stream);        }
     if (run4) {

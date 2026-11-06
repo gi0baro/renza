@@ -40,7 +40,6 @@ namespace {
 
 constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
-bool fp32_activations = false;
 bool native_mmvf = false;
 
 /// The bf16 conversions live in `strata/kernels/bf16_bits.hpp`, and this file used to carry its own copies.
@@ -51,9 +50,7 @@ bool native_mmvf = false;
 /// The local names are kept as thin wrappers so the body below is untouched by the swap.
 __device__ __forceinline__ uint16_t f32_to_bf16_bits(float f) { return bf16_from_f32(f); }
 __device__ __forceinline__ float bf16_bits_to_f32(uint16_t h) { return f32_from_bf16(h); }
-__device__ __forceinline__ float activation_f32(float x) { return x; }
 __device__ __forceinline__ float activation_f32(uint16_t x) { return bf16_bits_to_f32(x); }
-__device__ __forceinline__ void store_activation(float* dst, int i, float x) { dst[i] = x; }
 __device__ __forceinline__ void store_activation(uint16_t* dst, int i, float x) {
     dst[i] = f32_to_bf16_bits(x);
 }
@@ -298,7 +295,6 @@ __global__ void gr_write_kernel(const float* __restrict__ R, const float* __rest
 
 }  // namespace
 
-void gr_set_fp32_activations(bool enabled) { fp32_activations = enabled; }
 void gr_set_native_mmvf(bool enabled) { native_mmvf = enabled; }
 bool gr_native_mmvf_enabled() { return native_mmvf; }
 
@@ -361,7 +357,6 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
 
     // One setting selects every projection in this call. Captured graphs retain these kernel variants.
     const bool use_native = native_mmvf;
-    const bool use_fp32 = fp32_activations || use_native;
     if (use_native) {
         if ((hc_dim & 1) != 0 || (hc_lr & 1) != 0)
             throw std::invalid_argument("gr_read native MMVF requires even hc*n_embd and hc_lr");
@@ -372,11 +367,6 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
         // The existing null-injection contract identifies the final mixer.
         // Pinned qwen4exp uses fused HC pre for layers and the unfused graph for il=-1.
         native_gr_pre_gated(ws.xn, ws.gated, mixed, n_embd, hc, w_inject != nullptr, stream);
-    } else if (use_fp32) {
-        gr_norm_kernel<true><<<hc, THREADS, 0, st>>>(R, w_norm, eps, n_embd, ws.xn, ws.xq);
-        gr_down_kernel<float><<<hc_lr, THREADS, 0, st>>>(ws.xn, w_down, hc_dim, hc_lr, hc, ws.lo);
-        gr_gate_kernel<float><<<(hc_dim + WARPS - 1) / WARPS, THREADS, 0, st>>>(
-            ws.lo, w_up, ws.xn, hc_dim, hc_lr, ws.gated);
     } else {
         gr_norm_kernel<false><<<hc, THREADS, 0, st>>>(R, w_norm, eps, n_embd, ws.xn, ws.xq);
         gr_down_kernel<uint16_t><<<hc_lr, THREADS, 0, st>>>(ws.xq, w_down, hc_dim, hc_lr, hc, ws.lq);
@@ -391,8 +381,6 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
         const int nthreads = 32 * hc;
         if (use_native)
             bf16_gemv_fp32_mmvf(ws.xn, w_inject, inject, hc_dim, hc, stream);
-        else if (use_fp32)
-            gr_inject_kernel<float><<<1, nthreads, 0, st>>>(ws.xn, w_inject, hc_dim, hc, inject);
         else
             gr_inject_kernel<uint16_t><<<1, nthreads, 0, st>>>(ws.xq, w_inject, hc_dim, hc, inject);
     }

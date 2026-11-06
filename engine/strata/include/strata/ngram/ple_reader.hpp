@@ -36,7 +36,6 @@ struct ReaderStats {
     double wait_us = 0;           ///< time `collect` spent blocked
     double submit_us = 0;         ///< time spent inside the read submission call (non-zero = it blocks)
     double read_us_sum = 0;       ///< sum of per-read latencies (issue to completion)
-    uint64_t late_injected = 0;   ///< reads delayed by fault injection
     uint64_t keepalive_reads = 0; ///< pages read only to keep the SSD awake (not in `reads`, `bytes` or latencies)
     double keepalive_us_max = 0;  ///< the slowest of them
     std::vector<float> read_us;   ///< last <= 65,536 read latencies, for percentiles
@@ -79,10 +78,6 @@ public:
     /// decode happens after a few rounds whose rows all came from the row cache. 0 turns it off (the reader's
     /// default; generate turns it on, see STRATA_SSD_KEEPALIVE). A keep-alive read that fails turns it off.
     void set_keepalive(double period_ms, double window_s);
-
-    /// Fault injection for tests and for the plan's P2 exit check: every read completes no earlier than
-    /// `delay_us` after it was issued. 0 disables.
-    void set_injected_delay_us(double delay_us);
 
     /// Read with no ticket in flight (the worker updates these while reads are outstanding; with the keep-alive
     /// on it may also be counting a keep-alive read - `snapshot` takes a consistent copy).

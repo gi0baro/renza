@@ -44,17 +44,7 @@ size_t device_free_bytes() {
             while (std::fgets(line, sizeof line, m))
                 if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
             std::fclose(m);
-            // STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
-            static const long gib = [] {
-                const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
-                if (h == nullptr) return 6L;
-                char* end = nullptr;
-                const long v = std::strtol(h, &end, 10);
-                if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
-                std::fprintf(stderr, "strata: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
-                return 6L;
-            }();
-            const unsigned long long head = (unsigned long long) gib << 30;
+            const unsigned long long head = 6ull << 30;
             const unsigned long long avail = kb << 10;
             if (avail > head && avail - head > free_b) free_b = (size_t) (avail - head);
         }
@@ -498,15 +488,6 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     blob_ = blob_bytes;
     next_free_ = 0;
     fills_ = 0;
-    admitted_ = 0;
-    // R4.2g: each layer starts at the bottom of its own range.  Built here rather than lazily so `admit`
-    // stays allocation-free on the token path.
-    layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
-    for (int64_t l = 0; l < n_layers; ++l) {
-        int64_t lo = 0, hi = 0;
-        layer_slot_range(l, lo, hi);
-        layer_next_[(size_t) l] = (int32_t) lo;
-    }
     return true;
 }
 
@@ -516,9 +497,8 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
     for (size_t i = 0; i < slot_bytes.size(); ++i) {
-        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it (and the
-        // STRATA_MMQ_DIRECT guard after each blob, 0 by default)
-        off[i + 1] = off[i] + (uint64_t) slot_stride(slot_bytes[i], guard_req_);
+        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it.
+        off[i + 1] = off[i] + (uint64_t) slot_stride(slot_bytes[i]);
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
@@ -527,21 +507,11 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     live_slots_ = slots_;
     blob_ = mx;
     off_ = std::move(off);
-    guard_ = guard_req_;
-    // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
-    // "slots", so its seeds are not slot indices
-    layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
-    for (int64_t l = 0; l < n_layers; ++l) {
-        int64_t lo = 0, hi = 0;
-        layer_slot_range(l, lo, hi);
-        layer_next_[(size_t) l] = (int32_t) lo;
-    }
     return true;
 }
 
 void ExpertCache::close() {
     off_.clear();
-    guard_ = 0;
     if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {
@@ -559,19 +529,6 @@ void ExpertCache::close() {
     blob_ = 0;
     next_free_ = 0;
     fills_ = 0;
-    admitted_ = 0;
-    layer_next_.clear();
-}
-
-/// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
-/// left over, so the ranges always cover `0..slots_` exactly and no slot is orphaned by the division.
-void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const {
-    lo = 0;
-    hi = 0;
-    if (n_layers_ <= 0 || slots_ <= 0 || layer < 0 || layer >= n_layers_) return;
-    const int64_t q = slots_ / n_layers_;
-    lo = layer * q;
-    hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
 }
 
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
@@ -583,17 +540,6 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);
     if (residency_[at] != kNotResident) return residency_[at];
-    // R4.2g: THE PER-LAYER PATH.  Same "no eviction" rule, but the ceiling is this layer's own range rather
-    // than one counter shared by all 48 - which is what confined the measured hit rate to 2.97%.
-    if (per_layer_) {
-        if (layer_next_.empty()) return kNotResident;
-        int64_t lo = 0, hi = 0;
-        layer_slot_range(layer, lo, hi);
-        if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
-        residency_[at] = layer_next_[(size_t) layer]++;
-        ++admitted_;
-        return residency_[at];
-    }
     if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
@@ -665,30 +611,6 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
         return false;
-    }
-    ++fills_;
-    return true;
-}
-
-bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err) {
-    uint8_t* dst = device_slot(slot);
-    if (dst == nullptr || parts == nullptr || n <= 0) {
-        err = "ExpertCache::fill_slot_queued_parts: slot outside the arena or no pieces";
-        return false;
-    }
-    uint64_t total = 0;
-    for (int i = 0; i < n; ++i) total += parts[i].n;
-    if (total > (uint64_t) blob_) {
-        err = "ExpertCache::fill_slot_queued_parts: the pieces are larger than a slot";
-        return false;
-    }
-    for (int i = 0; i < n; ++i) {
-        const cudaError_t e = cudaMemcpyAsync(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, cudaMemcpyHostToDevice,
-                                              (cudaStream_t) 0);
-        if (e != cudaSuccess) {
-            err = std::string("ExpertCache::fill_slot_queued_parts: ") + cudaGetErrorString(e);
-            return false;
-        }
     }
     ++fills_;
     return true;

@@ -24,14 +24,8 @@
 
 namespace strata::kernels {
 
-/// Select the activation precision for subsequent gr_read launches (default: false/BF16).
-/// Configure before creating/capturing a session, and do not mutate concurrently with gr_read.
-/// A captured graph retains the kernel variants chosen at capture; changing this flag cannot alter it.
-/// This changes activation precision only; the existing FP32 reduction trees remain unchanged.
-void gr_set_fp32_activations(bool enabled);
-
 /// Select pinned single-token BF16/F32 MMVF projections for subsequent gr_read launches (default false).
-/// This implies FP32 activations regardless of gr_set_fp32_activations. Configure before session capture;
+/// Configure before session capture;
 /// a captured graph retains its selected kernels. Requires even hc*n_embd and hc_lr, as MMVF reads pairs.
 /// This also selects pinned weighted F32 RMSNorm and nonlinear/combine arithmetic.
 /// Layer reads use fused HC pre; the final mixer (null w_inject) retains its unfused graph order.
@@ -90,7 +84,6 @@ inline size_t gr_workspace_bytes(const GrShapes& s) { GrWorkspace w; return gr_w
 ///
 /// `lo = silu((bf16(xn) @ w_down.T) / hc)` - the division by hc is INSIDE the silu, which is easy to read
 /// past and changes the result materially.
-/// With gr_set_fp32_activations(true), replace bf16(xn) and bf16(lo) by xn and lo respectively.
 ///
 /// **NO PERMUTATION: both matrices are taken exactly as the manifest stores them**, so the loader does nothing
 /// to them.  Both are coalesced because each projection assigns ONE WARP PER OUTPUT ROW and strides the

@@ -521,7 +521,6 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     return true;
 }
 
-void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
 
 std::string PleTable::io_report() const {
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};

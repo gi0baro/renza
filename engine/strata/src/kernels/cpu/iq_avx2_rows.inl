@@ -38,46 +38,6 @@ STRATA_ROWS_FN inline float ggml_hsum8(__m256 x) {
 template <int NT, bool GGML = false> STRATA_ROWS_FN
 inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res);
 
-template <int TY> STRATA_ROWS_FN
-inline float row_dot_ggml_one(const uint8_t* row, int nblocks, const block_q8_K* y) {
-    if constexpr (TY == 17) {
-        const block_q8_K* act[1] = {y};
-        float result = 0.0f;
-        row_dot_iq2xs<1, true>(row, nblocks, act, &result);
-        return result;
-    }
-    __m256 accum = _mm256_setzero_ps();
-    const int pf = prefetch_distance();
-    for (int i = 0; i < nblocks; ++i) {
-        const uint8_t* blk = row + (size_t) i * Fmt32<TY>::bytes;
-        rows_ahead(blk, pf);
-        __m256i sums[2] = {_mm256_setzero_si256(), _mm256_setzero_si256()};
-        for (int j = 0; j < 4; ++j)
-            for (int half = 0; half < 2; ++half) {
-                __m256i g, sign, scale;
-                Fmt32<TY>::decode(blk, j, half, g, sign, scale);
-                const __m256i act = _mm256_loadu_si256((const __m256i*) (y[i].qs + 64 * j + 32 * half));
-                const __m256i signed_act = _mm256_sign_epi8(act, sign);
-                sums[half] = madd_add(sums[half], _mm256_maddubs_epi16(g, signed_act), scale);
-            }
-        const float d = h2f(u16(blk)) * y[i].d;
-        accum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sums[0], sums[1])), accum);
-    }
-    if constexpr (TY == 16 || TY == 17 || TY == 22 || TY == 122) return 0.125f * ggml_hsum8(accum);
-    else if constexpr (TY == 18 || TY == 118) return 0.25f * ggml_hsum8(accum);
-    else return ggml_hsum8(accum);
-}
-
-template <int TY> STRATA_ROWS_FN
-void gu_ggml_one(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const block_q8_K* y, float* ff,
-                 int r0, int r1) {
-    for (int r = r0; r < r1; ++r) {
-        const float g = row_dot_ggml_one<TY>(blob + (size_t) r * gu_row, n / QK_K, y);
-        const float u = row_dot_ggml_one<TY>(blob + up_off + (size_t) r * gu_row, n / QK_K, y);
-        ff[r] = (g / (1.f + std::exp(-g))) * u;
-    }
-}
-
 template <int TY, int NT> STRATA_ROWS_FN
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     const int pf = prefetch_distance();

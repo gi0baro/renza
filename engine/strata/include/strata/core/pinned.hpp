@@ -47,25 +47,7 @@ struct PinnedArena {
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
-    /// `shared_file`: on Linux, use a file-backed MAP_SHARED mapping instead of anonymous memory.
-    /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
-    /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
-    /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
-    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
-                const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
-    /// Pin by need (STRATA_PIN_BY_NEED=1): register only the given byte ranges (offset, length), in the given order
-    /// (the caller's priority: the hottest experts the GPU does not hold first), each rounded out to 4 KiB pages and
-    /// trimmed against the ranges already registered; stops at the first refusal of the driver (the WDDM budget is
-    /// not raisable: we choose WHAT to pin), or when `max_pinned_bytes` (or STRATA_ARENA_PIN_GIB) would be passed.
-    /// Everything not registered - the holes - is locked resident instead.  Registered before any page is touched,
-    /// as the other constructors do.  `registered_bytes` is then the TOTAL registered, not a prefix: use
-    /// `pin_ranges`.
-    struct ByNeed {};
-    PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
-                uint64_t max_pinned_bytes = 0, const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
-    bool by_need = false;
-    std::vector<std::pair<uint64_t, uint64_t>> pin_ranges;    ///< registered (offset, length), sorted by offset, page-rounded
-    std::vector<std::pair<uint64_t, uint64_t>> locked_ranges; ///< the holes locked resident (offset, length)
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0);
     /// #285: reserve only; the caller registers the slices with register_slices(), on a thread, while its readers
     /// fill the ones already registered (one registration of the whole arena cost ~2.5 s at 33 GiB of 4 KB pages).
     struct Deferred {};

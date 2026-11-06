@@ -171,8 +171,6 @@ int main() {
         check(u64(40) == 0 && u64(48) == 0, "golden: reserved fields are zero");
         check(std::memcmp(g.data() + g.size() - 8, "STRSEND\x01", 8) == 0, "golden: end marker");
         const uint64_t h = session_hash64(g.data(), g.size(), 0);
-        const char* golden = std::getenv("STRATA_SESSION_GOLDEN_PRINT");
-        if (golden) std::printf("golden size %zu hash %016llx\n", g.size(), (unsigned long long)h);
         check(g.size() == kGoldenSize && h == kGoldenHash, "golden: the fixed sample's file bytes are unchanged");
     }
     check(written == fs::file_size(good), "write reports the file size");

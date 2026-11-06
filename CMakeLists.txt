@@ -30,7 +30,7 @@ add_subdirectory(engine/strata engine/strata EXCLUDE_FROM_ALL)
 
 # Strata's CPU tests renza runs; their executables are EXCLUDE_FROM_ALL: a setup test builds them first.
 set(strata_cpu_tests
-    message_boundary_test conv_cache_test draft_kv_plan_test
+    conv_cache_test draft_kv_plan_test
     suffix_drafter_test controller_test draft_policy_test
     coupled_draft_test spec_prob_test conversation_cache_test
     conversation_memory_test conversation_file_test session_save_reclaim_test

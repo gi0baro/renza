@@ -75,11 +75,8 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 /// Free device memory for the expert cache.  On a unified memory system - one memory for the CPU and the GPU, such as
 /// the DGX Spark (GB10); CUDA reports it as cudaDevAttrIntegrated - cudaMemGetInfo counts only MemFree, not the page cache - which, with the experts read from the GGUF in place, is mostly those
 /// files' clean pages and gives way to a device allocation.  There the figure is MemAvailable less 6 GiB for the OS
-/// and the engine's host side (STRATA_UMA_HEADROOM_GIB).  Elsewhere it is cudaMemGetInfo's.
+/// and the engine's host side.  Elsewhere it is cudaMemGetInfo's.
 size_t device_free_bytes();
-
-/// One piece of an expert blob that lives contiguously in a source's own memory: `n` bytes at `p`, to land `at` bytes into the blob.
-struct BlobPart { const uint8_t* p; uint64_t n; uint64_t at; };
 
 class ExpertCache {
 public:
@@ -108,7 +105,7 @@ public:
     int64_t full_slots() const { return slots_; }
     /// Slots actually claimed.  Not the same as `slots()` - the cache does not evict, so a run that routes
     /// fewer distinct experts than there are slots leaves the rest empty.
-    int64_t resident() const { return per_layer_ ? admitted_ : next_free_; }
+    int64_t resident() const { return next_free_; }
     /// The bytes of `slots()` (all of the arena unless shrunk); `full_bytes()`: of every slot.
     int64_t bytes() const { return slot_end(live_slots_); }
     int64_t full_bytes() const { return slot_end(slots_); }
@@ -122,16 +119,7 @@ public:
     /// always.  CUDA only: a HIP build refuses it at open.  The slots past `slots()` after a shrink must hold no
     /// resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
-    /// STRATA_MMQ_DIRECT: `open_sized` leaves at least `g` bytes of room after each slot's blob (the prompt MMQ
-    /// reads a little past a down matrix when it reads an expert in its slot).  Set before opening, like
-    /// `set_segment_bytes`; `close` keeps it.  0 (the default): no guard.  The uniform `open` ignores it, and so does
-    /// the SYCL engine's open_sized (its slots then have no guard, and `slot_tail` finds no room).
-    void set_slot_guard(int64_t g) { guard_req_ = g > 0 ? g : 0; }
-    /// The guard the open slots were laid out with: what `open_sized` applied (0 for uniform slots, when closed, and
-    /// on SYCL, whose open_sized applies none).
-    int64_t slot_guard() const { return guard_; }
-    /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.
-    static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
+    static int64_t slot_stride(int64_t blob) { return (blob + 255) / 256 * 256; }
     bool segmented() const { return !segs_.empty(); }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
@@ -166,25 +154,6 @@ public:
 
     /// **R4.2g: GIVE EACH LAYER ITS OWN SLOTS.  ROUND 328 MEASURED WHY THE GLOBAL FORM CANNOT WORK.**
     ///
-    /// `admit`'s original policy hands out slots in ARRIVAL ORDER from one counter shared by every layer
-    /// (`if (next_free_ >= slots_) return kNotResident;`).  A position looks at 10 experts in each of 48
-    /// layers, so the first `n_slots` distinct (layer, expert) pairs are **about 26 layers of POSITION 0** -
-    /// the cache fills entirely inside the first position it ever sees and never changes again, so hits are
-    /// confined to those few layers for the rest of the run.
-    ///
-    /// Measured, `--expert-cache 256`: **1781 of 60000 = 2.97%**.  `Memory/cache_allocation.py` scores the
-    /// same run's routing and says **8 slots per layer is worth 21.4%** and 64 is worth **70.4%**.  The cache
-    /// was never short of capacity - it was handing all of it to two layers.
-    ///
-    /// With this on, layer `l` may only use slots `[l*q, (l+1)*q)` where `q = slots()/n_layers`, the last
-    /// layer taking the remainder.  **EVICTION IS STILL ABSENT** - the property the comment above calls
-    /// deliberate is preserved exactly; only WHICH slot a layer may take changes.  Default off, so every
-    /// caller that predates this flag is bit-for-bit unaffected.
-    void set_per_layer_admission(bool on) { per_layer_ = on; }
-    bool per_layer_admission() const { return per_layer_; }
-    /// The slot range layer `l` may admit into under per-layer admission.  Exposed so a test can check it.
-    void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
-
     /// The device address of one slot.
     uint8_t* device_slot(int32_t slot);
     const uint8_t* device_slot(int32_t slot) const;
@@ -204,9 +173,6 @@ public:
     /// perf-review D-4: `fill_slot_blocking`'s copy on the same (legacy) stream, but queued: many slots are refilled
     /// with one `sync_queued` at the end instead of a wait per slot. Same ordering against earlier work, same bytes.
     bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
-    /// `fill_slot_queued` for a blob that is not in one piece: each `parts[i].n` bytes at `parts[i].p` go to byte `parts[i].at`
-    /// of the slot (the pieces tile the blob).  Same queue, same `sync_queued`.
-    bool fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err);
     bool sync_queued(std::string& err);
 
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS
@@ -234,8 +200,6 @@ private:
     uint8_t* base_ = nullptr;
     int64_t live_slots_ = 0;            ///< #533: slots() - all of them unless shrunk
     int64_t seg_req_ = 0;               ///< #533: the segment size asked for (0: one cudaMalloc)
-    int64_t guard_req_ = 0;             ///< STRATA_MMQ_DIRECT: bytes kept after each sized slot's blob (set_slot_guard)
-    int64_t guard_ = 0;                 ///< ...the guard open_sized applied to the open slots (0: none)
     int64_t seg_ = 0;                   ///< #533: the segment size used (a multiple of the driver's granularity)
     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
     std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
@@ -249,12 +213,7 @@ private:
     int64_t blob_ = 0;
     int64_t next_free_ = 0;
     int64_t fills_ = 0;
-    /// R4.2g.  `per_layer_` off (the default) leaves `next_free_` as the only admission counter, so the
-    /// pre-existing path is untouched.
-    bool per_layer_ = false;
-    std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
-    int64_t admitted_ = 0;
 };
 
 }  // namespace strata::core

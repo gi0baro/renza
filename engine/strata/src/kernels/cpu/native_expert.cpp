@@ -111,16 +111,7 @@ int native_gu_mt_min(int gu_type) {
     // kernels for every group: output independent of the drafting, at a measured -1..-3% decode on IQ3_S (AVX-512).
     static const char* env = std::getenv("STRATA_IQ_MT_MIN");
     static const int mt_min = env ? std::atoi(env) : 2;
-    // IQ3_S where the AVX-2 kernel gathers its grid (cpu_gather_fast, unless STRATA_IQ256_GATHER=0) on a CPU without
-    // AVX-512: there that kernel beats ggml's dot for ONE token too (14900KF P-core, an expert's gate/up rows: 0.34 ->
-    // 0.19 ms; its E-cores, which keep the scalar decode: 0.71 -> 0.68), and in decode most CPU experts serve one token
-    // of the window.  So IQ3_S takes it for every group, and those rows no longer depend on the drafting.  A machine-
-    // wide rule, not a per-core one: every core rounds an expert the same.  Every probe here is in expert_layout.cpp
-    // and cpu_avx2_ok() comes first, so no AVX2 code runs before the check.  STRATA_IQ_MT_MIN set keeps its rule.
-    // Opt-in (STRATA_IQ3S_MT1=1): it changes a lone token's IQ3_S rounding on those CPUs, so the default stays 0.1.39's.
-    static const bool iq3s_one = env == nullptr && std::getenv("STRATA_IQ3S_MT1") != nullptr && cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr &&
-                                 !cpu_avx512_ok() && iq256_gather_setting() != 0 && cpu_gather_fast();
-    return iq3s_one && gu_type == 21 ? 1 : mt_min;
+    return mt_min;
 }
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
@@ -139,22 +130,6 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // baseline the build selected (AVX1 here) and covers the same types - IQ2_XXS and IQ2_S among
     // them.  That path loops over tokens itself, so it is correct for any `nt`, not just one.
     static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
-    // The exact rows are ggml-cpu's AVX2 single-token dot bit for bit, so they need ggml-cpu itself built for AVX2 and
-    // not AVX-512 (ggml_cpu_has_*): a STRATA_ISA_FLOOR build runs ggml's AVX1/SSE dots, a native build on an AVX-512 CPU
-    // run with STRATA_FORCE_AVX2=1 runs its AVX-512 one, and both round differently (#2215's guard).
-    static const bool exact_one = [] {
-        const char* v = std::getenv("STRATA_CPU_IQ_ALL_EXACT1");
-        return v && v[0] == '1' && v[1] == 0 && ggml_cpu_has_avx2() && !ggml_cpu_has_avx512();
-    }();
-    // only where ggml's dot runs today (below the #152 multi-token rule): with STRATA_IQ_MT_MIN=1 a lone token keeps the
-    // multi-token kernel, so a token's rows still do not depend on how many tokens share its expert
-    if (exact_one && nt == 1 && nt < native_gu_mt_min(f.gu_type) && avx2 && !cpu_avx512_ok() &&
-        (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22)) {
-        static std::once_flag announced;
-        std::call_once(announced, [] { std::fprintf(stderr, "strata ab: GATE=STRATA_CPU_IQ_ALL_EXACT1 active=1\n"); });
-        iq256_gu_rows_exact_one(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
-        return;
-    }
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold

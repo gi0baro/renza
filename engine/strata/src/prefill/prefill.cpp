@@ -1400,23 +1400,9 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-               std::string& err, int64_t ldy = 0, void* stream = nullptr) {
+               std::string& err, int64_t ldy = 0, void* = nullptr) {
     if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
     const uint16_t* wb = (const uint16_t*) w->data;
-    if (w->q8_scale != nullptr) {
-        // STRATA_HC_REQ8: the GEMM takes bf16, so the int8 codes are expanded into one reused scratch on this stream
-        static uint16_t* scratch = nullptr;
-        static int64_t cap = 0;
-        if (w->elements > cap) {
-            if (scratch) cudaFree(scratch);
-            if (cudaMalloc((void**) &scratch, (size_t) w->elements * 2) != cudaSuccess) {
-                scratch = nullptr; cap = 0; err = "prefill: the STRATA_HC_REQ8 scratch"; return false;
-            }
-            cap = w->elements;
-        }
-        strata::kernels::hc_q8_to_bf16(w->data, w->q8_scale, scratch, (long long) w->elements, stream);
-        wb = scratch;
-    }
     gm.bf16(X, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f);
     return true;
 }
@@ -1864,15 +1850,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
-                // STRATA_HC_Q8 without a bf16 copy: this path's GEMMs read bf16, so the matrices are dequantized per half
-                core::WeightRef wd_q8, wu_q8;
-                if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
-                    wd_q8 = *wd; wu_q8 = *wu;
-                    wd_q8.data = core::NativeDense::hc_bf16_view(*wd, m.cs, 0, 0);
-                    wu_q8.data = core::NativeDense::hc_bf16_view(*wu, m.cs, 1, 0);
-                    if (!wd_q8.data || !wu_q8.data) { err = "prefill: the Q8_0 hyper-connection projections could not be dequantized"; return false; }
-                    wd = &wd_q8; wu = &wu_q8;
-                }
                 pt.mark(kPfHc, cs);
                 if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs);
                 normed = false;
@@ -1882,10 +1859,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.cs)) return false;
                 gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 
-                if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
-                    core::NativeDense::hc_bf16_release(m.cs, 0, 0);
-                    core::NativeDense::hc_bf16_release(m.cs, 1, 0);
-                }
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),

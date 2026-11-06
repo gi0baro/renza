@@ -53,13 +53,6 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
 /// it to the pagefile, copying it back runs at the drive's page-in speed (measured in the reports: ~190 hard faults
 /// a second, under 1 MB/s) and one memcpy of it stays silent past the 60 s limit, so the watchdog ended an engine
 /// that was only slow.  One beat per 1 MiB slice keeps a copy that moves alive and still lets a real stall show.
-/// STRATA_TEST_SLOW_COPY_US=N (tests only): every 1 MiB slice of a checkpoint copy takes N microseconds more, as when
-/// the OS has paged the checkpoints out and each slice is read back from the drive.  Unset: no delay.
-inline long test_slow_copy_us() {
-    static const long v = [] { const char* e = std::getenv("STRATA_TEST_SLOW_COPY_US"); return e ? std::atol(e) : 0L; }();
-    return v;
-}
-
 template<class T>
 inline std::vector<T> copy_beating(const std::vector<T>& src) {
     std::vector<T> out;
@@ -68,7 +61,6 @@ inline std::vector<T> copy_beating(const std::vector<T>& src) {
     for (size_t at = 0; at < src.size(); at += step) {
         out.insert(out.end(), src.begin() + (std::ptrdiff_t) at,
                    src.begin() + (std::ptrdiff_t) std::min(src.size(), at + step));
-        if (const long us = test_slow_copy_us(); us > 0) std::this_thread::sleep_for(std::chrono::microseconds(us));
         core::progress_beat();
     }
     return out;

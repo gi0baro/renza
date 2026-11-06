@@ -185,9 +185,6 @@ public:
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
 
-    /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
-    void set_injected_delay_us(double us);
-
     /// Maps the ORIGINAL second GGUF shard read-only.  The tensor's data does NOT start at file offset 0:
     /// the manifest's `shard2_tensor.offset` is relative to the GGUF's DATA SECTION, and the header before it
     /// is 192 bytes.  Reading at 0 would silently decode the header plus 192 bytes of shifted rows - still

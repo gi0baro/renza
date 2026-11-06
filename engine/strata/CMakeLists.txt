@@ -138,7 +138,6 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/native_qsa.cu
                           src/kernels/cuda/native_rope.cu
                           src/kernels/cuda/native_ple_postops.cu
-                          src/kernels/cuda/native_flash_attn.cu
                           src/kernels/cuda/native_qsa_indexer.cu
                           src/kernels/cuda/native_qsa_score.cu
                           src/kernels/cuda/ple.cu
@@ -172,7 +171,6 @@ if(STRATA_ENABLE_CUDA)
       src/kernels/cuda/native_qsa.cu
       src/kernels/cuda/native_rope.cu
       src/kernels/cuda/native_ple_postops.cu
-      src/kernels/cuda/native_flash_attn.cu
       src/kernels/cuda/native_qsa_indexer.cu
       src/kernels/cuda/native_qsa_score.cu
       PROPERTIES COMPILE_OPTIONS "--use_fast_math")
@@ -230,9 +228,6 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME draft_policy_test COMMAND draft_policy_test)
 endif()
 if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
-  add_executable(message_boundary_test src/program/message_boundary_test.cpp)
-  target_include_directories(message_boundary_test PRIVATE include)
-  add_test(NAME message_boundary_test COMMAND message_boundary_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)

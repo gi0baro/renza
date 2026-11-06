@@ -105,14 +105,12 @@ struct PleReader::Impl {
     uint8_t* slab = nullptr;              // max_inflight slots of 2 pages
     std::vector<uint32_t> free_slots;
     std::vector<Job> inflight;            // indexed by slot
-    std::vector<Completion> delayed;      // completed but held back by fault injection
     std::deque<Job> queue;                // not yet submitted
     std::unordered_map<uint32_t, TicketState> tickets;
     uint32_t next_ticket = 1;
     RowCache cache;
     ReaderStats stats;
     size_t ring_pos = 0;
-    double delay_us = 0;
     std::string error;
     // the keep-alive (`set_keepalive`), steady-clock microseconds; `keep_us` 0 = off
     double keep_us = 0;
@@ -129,7 +127,7 @@ struct PleReader::Impl {
     std::thread worker;
 
     uint8_t* slot_buf(uint32_t s) { return slab + (size_t) s * 2 * PAGE; }
-    bool busy() const { return free_slots.size() < max_inflight || !delayed.empty(); }
+    bool busy() const { return free_slots.size() < max_inflight; }
 
     void cancel_queued() {
         for (const Job& job : queue) {
@@ -250,7 +248,7 @@ struct PleReader::Impl {
         return error.empty() ? pump() : true;
     }
 
-    /// Completions (or wake packets) just returned by `file.wait`, applying fault injection.
+    /// Completions (or wake packets) just returned by `file.wait`.
     bool process(const Completion* got, int n) {
         bool ok = true;
         for (int i = 0; i < n; ++i) {
@@ -261,37 +259,14 @@ struct PleReader::Impl {
                 ok = false;
                 continue;
             }
-            if (delay_us > 0 && now_us() - inflight[(uint32_t) got[i].tag].issued_us < delay_us) {
-                delayed.push_back(got[i]);
-                ++stats.late_injected;
-                continue;
-            }
             if (!finish(got[i])) ok = false;   // drain the rest of this batch so no completed slot is stranded
         }
         return ok;
     }
 
-    bool release_delayed() {
-        const double now = now_us();
-        for (size_t i = 0; i < delayed.size();) {
-            if (now - inflight[(uint32_t) delayed[i].tag].issued_us >= delay_us) {
-                const Completion c = delayed[i];
-                delayed.erase(delayed.begin() + (ptrdiff_t) i);
-                if (!finish(c)) return false;
-            } else {
-                ++i;
-            }
-        }
-        return true;
-    }
-
     /// Caller-thread mode: process whatever has completed; blocks up to `timeout_ms` for the first completion.
     bool drain(int timeout_ms) {
         Completion got[64];
-        if (!delayed.empty()) {
-            if (!release_delayed()) return false;
-            timeout_ms = 0;                        // keep polling the held completions
-        }
         const int n = file.wait(got, 64, timeout_ms);
         return process(got, n);
     }
@@ -309,14 +284,13 @@ struct PleReader::Impl {
             }
             if (stop && !busy()) break;
             if (error.empty() && !pump() && error.empty()) error = "PleReader: submit failed";
-            if (!delayed.empty() && !release_delayed() && error.empty()) error = "PleReader: read failed";
             if (!error.empty()) {
                 cv_done.notify_all();
                 if (!busy()) { cv_work.wait(lk, [&] { return stop; }); break; }
             }
             if (!busy()) { cv_done.notify_all(); continue; }
             // Block in the port WITHOUT the lock, so `issue` can queue work; `issue` wakes us with a packet.
-            const int timeout = delayed.empty() ? -1 : 0;
+            const int timeout = -1;
             lk.unlock();
             Completion got[64];
             const int n = file.wait(got, 64, timeout);
@@ -406,7 +380,6 @@ void PleReader::close() {
     m.slab = nullptr;
     m.queue.clear();
     m.tickets.clear();
-    m.delayed.clear();
     m.inflight.clear();
     m.free_slots.clear();
     m.cache.init(0);
@@ -524,10 +497,6 @@ void PleReader::set_keepalive(double period_ms, double window_s) {
     m.cv_work.notify_all();
 }
 
-void PleReader::set_injected_delay_us(double delay_us) {
-    std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->delay_us = delay_us < 0 ? 0 : delay_us;
-}
 const ReaderStats& PleReader::stats() const { return impl_->stats; }
 ReaderStats PleReader::snapshot() const {
     Impl& m = *impl_;
