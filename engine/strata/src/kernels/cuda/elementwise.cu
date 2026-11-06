@@ -266,16 +266,6 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
                                                                                   width / 4, hit_rows, count);
 }
-void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* dst, const float* src, int64_t rows,
-                                 int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream) {
-    if (rows <= 0) return;
-    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
-        std::fprintf(stderr, "copy_rows_from_mapped_after: width must be a multiple of 4 and both pointers 16-byte aligned\n");
-        std::exit(1);
-    }
-    copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
-        (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, (const volatile uint32_t*) flag, value);
-}
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {

@@ -166,8 +166,6 @@ __global__ void __launch_bounds__(S) gdn_conv_ab_kernel(int conv_blocks, float* 
 
 // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
-// DBG (STRATA_DBG_GDN=1, #937): a window count the launch never allowed (n_keep is read from device memory; n_max is the
-// rows the window holds) is reported and the commit skipped, where the fault would be a memory-aperture violation
 __device__ __forceinline__ void gdn_step_commit_body(float* __restrict__ state, const float* __restrict__ hbuf, int C,
                                                      const float* __restrict__ gate, const float* __restrict__ beta,
                                                      int h_k, int h_v, int n);
@@ -181,11 +179,6 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
                                                                   const int32_t* __restrict__ n_keep, int n_max) {
     const int n = *n_keep;
     if (n <= 0) return;
-    if (DBG && n > n_max) {
-        if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0)
-            printf("strata DBG: gdn_step_commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n", n, n_max);
-        return;
-    }
     gdn_step_commit_body(state, hbuf, C, gate, beta, h_k, h_v, n);
 }
 
@@ -260,24 +253,7 @@ __device__ __forceinline__ void gdn_step_commit_body(float* __restrict__ state, 
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
 }
 
-// S26 (STRATA_QFUSE=1): the q8_1 image of a 32-column block, written by the warp that holds those columns with
-// native_quantize_q8_1_kernel's quantizer (the same XOR-tree max and sum, d = amax / 127, roundf(x / d), ds = (d, sum)).
 struct GdnQ81 { half2 ds; int8_t qs[32]; };
-__device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi) {
-    // no contraction: xi is a product here, and fma(a, b, shfl) would round the first sum unlike the separate
-    // quantizer, which reads xi from memory (S26 harness: ds.sum differed by 1 ulp without this)
-#pragma clang fp contract(off)
-    float amax = fabsf(xi), sum = xi;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    const float d = q8_1_finite(amax / 127.0f);   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit
-    const int8_t q = q8_1_quant(xi, d, amax);
-    xq[idx / 32].qs[idx % 32] = q;
-    if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
-}
-
 template <bool ALL_OUT, bool Q>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
@@ -368,184 +344,11 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             const float zz = z[(size_t) t * value_dim + head * S + col];
             const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
             y[(size_t) t * value_dim + head * S + col] = yv;
-            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
         }
     }
     if (!ALL_OUT && n_keep != nullptr && n > 0) {
 #pragma unroll
         for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
-    }
-}
-
-// S25 (STRATA_GDN_SPLIT=1): the same recurrence with each head's 128 state columns over 4 blocks of 32 columns
-// (128 threads: the same (column, row group) threads, each with the same 32 state rows), so 4x the blocks of
-// gdn_step_norm_multi_kernel - which ran one 512-thread block per head (32 blocks) and read the 2 MB state of a layer
-// at ~60 GB/s. Every column's arithmetic is the original's; the output norm, which needs all 128 columns of a head,
-// moves to gdn_out_norm_kernel: this kernel leaves the unnormalized output `oc` in y and the second kernel sums the
-// squares by the same warps (columns 32w..32w+31, the same butterfly) in the same order.
-// S26: OUT = false (the commit, whose outputs nobody reads) drops the output reduction and its two barriers; the
-// norm kernel below has the old kernel's code shape (S x RG threads, rg 0 holding oc), which makes it bitwise equal -
-// the 128-thread version differed from the old kernel by 1 ulp in ~7% of the outputs.
-constexpr int GS_COLS = 32;
-template<bool OUT>
-__global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __restrict__ state,
-                                                                      const float* __restrict__ hbuf, int C,
-                                                                      const float* __restrict__ gate,
-                                                                      const float* __restrict__ beta,
-                                                                      float* __restrict__ y, int h_k, int h_v, int T,
-                                                                      const int32_t* __restrict__ n_keep,
-                                                                      int t_out_begin) {
-    __shared__ float sk[S], sq[S];
-    __shared__ float red[RG][GS_COLS];
-    const int head = blockIdx.x;
-    const int c0 = blockIdx.y * GS_COLS;
-    const int lc = threadIdx.x;                 // local column
-    const int col = c0 + lc;
-    const int rg = threadIdx.y;
-    const int tid = rg * GS_COLS + lc;
-    const int qh = head % h_k;
-    const int qk = S * h_k;
-    const int value_dim = S * h_v;
-    const int n = n_keep ? *n_keep : T;
-    float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
-    const size_t row_stride = (size_t) h_v * S;
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
-    for (int t = 0; t < n; ++t) {
-        const float* ht = hbuf + (size_t) t * C;
-        __syncthreads();
-        if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
-        __syncthreads();
-        const float g = __expf(gate[(size_t) t * h_v + head]);
-        float kv = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][lc] = kv;
-        __syncthreads();
-        const float kv_col = red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc];
-        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
-        float o = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
-        }
-        if (!OUT) continue;
-        __syncthreads();
-        red[rg][lc] = o;
-        __syncthreads();
-        if (rg == 0 && t >= t_out_begin)
-            y[(size_t) t * value_dim + head * S + col] =
-                (red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc]) * rsqrtf((float) S);
-    }
-    if (n_keep != nullptr && n > 0) {
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
-    }
-}
-
-
-// S26: the state-only replay (the commit) with its per-token inputs prefetched - gate, beta and the v column of every
-// row up front, the next row's k / q while the current one computes. The arithmetic and its order are
-// gdn_step_split_kernel<false>'s (gfx1151 harness: state bitwise equal; 44.5 -> 39.1 us at 1 row, 47.4 -> 40.5 at 2,
-// 53.8 -> 42.9 at 4, h_v 48). With outputs the prefetch lost (register pressure), so the window keeps the plain split.
-template<int MAXT>
-__global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* __restrict__ state,
-                                                                        const float* __restrict__ hbuf, int C,
-                                                                        const float* __restrict__ gate,
-                                                                        const float* __restrict__ beta, int h_k,
-                                                                        int h_v, int T, const int32_t* __restrict__ n_keep) {
-    __shared__ float sk[S], sq[S];
-    __shared__ float red[RG][GS_COLS];
-    const int head = blockIdx.x;
-    const int c0 = blockIdx.y * GS_COLS;
-    const int lc = threadIdx.x;
-    const int col = c0 + lc;
-    const int rg = threadIdx.y;
-    const int tid = rg * GS_COLS + lc;
-    const int qh = head % h_k;
-    const int qk = S * h_k;
-    const int n = n_keep ? *n_keep : T;
-    float gv[MAXT], bv[MAXT], vv[MAXT];
-#pragma unroll
-    for (int t = 0; t < MAXT; ++t) {
-        if (t < n) {
-            gv[t] = gate[(size_t) t * h_v + head];
-            bv[t] = beta[(size_t) t * h_v + head];
-            vv[t] = hbuf[(size_t) t * C + 2 * qk + head * S + col];
-        }
-    }
-    float kn = 0.0f, qn = 0.0f;
-    if (n > 0) { kn = hbuf[qk + qh * S + tid]; qn = hbuf[qh * S + tid]; }
-    float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
-    const size_t row_stride = (size_t) h_v * S;
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
-#pragma unroll
-    for (int t = 0; t < MAXT; ++t) {
-        if (t >= n) break;
-        __syncthreads();
-        sk[tid] = kn; sq[tid] = qn;
-        __syncthreads();
-        if (t + 1 < n) {
-            const float* hn = hbuf + (size_t) (t + 1) * C;
-            kn = hn[qk + qh * S + tid]; qn = hn[qh * S + tid];
-        }
-        const float g = __expf(gv[t]);
-        float kv = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][lc] = kv;
-        __syncthreads();
-        const float kv_col = red[0][lc] + red[1][lc] + red[2][lc] + red[3][lc];
-        const float delta = (vv[t] - g * kv_col) * bv[t];
-        float o = 0.0f;   // unused: kept because the measured code had it (without it: 51 us instead of 39 at 1 row)
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
-        }
-        (void) o;
-    }
-    if (n_keep != nullptr && n > 0) {
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
-    }
-}
-// y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) per head and token: gdn_step_norm_multi_kernel's tail with its
-// code shape (S x RG threads; rg 0 holds oc, the other row groups contribute 0 to wsum), reading oc from y
-template<bool Q>
-__global__ void __launch_bounds__(S * RG) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
-                                                             float eps, float* __restrict__ y, int h_v, int T,
-                                                             const int32_t* __restrict__ n_keep, int t_out_begin,
-                                                             GdnQ81* __restrict__ xq) {
-    __shared__ float wsum[S * RG / 32];
-    const int head = blockIdx.x, t = blockIdx.y + t_out_begin, col = threadIdx.x, rg = threadIdx.y;
-    const int tid = rg * S + col;
-    const int n = n_keep ? *n_keep : T;
-    if (t >= n) return;
-    const int value_dim = S * h_v;
-    float oc = 0.0f, sq_part = 0.0f;
-    if (rg == 0) {
-        oc = y[(size_t) t * value_dim + head * S + col];
-        sq_part = oc * oc;
-    }
-    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
-    if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
-    __syncthreads();
-    if (rg == 0) {
-        const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-        const float scale = rsqrtf(ss / (float) S + eps);
-        const float zz = z[(size_t) t * value_dim + head * S + col];
-        if constexpr (Q) {
-            const float yv = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
-            y[(size_t) t * value_dim + head * S + col] = yv;
-            gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
-        } else {
-            y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
-        }
     }
 }
 
@@ -678,12 +481,6 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
     steps[i * 4 + 3] = c + 1;
 }
 
-// --pipeline-windows: the drafter's chain, teacher forced (see force_token)
-__global__ void force_token_kernel(int32_t* tok, const int32_t* force, int j) {
-    const int32_t f = ((const volatile int32_t*) force)[j];
-    if (f >= 0) *tok = f;
-}
-
 }  // namespace
 
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
@@ -739,11 +536,6 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
                                                             probs, out_p);
     check("mtp_select");
-}
-
-void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
-    force_token_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(tok, force, j);
-    check("force_token");
 }
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
@@ -1017,10 +809,8 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
     // the per-layer commit's kernel choice (gdn_step_norm_multi below): only its state-only kernel is batched here
     static const bool per_layer = [] {
-        const char* sp = std::getenv("STRATA_GDN_SPLIT");
         const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
-        const char* dbg = std::getenv("STRATA_DBG_GDN");
-        return (sp && sp[0] == '1') || (cs && cs[0] == '0') || (dbg && dbg[0] == '1');
+        return cs && cs[0] == '0';
     }();
     if (per_layer || n_layers <= 0 || n_layers > 65535 || n_max < 1 || n_max > kVerifyMaxT || n_keep == nullptr ||
         h_v <= 0 || h_k <= 0 || h_v % h_k != 0)
@@ -1057,52 +847,25 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out) {
-    GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);   // S26: non-null = also the outputs' q8_1 (STRATA_QFUSE)
+                         const int32_t* n_keep, void* stream, int t_out_begin) {
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
-    }
-    static const bool split = [] { const char* v = std::getenv("STRATA_GDN_SPLIT"); return v && v[0] == '1'; }();
-    // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows
-    // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case
-    if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
-        const dim3 grid((unsigned) h_v, S / GS_COLS), block(GS_COLS, RG);
-        if (t_out_begin >= n_tok) {   // no outputs (the commit): the state only
-            gdn_state_replay_kernel<kVerifyMaxT><<<grid, block, 0, (cudaStream_t) stream>>>(
-                state, h, conv_channels, gate, beta, h_k, h_v, n_tok, n_keep);
-        } else {
-            gdn_step_split_kernel<true><<<grid, block, 0, (cudaStream_t) stream>>>(
-                state, h, conv_channels, gate, beta, y, h_k, h_v, n_tok, n_keep, t_out_begin);
-            const dim3 ng((unsigned) h_v, (unsigned) (n_tok - t_out_begin));
-            if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq);
-            else gdn_out_norm_kernel<false><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, nullptr);
-        }
-        check("gdn_step_norm_multi (split)");
-        return;
     }
     static const bool commit_split = [] {
         const char* e = std::getenv("STRATA_GDN_COMMIT_SPLIT");
         return !e || e[0] != '0';
     }();
     if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
-        static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
-        if (dbg) gdn_step_commit_kernel<true><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
-            state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
-        else gdn_step_commit_kernel<false><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        gdn_step_commit_kernel<false><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
         check("gdn_step_commit");
         return;
     }
     const dim3 g1((unsigned) h_v), b1(S, RG);
     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
-    if (xq && t_out_begin < n_tok) {
-        if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
-        else gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq);
-    } else if (all_out) {
+    if (all_out) {
         gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr);
     } else {
@@ -1355,23 +1118,6 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
-namespace {
-__global__ void wait_copy_i32_kernel(const volatile uint32_t* flag, uint32_t value, int32_t* __restrict__ dst,
-                                     const volatile int32_t* src, int n) {
-    if (threadIdx.x == 0) {
-        while (*flag < value) strata_spin_pause();
-        __threadfence_system();
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
-}
-}  // namespace
-void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n,
-                               void* stream) {
-    wait_copy_i32_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(flag, value, dst, src, (int) n);
-    check("wait_copy_i32_from_mapped");
-}
-
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
@@ -1412,10 +1158,6 @@ __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     buf[i] = t;
 }
 }  // namespace
-namespace {
-__global__ void noop_kernel() {}
-}  // namespace
-void gpu_noop(void* stream) { noop_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(); }
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
@@ -1452,8 +1194,6 @@ bool pdl_supported() {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
     if (state[dev].load(std::memory_order_relaxed) == 0) {
-        static const bool env_on = [] { const char* v = std::getenv("STRATA_DF_PDL"); return v != nullptr && std::atoi(v) != 0; }();
-        (void) env_on;
         cudaGetLastError();
         state[dev].store(2, std::memory_order_relaxed);
     }

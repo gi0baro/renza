@@ -85,19 +85,6 @@ uint16_t half_bits(float f) {
     if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
     return (uint16_t) (sign | h);
 }
-std::vector<uint8_t> q8_0_of(const float* x, uint64_t n) {
-    std::vector<uint8_t> out((size_t) (n / 32 * 34));
-    for (uint64_t b = 0; b < n / 32; ++b) {
-        float amax = 0.0f;
-        for (int j = 0; j < 32; ++j) amax = (std::max)(amax, std::fabs(x[b * 32 + j]));
-        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
-        uint8_t* o = out.data() + b * 34;
-        const uint16_t hb = half_bits(d);
-        std::memcpy(o, &hb, 2);
-        for (int j = 0; j < 32; ++j) o[2 + j] = (uint8_t) (int8_t) std::lround(x[b * 32 + j] * id);
-    }
-    return out;
-}
 // A bf16 matrix (the pack file's values) as Q8_0, ggml's reference rounding; the blocks are independent, so a few threads
 std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
     std::vector<uint8_t> out((size_t) (n / 32 * 34));
@@ -347,11 +334,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
             if (hc_q8_env())
                 for (const auto& tensor : gguf.tensors()) {
-                    // S25: the F32 inject rows hold BF16-exact values: the read takes the pack's BF16 rows unless
-                    // STRATA_HC_Q8_INJECT=1 asks for a Q8_0 copy
-                    static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
-                    const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
-                    if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
+                    if (tensor.type != 8 || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
                     auto found = table.table_.find(tensor.name);
                     if (found == table.table_.end() || found->second.hc_q8 != nullptr) continue;
                     auto& ref = found->second;
@@ -360,10 +343,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     }
                     const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
                     void* p = nullptr;
-                    std::vector<uint8_t> q8;
-                    if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
                     if (cudaMalloc(&p, bytes) != cudaSuccess ||
-                        cudaMemcpy(p, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
+                        cudaMemcpy(p, gguf.tensor_data(tensor), bytes,
                                    cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }

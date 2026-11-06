@@ -398,7 +398,6 @@ struct Options {
     double spec_min_p = 0.0;
     /// The end-of-turn tokens a request stops at (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     std::vector<int64_t> eos_ids = {248044, 248046};
-    bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -443,9 +442,6 @@ struct Options {
     /// verify window (the window grows to at most 8).  Greedy verification keeps the output; its own counts are kept.
     int lookup_chain = 0;
     int lookup_chain_min = 3;   ///< --lookup-chain-min M: the shortest match (in tokens, drafts included) it extends on
-    /// --mtp-hnorm stream (opt-in): the draft layer's pre_fc_norm_hidden normalizes each hyper-connection stream on
-    /// its own (llama.cpp's qwen4exp MTP graph) instead of one RMS over all four (the default, tools/mtp_probe.py).
-    bool mtp_hnorm_stream = false;
     /// --mtp-q4 (opt-in): the draft layer's projections and draft head from 4-bit copies (fewer bytes per draft step)
     std::string mtp_q4;   ///< "" (off), all, proj (the projections only) or head (the draft head only)
     /// --mtp-draft-vocab FILE (opt-in): the draft head's token subset from FILE instead of <mtp>/draft_vocab.bin
@@ -549,8 +545,6 @@ void usage() {
                  "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
                  "                       them (the window grows to at most 8; default 0 = off)\n"
                  "  --lookup-chain-min M  the shortest context match --lookup-chain extends on (default 3)\n"
-                 "  --mtp-hnorm pooled|stream  the draft layer's hidden-input norm: one RMS over all four streams\n"
-                 "                       (default) or one per stream (llama.cpp's MTP graph)\n"
                  "  --mtp-q4 all|proj|head  opt-in: the draft layer's projections and/or draft head as 4-bit copies\n"
                  "  --mtp-draft-vocab FILE  opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
@@ -1779,7 +1773,6 @@ int EngineState::parse_options(int argc, char** argv) {
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
-        else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
@@ -1806,13 +1799,6 @@ int EngineState::parse_options(int argc, char** argv) {
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-chain") o.lookup_chain = std::clamp(std::atoi(next("--lookup-chain")), 0, 7);
         else if (a == "--lookup-chain-min") o.lookup_chain_min = std::max(3, std::atoi(next("--lookup-chain-min")));
-        else if (a == "--mtp-hnorm") {
-            const std::string v = next("--mtp-hnorm");
-            if (v != "pooled" && v != "stream") {
-                return fail(2, "strata generate: --mtp-hnorm takes pooled or stream\n");
-            }
-            o.mtp_hnorm_stream = v == "stream";
-        }
         else if (a == "--mtp-q4") {
             o.mtp_q4 = next("--mtp-q4");
             if (o.mtp_q4 != "all" && o.mtp_q4 != "proj" && o.mtp_q4 != "head") {
@@ -1820,7 +1806,6 @@ int EngineState::parse_options(int argc, char** argv) {
             }
         }
         else if (a == "--mtp-draft-vocab") o.mtp_draft_vocab = next("--mtp-draft-vocab");
-        else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
             std::string e;
             if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { return fail(2, "--eos-ids: %s\n", e.c_str()); }
@@ -2699,7 +2684,6 @@ int EngineState::start_up(int argc, char** argv) {
             o.mtp.clear();
         }
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        mtp.set_hnorm_per_stream(o.mtp_hnorm_stream);   // --mtp-hnorm stream (opt-in), before any capture
         mtp.set_q4(o.mtp_q4 == "all" || o.mtp_q4 == "proj", o.mtp_q4 == "all" || o.mtp_q4 == "head");   // before load
         if (!o.mtp_draft_vocab.empty()) mtp.set_draft_vocab(o.mtp_draft_vocab);
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
@@ -4407,19 +4391,6 @@ int EngineState::serve_setup() {
     if (cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess)
         return fail(1, "strata serve: the penalty-history allocation failed\n");
     vh.d_res = thits.d_res;
-    // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
-    // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
-    if (use_mtp && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
-        std::getenv("STRATA_ROUTE_RESIDENT_MTP") != nullptr && std::atoi(std::getenv("STRATA_ROUTE_RESIDENT_MTP")) != 0) {
-        const float margin = (float) std::atof(std::getenv("STRATA_ROUTE_RESIDENT"));
-        int lo = 6, hi = 9;
-        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &lo, &hi);
-        if (margin > 0.0f) {
-            mtp.set_route_resident(thits.d_res + (size_t) (g.n_layers - 1) * (size_t) g.n_expert, margin, lo, hi);
-            std::fprintf(stderr, "strata generate: STRATA_ROUTE_RESIDENT_MTP: the MTP draft's router is biased toward layer %lld's resident experts (margin %g, ranks %d-%d; experimental)\n",
-                         (long long) (g.n_layers - 1), margin, lo, hi);
-        }
-    }
     vh.h_res = host_res.empty() ? nullptr : host_res.data();
     vh.cache_base = thits.cache_base;
     vh.blob = thits.blob;
@@ -4433,7 +4404,6 @@ int EngineState::serve_setup() {
     win_pool_fn = &drive_pool_multi;
     win_pool_user = (void*) &drive;
     mem_mark("the verifier and the drafter's binding");
-    ver.set_split(o.spec_split);
     // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
     // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
     // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
@@ -4609,9 +4579,6 @@ int EngineState::serve_setup() {
             if (dkv.try_batched) batched = sp->draft_kv(mtp, R_rows, nxt.data(), T, p0, e, &why);
         }
         if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
-        if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
-            std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
-                         batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
         // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
         const int64_t done = p0 + T;
         pp_reached = done;

@@ -84,10 +84,6 @@ public:
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
-    /// #649 (STRATA_VERIFY_TRACE=1, opt-in): the last windows' host-side handshake events and the GPU's breadcrumbs
-    /// (in mapped memory, so they read while the GPU hangs).  Nothing when the trace is off.
-    void trace_dump(std::FILE* f) const;
-
     /// #267: raise every flag the window's spin kernels wait on past any ring (UINT32_MAX), so a window the GPU
     /// cannot finish drains instead of staying resident, then wait up to `timeout_ms` for its streams.  For the
     /// paths that give up on the engine (a timed-out window, the serve watchdog): the window then ran on whatever
@@ -196,9 +192,6 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
-    /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
-    /// of the other (default on).  Set before the first `run`.
-    void set_split(bool on) { split_ = on; }
     /// Plan v0.3 P6: how the PCIe share of the misses reaches the GPU: 0 = DMA into staging (the copy engine works
     /// beside the CPU; best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
@@ -249,7 +242,6 @@ private:
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
-    unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
     /// #871: the zero-doorbell graph plans from the device residency table alone, so it is only right while every
@@ -263,7 +255,6 @@ private:
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
-    unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
@@ -272,12 +263,6 @@ private:
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
-    // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
-    // per layer and token group, written to mapped memory (null when the trace is off)
-    void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;
-    unsigned long long* trace_h_ = nullptr;
-    unsigned long long* trace_m_ = nullptr;
-    size_t trace_n_ = 0;
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
@@ -301,21 +286,8 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
-    // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
-    // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
-    bool df_branch_ = false;
-    cudaStream_t df_side_[2] = {};
-    cudaEvent_t df_fork_ = nullptr;
-    cudaEvent_t df_join_[2] = {};
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
-    // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
-    // mixer's projections, joined before the recurrence / the attention
-    cudaStream_t side_ = nullptr;
-    cudaEvent_t mfork_ = nullptr, mjoin_ = nullptr;
-    // fork b063c13 (STRATA_SIDE_MIXER=2): a second branch for the GDN gate projection and the QSA queries' chain
-    cudaStream_t side2_ = nullptr;
-    cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
@@ -360,9 +332,7 @@ private:
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
-    bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
-    int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device

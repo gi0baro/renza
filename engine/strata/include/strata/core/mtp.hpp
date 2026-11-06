@@ -47,18 +47,8 @@ public:
               int64_t window = 32768, const MtpDrafter* shared = nullptr);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
-    /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
-    /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of 512 experts: slot or -1) as the
-    /// table.  nullptr switches it off.
-    void set_route_resident(const int32_t* res_row, float margin, int lo, int hi) {
-        rr_res_ = res_row; rr_margin_ = margin; rr_lo_ = lo; rr_hi_ = hi;
-    }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
-    /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
-    /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
-    void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
-    bool hnorm_per_stream() const { return hnorm_stream_; }
     /// --mtp-q4 (opt-in; before load): the draft layer's Q8_0 projections and its draft head run from 4-bit (Q4_0)
     /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
     /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
@@ -124,34 +114,7 @@ public:
     bool prob() const { return coupled_active_ && h_q_ != nullptr; }
     const int32_t* spec_q() const { return h_q_; }
 
-    // ---- --pipeline-windows 2: the chain as one asynchronous launch (the round and its steps back to back, no host
-    // wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of
-    // a window already in flight), each output read once the event after its step has completed.
-    /// Before `load`: the round/step graphs get the forcing kernel (a no-op while its token is -1), and the drafter's
-    /// stream the highest priority (STRATA_MTP_PRIORITY=0: the default priority).
-    void set_force_capture(bool on) { force_on_ = on; }
-    /// The rows the next round reads (null: the bound `window_R`), copied into the bound buffer before the round.
-    void set_source_R(const float* rows) { src_R_ = rows; }
-    /// Capture the round graphs for T = 1..max_t and every step graph now (a capture syncs the drafter's stream).
-    bool prepare_chain(std::string& err);
-    /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
-    /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
-    /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
-    bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
-                      int n_early, std::string& err);
-    /// 1: every output is in chain_tok()/chain_prob(); 0: still running; -1: an error.
-    int chain_poll(std::string& err);
-    /// How many of the chain's first outputs (up to `n_early`; all of them once the chain is done) have landed in
-    /// chain_tok()/chain_prob(); -1: an error.  A window's size is often decided by its first outputs (a draft below
-    /// spec_min_p ends it), so the next launch need not wait for all of them.
-    int chain_outputs_ready(std::string& err);
-    bool chain_live() const { return chain_live_; }
-    const int32_t* chain_tok() const { return chain_tok_; }
-    const float* chain_prob() const { return chain_prob_; }
-
     double ms_draft = 0, ms_prefill = 0;
-    double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
-    int64_t n_src = 0;
     int64_t rounds = 0;
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
@@ -176,7 +139,6 @@ private:
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
     bool record_rest(int step_row, cudaStream_t cs, std::string& err);
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
-    bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
@@ -206,7 +168,6 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
-    bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
     std::vector<std::pair<std::string, uint64_t>> q4_off_;
@@ -220,20 +181,9 @@ private:
     void record_top2(int j);
     std::vector<int32_t> top2_, dvocab_host_;
     std::vector<float> lg_host_;
-    // --pipeline-windows 2 (chain_launch)
-    bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
-    bool force_on_ = false, chain_live_ = false;
-    const float* src_R_ = nullptr;
-    int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
-    cudaEvent_t ev_chain_ = nullptr;
-    cudaEvent_t ev_step_[8] = {};                       ///< after each of the first n_early outputs
-    int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
-    int32_t chain_tok_[8] = {};
-    float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
@@ -266,9 +216,6 @@ private:
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
-    const int32_t* rr_res_ = nullptr;
-    float rr_margin_ = 0.0f;
-    int rr_lo_ = 6, rr_hi_ = 9;
     float* probs_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' and row_top_prob_split's partials and counters
     uint8_t* top_scratch_ = nullptr;

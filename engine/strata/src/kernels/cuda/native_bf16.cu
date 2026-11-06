@@ -144,9 +144,6 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
                                           int64_t ldy_aux = 0) {
     const int t = threadIdx.x;
     int o0 = blockIdx.x * RPB;
-    if constexpr (AUX) {
-        if (blockIdx.x == gridDim.x - 1) { w = w_aux; y = y_aux; ldy = ldy_aux; n_out = 1; o0 = 0; }
-    }
     __shared__ float partials[RPB][NT][32];
     if constexpr (BLOCK_SIZE > 32) {
         if (t < 32)
@@ -211,11 +208,6 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
     constexpr int RPB = 4;
     const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
-    if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
-        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux);
-        else bf16_f32_mmvf_rows_kernel<B, 8, RPB, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux);
-        return;
-    }
     if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
     else bf16_f32_mmvf_rows_kernel<B, 8, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
 }
@@ -234,32 +226,6 @@ int mmvf_block_size(int64_t n_in) {
 }
 
 }  // namespace
-
-bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                                   int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
-                                   int64_t ldy_aux, void* stream) {
-    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
-    // exactly the conditions under which both calls would take the rows / multi kernels at the same block size
-    if (!rows || n_out < 64 || n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || x == nullptr ||
-        w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
-        return false;
-    const cudaStream_t st = (cudaStream_t) stream;
-    const int ni = (int) n_in, no = (int) n_out;
-    switch (mmvf_block_size(n_in)) {
-        case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 64: launch_rows<64>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 96: launch_rows<96>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 128: launch_rows<128>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 160: launch_rows<160>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 192: launch_rows<192>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 224: launch_rows<224>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        default: launch_rows<256>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-    }
-    const cudaError_t result = cudaGetLastError();
-    if (result != cudaSuccess)
-        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi_aux launch: ") + cudaGetErrorString(result));
-    return true;
-}
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {

@@ -52,15 +52,7 @@ __global__ void combine(const float* __restrict__ parts, const float* __restrict
         if (ZADD) p = 0.0f + p;
         sum += p * weights[expert];
     }
-    if constexpr (GATED) {
-        // contraction off in this block only: the product is rounded on its own (scale_rows' store), then added
-#pragma clang fp contract(off)
-        const float g = __fdividef(1.0f, 1.0f + __expf(-sg[tk]));
-        const float sh = shared[col] * g;
-        sum += sh;
-    } else {
-        if (shared) sum += shared[col];
-    }
+    if (shared) sum += shared[col];
     output[col] = sum;
 }
 __global__ void combine_k10_vec4(const float4* __restrict__ parts4, const float* __restrict__ weights,
@@ -204,16 +196,6 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
         combine<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
             parts, weights, shared, output, n_embd, int(k));
     }
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-}
-void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,
-                                         const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
-                                         void* stream) {
-    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || !shared || !shared_gate)
-        throw std::invalid_argument("native MoE combine (hits, gated) requires a stream, width, 1..15 experts, tokens");
-    combine<true, true><<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-        hits, weights, shared, output, n_embd, int(k), shared_gate);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

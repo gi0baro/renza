@@ -49,7 +49,7 @@ struct GdnGroups {
 };
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+                         const int32_t* n_keep, void* stream, int t_out_begin = 0);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
@@ -59,25 +59,15 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream);
-/// (xq_out, S26 STRATA_QFUSE: also write the q8_1 image of output rows [t_out_begin, n_tok) there - the bytes
-/// native_quantize_q8_1(y + t_out_begin * value_dim, xq_out, value_dim, n_tok - t_out_begin) would write.)
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
-/// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
-/// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
-/// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).
-void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n,
-                               void* stream);
-
 /// wait_flag_ge, also writing the GPU's clock (ns, gpu_stamp's) as the kernel starts into *t_in and as it returns
 /// into *t_out (either may be null): the verify window's PCIe-share balance, at no extra launch.
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
                           void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
-/// an empty one-thread kernel (a graph node that does nothing: STRATA_DUMMY_NODES measures what a node costs in a window)
-void gpu_noop(void* stream);
 /// dst[r][0, w) = src[r][0, w) for `rows` rows of source stride `src_w` floats (the query half of each q/gate head
 /// pair): the strided device-to-device cudaMemcpy2DAsync as a kernel, so the window's chain stays kernel to kernel.
 /// w and src_w multiples of 4 floats, both pointers 16-byte aligned.
@@ -130,9 +120,6 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
                 float* out_p = nullptr);
-/// --pipeline-windows, the drafter's chain teacher forced: `*tok = force[j]` when force[j] >= 0 (`force` is mapped
-/// host memory, read when the kernel runs), else `*tok` is left as it is.
-void force_token(int32_t* tok, const int32_t* force, int j, void* stream);
 /// Row *row_dev of a, b and c (a_n, b_n, c_n floats a row) copied to their row 0 (the draft layer's rest runs on
 /// row 0).  Graph-capturable: the row is read on the device.
 void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, int64_t b_n, float* c, int64_t c_n,

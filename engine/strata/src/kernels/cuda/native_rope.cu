@@ -135,12 +135,7 @@ void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, con
 void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
 bool native_norm_rope_usable(int head_dim, int n_rot) {
-    static const bool on = [] {
-        const char* off = std::getenv("STRATA_NO_NORM_ROPE");
-        if (off != nullptr && off[0] != '\0' && off[0] != '0') return false;
-        return true;
-    }();
-    return on && (head_dim == 128 || head_dim == 256) && n_rot == 64;
+    return (head_dim == 128 || head_dim == 256) && n_rot == 64;
 }
 
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
