@@ -11,7 +11,10 @@
 #include "renza_vision.h"
 #include "strata/program/engine.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +39,19 @@ constexpr int kVisionStart = 248053;     // <|vision_start|>
 constexpr int kVisionEnd = 248054;       // <|vision_end|>
 const char kNoEncoder[] = "no vision encoder linked (the engine takes image rows; the encoder is unit 6)";
 const char kNoEngine[] = "a test checkpoint has no engine";
+
+// renza's part of a saved session, after Strata's session file: the history's last token when Strata had not read it
+// (a save right after a sync: Strata reads a prompt's last token in the first decode window)
+struct SavedTail {
+    char magic[8];
+    int32_t unread;   // 0 or 1
+    int32_t token;
+};
+constexpr char kSavedTailMagic[8] = {'R', 'E', 'N', 'Z', 'A', 'K', 'V', '1'};
+static_assert(sizeof(SavedTail) == 16);
+// Strata reads a session file by name: a load copies the saved bytes here first
+const char kLoadTemplate[] = "/tmp/renza-session-load.XXXXXX";
+constexpr size_t kCopyBlock = 1 << 20;
 
 struct OpenOutcome {
     int status = program::kExitOk;
@@ -118,6 +134,43 @@ int refuse_open(int status, const std::string& message, char* err, size_t errlen
     g_open = {status, false};
     set_err(err, errlen, message);
     return RENZA_ERROR;
+}
+
+bool append_tail(const char* path, const SavedTail& tail, std::string& why) {
+    std::FILE* f = std::fopen(path, "ab");
+    if (f == nullptr) {
+        why = std::strerror(errno);
+        return false;
+    }
+    bool ok = std::fwrite(&tail, sizeof tail, 1, f) == 1 && std::fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (!ok) why = std::strerror(errno);
+    if (std::fclose(f) != 0 && ok) {
+        why = std::strerror(errno);
+        ok = false;
+    }
+    return ok;
+}
+
+bool copy_to_fd(std::FILE* in, int fd, uint64_t n, std::string& why) {
+    std::vector<char> buf(kCopyBlock);
+    while (n > 0) {
+        const size_t want = (size_t) std::min<uint64_t>(n, buf.size());
+        if (std::fread(buf.data(), 1, want, in) != want) {
+            why = std::ferror(in) ? std::strerror(errno) : "the saved session is truncated";
+            return false;
+        }
+        for (size_t at = 0; at < want;) {
+            const ssize_t w = write(fd, buf.data() + at, want - at);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) {
+                why = std::strerror(errno);
+                return false;
+            }
+            at += (size_t) w;
+        }
+        n -= want;
+    }
+    return true;
 }
 
 }  // namespace
@@ -428,15 +481,18 @@ int renza_session_decode(renza_session* s, int token, const renza_sampling* samp
         return RENZA_ERROR;
     }
     int32_t fed = token;
-    if (token >= 0 && b->pending) {
-        // Strata reads a synced prompt's last token in the first decode window, which feeds nothing: the token
-        // joins the prompt instead, and that window reads it
-        if (budget < 1 || cap < 1 || s->tokens.len + 2 > s->ctx) {
+    // Strata reads a synced prompt's last token in the first decode window, which feeds nothing, and a save or a load
+    // ends Strata's request: the token (if any) joins the prompt instead, and a sync from the state Strata kept opens
+    // the request whose first window reads it
+    const bool resync = token >= 0 ? b->pending || !b->request_open : !b->request_open;
+    if (resync) {
+        const int fed_tokens = token >= 0 ? 1 : 0;
+        if (budget < 1 || cap < 1 || s->tokens.len + fed_tokens + 1 > s->ctx) {
             set_err(err, errlen, "the context has no room for the token and the one after it, or no budget");
             return RENZA_ERROR;
         }
         std::vector<int> ids(s->tokens.v, s->tokens.v + s->tokens.len);
-        ids.push_back(token);
+        if (token >= 0) ids.push_back(token);
         std::vector<renza_vision_span> images(s->images, s->images + s->image_count);
         const size_t width = (size_t) b->engine->engine->embd_dim();
         size_t offset = 0;
@@ -494,6 +550,123 @@ void renza_session_invalidate(renza_session* s) {
     b->session->invalidate();
     b->request_open = false;
     clear_pending(*b);
+}
+
+int renza_session_save(renza_session* s, const char* path, char* err, size_t errlen) {
+    StrataSession* b = backend(s);
+    if (b == nullptr) {
+        set_err(err, errlen, kNoEngine);
+        return RENZA_ERROR;
+    }
+    if (b->engine->engine->dead()) {
+        set_err(err, errlen, b->engine->engine->dead_message());
+        return RENZA_ENGINE_DEAD;
+    }
+    if (!s->checkpoint_valid || b->engine->prompt_cache <= 0) {
+        set_err(err, errlen, "the session is not at a state it can save");
+        return RENZA_UNAVAILABLE;
+    }
+    if (s->image_count > 0) {
+        set_err(err, errlen, "a session holding images is not saved (the file keeps no image rows)");
+        return RENZA_ERROR;
+    }
+    end_request(*b);
+    std::vector<int32_t> saved;
+    const int status = b->session->save(path, saved);
+    if (status != program::kOk) set_err(err, errlen, b->session->error());
+    if (status == program::kDead) {
+        s->checkpoint_valid = false;
+        clear_pending(*b);
+        return RENZA_ENGINE_DEAD;
+    }
+    if (status == program::kUnavailable) return RENZA_UNAVAILABLE;
+    if (status != program::kOk) return RENZA_ERROR;
+    const int unread = b->pending ? 1 : 0;
+    std::string why;
+    if ((int) saved.size() + unread != s->tokens.len || !std::equal(saved.begin(), saved.end(), s->tokens.v))
+        why = "the engine saved another history than the session's";
+    SavedTail tail = {};
+    std::memcpy(tail.magic, kSavedTailMagic, sizeof tail.magic);
+    tail.unread = unread;
+    tail.token = unread ? s->tokens.v[s->tokens.len - 1] : 0;
+    if (why.empty() && append_tail(path, tail, why)) return RENZA_OK;
+    std::remove(path);
+    set_err(err, errlen, why);
+    return RENZA_ERROR;
+}
+
+int renza_session_load(renza_session* s, std::FILE* fp, uint64_t bytes, char* err, size_t errlen) {
+    StrataSession* b = backend(s);
+    if (b == nullptr) {
+        set_err(err, errlen, kNoEngine);
+        return RENZA_ERROR;
+    }
+    if (b->engine->engine->dead()) {
+        set_err(err, errlen, b->engine->engine->dead_message());
+        return RENZA_ENGINE_DEAD;
+    }
+    if (bytes < sizeof(SavedTail)) {
+        set_err(err, errlen, "not a saved session (too short)");
+        return RENZA_ERROR;
+    }
+    char path[sizeof kLoadTemplate];
+    std::memcpy(path, kLoadTemplate, sizeof path);
+    const int fd = mkstemp(path);
+    if (fd < 0) {
+        set_err(err, errlen, std::string("cannot create a file for the saved session: ") + std::strerror(errno));
+        return RENZA_ERROR;
+    }
+    std::string why;
+    bool ok = copy_to_fd(fp, fd, bytes - sizeof(SavedTail), why);
+    if (close(fd) != 0 && ok) {
+        why = std::strerror(errno);
+        ok = false;
+    }
+    SavedTail tail = {};
+    if (ok && std::fread(&tail, sizeof tail, 1, fp) != 1) {
+        why = "the saved session is truncated";
+        ok = false;
+    }
+    if (ok && (std::memcmp(tail.magic, kSavedTailMagic, sizeof tail.magic) != 0 || tail.unread < 0 ||
+               tail.unread > 1 || tail.token < 0 || tail.token >= b->engine->engine->vocab_size())) {
+        why = "not a saved session (renza's part of it is invalid)";
+        ok = false;
+    }
+    if (!ok) {
+        unlink(path);
+        set_err(err, errlen, why);
+        return RENZA_ERROR;
+    }
+    end_request(*b);
+    std::vector<int32_t> ids;
+    const int status = b->session->load(path, ids);
+    unlink(path);
+    if (status != program::kOk) set_err(err, errlen, b->session->error());
+    switch (status) {
+    case program::kOk:
+        break;
+    case program::kDead:
+        s->checkpoint_valid = false;
+        clear_pending(*b);
+        return RENZA_ENGINE_DEAD;
+    case program::kInvalidated:
+        renza_session_book_invalidate(s);
+        clear_pending(*b);
+        return RENZA_ERROR;
+    default:   // refused: Strata's state is as it was
+        return RENZA_ERROR;
+    }
+    if ((int64_t) ids.size() + tail.unread >= s->ctx) {
+        renza_session_invalidate(s);
+        set_err(err, errlen, "the saved history does not fit this session");
+        return RENZA_ERROR;
+    }
+    if (tail.unread) ids.push_back(tail.token);
+    clear_pending(*b);
+    renza_session_book_assign(s, ids.data(), (int) ids.size(), nullptr, 0);
+    s->checkpoint_valid = true;
+    b->pending = tail.unread == 1;
+    return RENZA_OK;
 }
 
 int renza_strata_open_status(bool* printed) {

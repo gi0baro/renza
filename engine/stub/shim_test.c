@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ds4.h"
 #include "renza_common.h"
@@ -35,6 +36,9 @@ static struct {
     int budget;
     int cap;
     renza_sampling sampling;
+    int save_status;
+    char saved_path[256];
+    uint64_t load_bytes;
 } fake;
 
 const renza_engine_text *renza_engine_text_of(const renza_engine *e) {
@@ -165,6 +169,35 @@ void renza_session_rewind(renza_session *s, int pos) {
 
 void renza_session_invalidate(renza_session *s) {
     renza_session_book_invalidate(s);
+}
+
+/* A saved session here: the history's length, then its ids. */
+int renza_session_save(renza_session *s, const char *path, char *err, size_t errlen) {
+    snprintf(fake.saved_path, sizeof(fake.saved_path), "%s", path);
+    if (fake.save_status != RENZA_OK) {
+        renza_set_err(err, errlen, "unavailable");
+        return fake.save_status;
+    }
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL);
+    fwrite(&s->tokens.len, sizeof(int), 1, fp);
+    fwrite(s->tokens.v, sizeof(int), (size_t)s->tokens.len, fp);
+    fclose(fp);
+    return RENZA_OK;
+}
+
+int renza_session_load(renza_session *s, FILE *fp, uint64_t bytes, char *err, size_t errlen) {
+    fake.load_bytes = bytes;
+    int n = 0;
+    if (fread(&n, sizeof(n), 1, fp) != 1 || bytes != sizeof(int) * (uint64_t)(n + 1)) {
+        renza_set_err(err, errlen, "not a saved session");
+        return RENZA_ERROR;
+    }
+    int ids[FAKE_CTX];
+    CHECK(n <= FAKE_CTX && fread(ids, sizeof(int), (size_t)n, fp) == (size_t)n);
+    renza_session_book_assign(s, ids, n, NULL, 0);
+    s->checkpoint_valid = true;
+    return RENZA_OK;
 }
 
 static ds4_tokens tokens_of(int first, int n) {
@@ -306,11 +339,60 @@ static void test_context_end(void) {
     ds4_engine_close(e);
 }
 
+/* What ds4's KV store does with a payload: stage it, copy it into its file
+ * between its own header and trailer, load it from there, free it. */
+static void test_payload(void) {
+    ds4_engine *e = open_engine();
+    CHECK(ds4_engine_routed_quant_bits(e) == 8 && ds4_engine_routed_quant_bits(NULL) == 0);
+    ds4_session *s = synced_session(e, FAKE_CTX, 5);
+    char err[64];
+    ds4_session_payload_file staged = {0};
+    CHECK(ds4_session_stage_payload(s, &staged, err, sizeof(err)) == 0);
+    CHECK(staged.path && !strcmp(staged.path, fake.saved_path));
+    CHECK(staged.bytes == sizeof(int) * 6);
+
+    static const char head[] = "head", trailer[] = "trailer";
+    FILE *store = tmpfile();
+    fwrite(head, 1, sizeof(head), store);
+    CHECK(ds4_session_write_staged_payload(&staged, store, err, sizeof(err)) == 0);
+    fwrite(trailer, 1, sizeof(trailer), store);
+    const uint64_t payload_bytes = staged.bytes;
+    char *staged_path = strdup(staged.path);
+    ds4_session_payload_file_free(&staged);
+    CHECK(!staged.path && staged.bytes == 0 && access(staged_path, F_OK) != 0);
+    free(staged_path);
+
+    ds4_session *t = synced_session(e, FAKE_CTX, 2);
+    uint64_t rng = 1;
+    CHECK(ds4_session_sample(t, 0.0f, 0, 0.0f, 0.0f, &rng) == 3);
+    fseek(store, sizeof(head), SEEK_SET);
+    CHECK(ds4_session_load_payload(t, store, payload_bytes, err, sizeof(err)) == 0);
+    CHECK(fake.load_bytes == payload_bytes && history_is(t, 1, 5));
+    char after[sizeof(trailer)];
+    CHECK(fread(after, 1, sizeof(after), store) == sizeof(after) && !memcmp(after, trailer, sizeof(after)));
+    fclose(store);
+
+    /* Nothing is left behind when the engine cannot save. */
+    fake.save_status = RENZA_UNAVAILABLE;
+    staged.bytes = 1;
+    CHECK(ds4_session_stage_payload(s, &staged, err, sizeof(err)) == 1);
+    CHECK(!staged.path && staged.bytes == 0 && access(fake.saved_path, F_OK) != 0);
+    fake.save_status = RENZA_OK;
+
+    ds4_session_free(t);
+    ds4_session_free(s);
+    ds4_engine_close(e);
+}
+
 int main(void) {
     test_engine_options();
     test_windows();
     test_held_token_dropped();
     test_context_end();
+    const int before = failures;
+    test_payload();
+    printf("renza-shim tests: stage/write/load/free payload contract: %s\n",
+           failures == before ? "ok" : "FAILED");
     if (failures) {
         fprintf(stderr, "renza-shim tests: %d failed\n", failures);
         return 1;

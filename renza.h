@@ -45,6 +45,8 @@ enum {
     /* sync stopped because the cancel callback returned true. */
     RENZA_INTERRUPTED = -2,
     RENZA_ENGINE_DEAD = -3,
+    /* renza_session_save: the session is not at a point it can save. */
+    RENZA_UNAVAILABLE = -4,
 };
 
 /* decode's token argument: sample from the state sync left, feed nothing. */
@@ -341,6 +343,36 @@ void renza_session_rewind(renza_session *s, int pos);
 /* Empties the session: tokens empty, pos 0, no images, checkpoint_valid
  * false. */
 void renza_session_invalidate(renza_session *s);
+
+/* Saved sessions, for a disk cache of conversations (the server's KV
+ * store).  A saved session is the engine's whole state for tokens (with its
+ * deepest checkpoint), bound to the model files and the engine settings that
+ * give the state its meaning; Strata's is its session file (STRSESS v1).
+ * Not from a callback.
+ *
+ * Writes the session's state to a new file at path (replacing one there).
+ * Available only when checkpoint_valid, which a progress callback never
+ * sees: RENZA_UNAVAILABLE otherwise and with the prompt cache off (no file
+ * is written).  The state saved is the live end of a completed request:
+ * the engine ends the request in flight first, as the next sync would.  The
+ * session continues with the same tokens; the next decode starts a new
+ * request from the saved state, as a decode that feeds a token right after
+ * a sync does.  Errors: RENZA_ERROR (a session holding images; the engine
+ * refused or failed to write the file: path holds no new saved session, and
+ * the session continues as for RENZA_OK), RENZA_ENGINE_DEAD. */
+int renza_session_save(renza_session *s, const char *path, char *err, size_t errlen);
+/* Replaces the session's state with a saved one: the bytes bytes at fp's
+ * position, as renza_session_save wrote them.  On RENZA_OK tokens are the
+ * saved ones, no images, checkpoint_valid; fp is just past the bytes; the
+ * next decode may pass RENZA_TOKEN_NONE only when the save followed a sync.
+ * The whole file is checked before the state is touched: one saved with
+ * another model or engine configuration, corrupt, or longer than this
+ * session holds is refused.  Errors (RENZA_ERROR, fp's position
+ * unspecified): a refusal or a read failure leaves the session as it was; a
+ * transfer that failed after the state was touched invalidates the session
+ * (the engine stays usable).  RENZA_ENGINE_DEAD only when the engine was or
+ * went dead (a device fault). */
+int renza_session_load(renza_session *s, FILE *fp, uint64_t bytes, char *err, size_t errlen);
 
 /* Read-only queries. */
 int renza_session_pos(const renza_session *s);

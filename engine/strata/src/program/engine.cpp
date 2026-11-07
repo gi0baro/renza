@@ -8,6 +8,7 @@
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -843,6 +844,18 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     return false;
 }
 
+// what a refusal on the RAM guard says it had: "900 MiB available, source cgroup" (the smallest of MemAvailable, the
+// cgroup limits above the engine and --memory-limit-mib; see strata/core/conversation_memory.hpp)
+std::string ram_note(const std::optional<strata::core::HostMemoryReading>& mem) {
+    if (!mem) return "RAM telemetry unavailable";
+    return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
+}
+
+// Disk sessions: the defaults of --conversation-cache-min-free-mib (the RAM floor a save or a restore leaves) and
+// --session-min-free-mib (the disk a save leaves), options removed with the serve loop's parking and SAVE/RESTORE.
+constexpr int64_t kConversationCacheMinFreeMib = 2560;
+constexpr int64_t kSessionMinFreeMib = 4096;
+
 // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
 // reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
 // carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).
@@ -1203,6 +1216,7 @@ using strata::program::kInvalidated;
 using strata::program::kNoToken;
 using strata::program::kOk;
 using strata::program::kRefused;
+using strata::program::kUnavailable;
 using strata::program::ProgressFn;
 using strata::program::RequestStats;
 using strata::program::Sampling;
@@ -1223,6 +1237,10 @@ struct EngineState {
     int decode_window(int32_t token, const Sampling& sampling, int budget, int32_t* out, int cap);
     int finish_request();
     void invalidate_session();
+    // Disk sessions (Session::save / load): the serve loop's SAVE / RESTORE between requests
+    int save_session(const std::string& path, std::vector<int32_t>& saved);
+    int load_session(const std::string& path, std::vector<int32_t>& restored);
+    bool session_identity(strata::core::SessionFileIdentity& id, std::string& e, const std::function<void()>& next_file);
     // QUIT or the end of input: the open request ends, the round in flight lands, the profile is saved.  False when
     // the engine is dead.
     bool shut_down();
@@ -1359,6 +1377,7 @@ struct EngineState {
     bool nan_flush = false;
     std::vector<ConvCheckpoint> checks;
     uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+    std::optional<uint64_t> model_fp, config_fp;   // session_identity's, computed once
     int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
     int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
     bool pp_tail_saved = false;
@@ -5962,6 +5981,283 @@ void EngineState::invalidate_session() {
     tail_ckpt_len = -1;
 }
 
+// Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
+// engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
+// that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
+// K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
+bool EngineState::session_identity(strata::core::SessionFileIdentity& id, std::string& e,
+                                   const std::function<void()>& next_file) {
+    if (!model_fp) {
+        // what the loaders actually resolved: the CLI inputs, the pack's files and - from the expert source
+        // itself - every file its experts were read from (native_experts.txt can name GGUFs per layer/role)
+        strata::core::SessionInputs in;
+        in.native_shards = o.native_shards;
+        in.native_dense = o.native_dense_gguf;
+        in.native_head = o.native_head_shards;
+        in.embedding = o.embd_gguf;
+        in.ple = o.ple_gguf;
+        in.pack = o.pack;
+        in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+        if (srcp != nullptr) in.experts = srcp->model_inputs();
+        std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
+        // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
+        if (!o.pack.empty()) {
+            for (const char* n : {"index.txt", "dense.bin"}) files.push_back({std::string("pack ") + n, o.pack + "/" + n});
+            for (const char* n : {"embd.bin", "extra.bin", "manifest.json"})
+                files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
+            if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
+        }
+        if (!o.mtp.empty()) {
+            for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
+            files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
+        }
+        uint64_t fp = 0;
+        // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
+        if (next_file) next_file();
+        if (!strata::core::session_model_fingerprint(files, fp, e, next_file))
+            return false;
+        model_fp = fp;
+    }
+    if (!config_fp) {
+        strata::core::SessionConfig c;
+        c.engine_version = STRATA_VERSION;
+        c.backend = "cuda";
+        c.kv = o.kv;
+        c.max_context = o.max_context;
+        c.kv_resident = o.kv_resident;
+        c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
+        c.kv_rot = false;   // STRATA_KV_ROT (the rotated INT8 K/V) was removed: the K/V is never rotated
+        c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
+                  rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
+                  rope_cfg.beta_slow};
+        c.cvec = 0;   // no control vector is ever loaded (the digest of none)
+        // the switches renza removed keep their place with the one value they can have (off), so a file's
+        // fingerprint is the one the serve program gives the same configuration
+        constexpr bool kRemoved = false;
+        c.switches = {
+            {"no_ple", kRemoved}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
+            {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
+            {"native_gdn", o.native_gdn}, {"native_flash_attn_short", kRemoved},
+            {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
+            {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
+            {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
+            {"gr_fp32_activations", kRemoved}, {"gr_native_mmvf", o.gr_native_mmvf},
+            {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
+            {"keep_canonical", kRemoved}, {"no_fused_gr", o.no_fused_gr},
+            {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
+            {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+        config_fp = strata::core::session_config_fingerprint(c);
+    }
+    id.model = *model_fp;
+    id.config = *config_fp;
+    return true;
+}
+
+// The serve loop's SAVE: the file holds what a parked conversation holds (conversation_file.hpp).  A refusal or a
+// failure leaves the engine in step (the live session as it was).
+int EngineState::save_session(const std::string& path, std::vector<int32_t>& saved) {
+    if (dead) return kDead;
+    if (request_open || !live_ok || live.empty()) {
+        session_error = "no complete session to save";
+        return kUnavailable;
+    }
+    const auto t0 = Clock::now();
+    auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+    auto refuse_save = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid) {
+        std::fprintf(stderr, "strata serve: session save %s: %s\n", path.c_str(), why.c_str());
+        return refuse(std::string(strata::core::session_error_name(kind)) + ": " + why);
+    };
+    auto moving = [](uint64_t done, uint64_t) {
+        strata::core::progress_at("writing a session file, MiB", (int64_t) (done >> 20));
+        strata::core::progress_allow(0);   // a block moved: the ordinary watchdog limit again, and a beat
+    };
+    // a step that blocks in one call: its explicit allowance, announced before it starts
+    auto blocking = [](const char* phase, uint64_t bytes) {
+        strata::core::progress_at(phase);
+        strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
+    };
+    strata::core::progress_at("saving a session");
+    if (!ver.wait_commit(err)) return die(err);
+    strata::core::SessionFileIdentity id;
+    try {
+        if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); }))
+            return refuse_save(err, strata::core::SessionError::io);
+    } catch (const std::bad_alloc&) {
+        return refuse_save("session identity: out of memory", strata::core::SessionError::memory);
+    } catch (const std::exception& e) {
+        return refuse_save(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
+    }
+    size_t bytes = 0, kept = 0;
+    double capture_ms = 0;
+    try {
+        // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
+        // checkpoint is chosen by reference, and the copies it will take (the list below and the one
+        // in `meta`), the copied live running state with its tokens and images, the K/V source
+        // directory and the 16 MiB write buffer are asked for above the parking floor.  Only the
+        // deepest checkpoint goes to disk (the next turn's resume point); the K/V is streamed from
+        // the authoritative pools straight into the file, without a full host capture.
+        strata::core::SessionSaveLive sl;
+        {
+            strata::core::ConversationStateSizes z;
+            std::string why;
+            uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
+            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
+                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
+                if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
+            }
+            sl.state_bytes = state;
+            sl.tokens = live.size();
+            sl.images = live_imgs.size();
+            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+        }
+        const uint64_t floor = (uint64_t) kConversationCacheMinFreeMib << 20;
+        auto admit = [&](uint64_t need, std::string& why) {
+            const auto mem = strata::core::sample_host_memory();
+            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+            why = "not enough RAM to save the session (" +
+                  (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
+                  " MiB plus a floor of " + std::to_string((long long) kConversationCacheMinFreeMib) +
+                  " MiB needed, " + ram_note(mem) + ")";
+            return false;
+        };
+        std::vector<ConvCheckpoint> disk_checks;
+        std::string why;
+        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why))
+            return refuse_save(why, strata::core::SessionError::memory);
+        kept = disk_checks.size();
+        // no control vector: the session is always read with it on, the serve loop's default
+        const strata::core::ConversationView view{live, live_imgs, disk_checks, true};
+        strata::core::SavedConversation meta;
+        std::vector<strata::core::SessionKvSource> sources;
+        // the live running state comes off the device in one synchronous copy
+        blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
+        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), err))
+            return refuse_save(err, strata::core::SessionError::io);
+        capture_ms = ms();
+        strata::core::SessionWriteOptions wo;
+        wo.min_free_bytes = (uint64_t) kSessionMinFreeMib << 20;
+        wo.progress = moving;
+        wo.phase = blocking;
+        strata::core::SessionStatus st;
+        if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st))
+            return refuse_save(err, st.error);
+        if (st.dir_flush_unsupported)
+            std::fprintf(stderr, "strata serve: session saved to %s; this filesystem cannot flush a "
+                                 "folder, so the new name is not flushed\n", path.c_str());
+    } catch (const std::bad_alloc&) {
+        return refuse_save("not enough RAM to save the session", strata::core::SessionError::memory);
+    }
+    std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
+                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
+                 path.c_str(), ms(), capture_ms);
+    saved = live;
+    return kOk;
+}
+
+// The serve loop's RESTORE: the file is checked whole against this engine before the first device write, so only a
+// transfer that fails after it can leave the session's state partial.
+int EngineState::load_session(const std::string& path, std::vector<int32_t>& restored) {
+    if (dead) return kDead;
+    const auto t0 = Clock::now();
+    auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+    auto refuse_load = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid) {
+        std::fprintf(stderr, "strata serve: session restore %s: %s\n", path.c_str(), why.c_str());
+        return refuse(std::string(strata::core::session_error_name(kind)) + ": " + why);
+    };
+    auto moving = [](uint64_t done, uint64_t) {
+        strata::core::progress_at("reading a session file, MiB", (int64_t) (done >> 20));
+        strata::core::progress_allow(0);   // a block moved: the ordinary watchdog limit again, and a beat
+    };
+    auto blocking = [](const char* phase, uint64_t bytes) {
+        strata::core::progress_at(phase);
+        strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
+    };
+    if (request_open) return refuse_load("a request is open: a session file is restored between requests");
+    strata::core::progress_at("restoring a session");
+    if (o.prompt_cache <= 0) return refuse_load("session files need --prompt-cache > 0");
+    if (!ver.wait_commit(err)) return die(err);
+    strata::core::SessionFileIdentity id;
+    try {
+        if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); }))
+            return refuse_load(err, strata::core::SessionError::io);
+    } catch (const std::bad_alloc&) {
+        return refuse_load("session identity: out of memory", strata::core::SessionError::memory);
+    } catch (const std::exception& e) {
+        return refuse_load(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
+    }
+    strata::core::SavedConversation image;
+    size_t bytes = 0;
+    try {
+        // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
+        // state and K/V part), checked as the file is parsed and before each array is allocated; the
+        // file size follows from them.  The RAM the parse needs at its peak is asked first.
+        strata::core::SessionReadLimits limits;
+        limits.progress = moving;
+        const uint64_t floor = (uint64_t) kConversationCacheMinFreeMib << 20;
+        limits.admit = [floor](uint64_t need, std::string& why) {
+            const auto mem = strata::core::sample_host_memory();
+            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                  std::to_string((long long) kConversationCacheMinFreeMib) + " MiB needed, " + ram_note(mem) + ")";
+            return false;
+        };
+        // at most the history this session holds (ctx - 1 tokens: a prompt of n < ctx, decode up to ctx - 1)
+        if (!strata::core::conversation_session_read_limits(
+                limits, ss, g, mtp.kv_state(), (uint64_t) std::max<int64_t>(session_ctx - 1, 0),
+                (uint64_t) std::max(o.prompt_cache, 1), err))
+            return refuse_load(err, strata::core::SessionError::io);
+        strata::core::SessionStatus st;
+        if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st))
+            return refuse_load(err, st.error);
+    } catch (const std::bad_alloc&) {
+        return refuse_load("not enough RAM to read the session", strata::core::SessionError::memory);
+    }
+    const double read_ms = ms();
+    // the whole image against this engine, still without any device write
+    blocking("validate", bytes);
+    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) return refuse_load(err);
+    // the caller keeps image identities the file does not hold (the image rows' fingerprints)
+    if (!image.live.imgs.empty()) return refuse_load("the saved conversation holds images");
+    // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce))
+        return refuse_load("the K/V cannot grow to the saved conversation: no VRAM is left",
+                           strata::core::SessionError::memory);
+    live_ok = false;
+    // host -> device in synchronous copies of the whole state: one bounded allowance
+    blocking("transfer", bytes);
+    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+        strata::core::ConversationRestore::restored) {
+        // validated above: a failure here is a transfer failure, after device writes began - never
+        // decode from a partial state.  The conversation goes: the next request reads from token 0 and rewrites the
+        // state it reads, unless the device itself failed
+        std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(), err.c_str());
+        live.clear();
+        live_imgs.clear();
+        checks.clear();
+        tail_ckpt_len = -1;
+        const std::string why = "restoring the session file failed after the device state was changed: " + err;
+        if (const cudaError_t ce = cudaDeviceSynchronize(); ce != cudaSuccess)
+            return die(why + " (" + cudaGetErrorString(ce) + ")");
+        (void) cudaGetLastError();
+        session_error = why;
+        return kInvalidated;
+    }
+    live = std::move(image.live.ids);
+    live_imgs = std::move(image.live.imgs);
+    checks = std::move(image.checkpoints);
+    for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
+    live_ok = true;
+    nan_flush = false;   // #879: the file replaced the poisoned session
+    std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
+                 "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
+                 ms(), read_ms);
+    restored = live;
+    return kOk;
+}
+
 bool EngineState::shut_down() {
     if (dead) return false;
     if (!ready) return true;
@@ -6113,6 +6409,14 @@ const RequestStats& Session::stats() const {
 
 void Session::invalidate() {
     if (engine_ != nullptr) engine_->state_->s.invalidate_session();
+}
+
+int Session::save(const std::string& path, std::vector<int32_t>& tokens) {
+    return engine_ != nullptr ? engine_->state_->s.save_session(path, tokens) : kDead;
+}
+
+int Session::load(const std::string& path, std::vector<int32_t>& tokens) {
+    return engine_ != nullptr ? engine_->state_->s.load_session(path, tokens) : kDead;
 }
 
 int64_t Session::ctx() const { return ctx_; }

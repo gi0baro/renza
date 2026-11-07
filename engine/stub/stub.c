@@ -2,10 +2,11 @@
  * history, the vision identities, the think-mode helpers and the tokenizer
  * (engine/renza_common.c over text/) are real; everything that needs the
  * model's weights (session create, sync, decode, image encoding) fails with
- * an error. */
+ * an error.  A saved session holds the history only (magic, count, ids). */
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,6 +14,7 @@
 
 static const char STUB_NO_ENGINE[] = "no inference engine linked (renza stub engine)";
 static const char STUB_NO_ENCODER[] = "no vision encoder linked (renza stub engine)";
+static const char STUB_SAVED_MAGIC[8] = {'R', 'E', 'N', 'Z', 'A', 'S', 'T', 'B'};
 
 struct renza_engine {
     renza_engine_text *text;
@@ -148,4 +150,52 @@ void renza_session_rewind(renza_session *s, int pos) {
 
 void renza_session_invalidate(renza_session *s) {
     renza_session_book_invalidate(s);
+}
+
+int renza_session_save(renza_session *s, const char *path, char *err, size_t errlen) {
+    if (!s->checkpoint_valid) {
+        renza_set_err(err, errlen, "the session is not at a state it can save");
+        return RENZA_UNAVAILABLE;
+    }
+    if (s->image_count > 0) {
+        renza_set_err(err, errlen, "a session holding images is not saved");
+        return RENZA_ERROR;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        renza_set_err(err, errlen, "cannot create the saved session");
+        return RENZA_ERROR;
+    }
+    const uint32_t n = (uint32_t)s->tokens.len;
+    bool ok = fwrite(STUB_SAVED_MAGIC, sizeof(STUB_SAVED_MAGIC), 1, fp) == 1 &&
+              fwrite(&n, sizeof(n), 1, fp) == 1 &&
+              (n == 0 || fwrite(s->tokens.v, sizeof(int), n, fp) == n);
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) {
+        remove(path);
+        renza_set_err(err, errlen, "cannot write the saved session");
+        return RENZA_ERROR;
+    }
+    return RENZA_OK;
+}
+
+int renza_session_load(renza_session *s, FILE *fp, uint64_t bytes, char *err, size_t errlen) {
+    char magic[sizeof(STUB_SAVED_MAGIC)];
+    uint32_t n = 0;
+    if (bytes < sizeof(magic) + sizeof(n) || fread(magic, sizeof(magic), 1, fp) != 1 ||
+        memcmp(magic, STUB_SAVED_MAGIC, sizeof(magic)) != 0 || fread(&n, sizeof(n), 1, fp) != 1 ||
+        bytes != sizeof(magic) + sizeof(n) + (uint64_t)n * sizeof(int)) {
+        renza_set_err(err, errlen, "not a saved stub session");
+        return RENZA_ERROR;
+    }
+    int *ids = renza_xcalloc(n ? n : 1, sizeof(int));
+    if (n && fread(ids, sizeof(int), n, fp) != n) {
+        free(ids);
+        renza_set_err(err, errlen, "the saved session is truncated");
+        return RENZA_ERROR;
+    }
+    renza_session_book_assign(s, ids, (int)n, NULL, 0);
+    s->checkpoint_valid = true;
+    free(ids);
+    return RENZA_OK;
 }

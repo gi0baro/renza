@@ -7,6 +7,8 @@
 #include "renza_vision.h"
 #include "strata/program/engine.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -62,6 +64,13 @@ struct Fake {
     int invalidates = 0;
     bool request_open = false;
     program::RequestStats stats;
+    // Strata's histories: what the request in flight has read, and what the last one ended kept
+    std::vector<int32_t> consumed, live;
+    int32_t prompt_last = 0;   // the token the first decode window reads
+    int save_status = program::kOk;
+    int load_status = program::kOk;
+    int saves = 0;
+    int loads = 0;
 };
 
 Fake* fake = nullptr;
@@ -192,6 +201,8 @@ int Session::sync(const int32_t* ids, int64_t n, const ImageSpan* images, size_t
     }
     st.sync_rows.push_back(rows);
     st.request_open = true;
+    st.consumed.assign(ids, ids + (st.sync_status == kOk ? n - 1 : std::max<int64_t>(st.held, 0)));
+    st.prompt_last = ids[n - 1];
     if (progress) progress(SyncProgress{st.reused, n, st.reused, 0.0});
     return st.sync_status;
 }
@@ -206,12 +217,17 @@ int Session::decode(int32_t token, const Sampling& sampling, int, int32_t* out, 
     if (st.decode_status != kOk) return st.decode_status;
     const int n = std::min<int>(cap, (int) st.decode_out.size());
     std::copy(st.decode_out.begin(), st.decode_out.begin() + n, out);
+    st.consumed.push_back(token == kNoToken ? st.prompt_last : token);
+    st.consumed.insert(st.consumed.end(), out, out + n - 1);
     return n;
 }
 
 int Session::finish() {
     Fake& st = *engine_->state_;
-    if (st.request_open) ++st.finishes;
+    if (st.request_open) {
+        ++st.finishes;
+        st.live = st.consumed;
+    }
     st.request_open = false;
     return st.dead ? kDead : kOk;
 }
@@ -220,7 +236,37 @@ const RequestStats& Session::stats() const { return engine_->state_->stats; }
 
 void Session::invalidate() {
     finish();
+    engine_->state_->live.clear();
     ++engine_->state_->invalidates;
+}
+
+// The fake's session file: Strata's live ids, raw.
+int Session::save(const std::string& path, std::vector<int32_t>& tokens) {
+    Fake& st = *engine_->state_;
+    if (st.request_open || st.live.empty()) return kUnavailable;
+    ++st.saves;
+    if (st.save_status != kOk) return st.save_status;
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    CHECK(f != nullptr && std::fwrite(st.live.data(), sizeof(int32_t), st.live.size(), f) == st.live.size());
+    std::fclose(f);
+    tokens = st.live;
+    return kOk;
+}
+
+int Session::load(const std::string& path, std::vector<int32_t>& tokens) {
+    Fake& st = *engine_->state_;
+    if (st.request_open) return kRefused;
+    ++st.loads;
+    if (st.load_status == kInvalidated) st.live.clear();
+    if (st.load_status != kOk) return st.load_status;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    CHECK(f != nullptr);
+    std::vector<int32_t> ids;
+    int32_t id;
+    while (std::fread(&id, sizeof id, 1, f) == 1) ids.push_back(id);
+    std::fclose(f);
+    st.live = tokens = ids;
+    return kOk;
 }
 
 int64_t Session::ctx() const { return ctx_; }
@@ -523,6 +569,163 @@ void test_images_rewind_dead() {
     close_engine(o);
 }
 
+std::string temp_path(const char* name) {
+    return "/tmp/renza-adapter-tests-" + std::to_string((long) getpid()) + "-" + name;
+}
+
+std::vector<char> file_bytes(const std::string& path) {
+    std::vector<char> bytes;
+    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+        char c;
+        while (std::fread(&c, 1, 1, f) == 1) bytes.push_back(c);
+        std::fclose(f);
+    }
+    return bytes;
+}
+
+const char kStoreHead[] = "head";
+
+// The saved bytes in the middle of a larger file, as the KV store holds them; fp is at their start.
+std::FILE* stored(const std::vector<char>& saved) {
+    std::FILE* f = std::tmpfile();
+    std::fwrite(kStoreHead, 1, sizeof kStoreHead, f);
+    std::fwrite(saved.data(), 1, saved.size(), f);
+    std::fwrite("trailer", 1, 7, f);
+    std::fseek(f, sizeof kStoreHead, SEEK_SET);
+    return f;
+}
+
+int load(renza_session* s, const std::vector<char>& saved, long* end = nullptr) {
+    std::FILE* f = stored(saved);
+    char err[256];
+    const int status = renza_session_load(s, f, saved.size(), err, sizeof err);
+    if (end != nullptr) *end = std::ftell(f);
+    std::fclose(f);
+    return status;
+}
+
+struct SaveInProgress {
+    renza_session* session = nullptr;
+    std::string path;
+    int status = RENZA_OK;
+};
+
+void save_in_progress(void* ud, int, int) {
+    SaveInProgress* p = static_cast<SaveInProgress*>(ud);
+    char err[256];
+    p->status = renza_session_save(p->session, p->path.c_str(), err, sizeof err);
+}
+
+void test_save_unavailable() {
+    Opened o = open_engine(nullptr, 0);
+    const std::string path = temp_path("unavailable");
+    char err[256];
+    CHECK(renza_session_save(o.session, path.c_str(), err, sizeof err) == RENZA_UNAVAILABLE);
+    SaveInProgress in_progress{o.session, path};
+    renza_session_set_progress(o.session, save_in_progress, &in_progress);
+    renza_tokens prompt = tokens_of({1, 2, 3, 4});
+    CHECK(renza_session_sync(o.session, &prompt, err, sizeof err) == RENZA_OK);
+    CHECK(in_progress.status == RENZA_UNAVAILABLE);
+    renza_session_set_progress(o.session, nullptr, nullptr);
+    renza_session_rewind(o.session, 2);
+    CHECK(renza_session_save(o.session, path.c_str(), err, sizeof err) == RENZA_UNAVAILABLE);
+    CHECK(fake->saves == 0 && file_bytes(path).empty());
+    close_engine(o);
+
+    const char* no_cache[] = {"--prompt-cache", "0"};
+    o = open_engine(no_cache, 2);
+    CHECK(renza_session_sync(o.session, &prompt, err, sizeof err) == RENZA_OK);
+    CHECK(renza_session_save(o.session, path.c_str(), err, sizeof err) == RENZA_UNAVAILABLE);
+    CHECK(fake->saves == 0 && fake->request_open && file_bytes(path).empty());
+    renza_tokens_free(&prompt);
+    close_engine(o);
+}
+
+void test_save_load_round_trip() {
+    Opened o = open_engine(nullptr, 0);
+    renza_tokens prompt = tokens_of({1, 2, 3, 4});
+    renza_sampling sampling = {};
+    int out[4];
+    char err[256];
+    CHECK(renza_session_sync(o.session, &prompt, err, sizeof err) == RENZA_OK);
+    const std::string after_sync = temp_path("after-sync");
+    CHECK(renza_session_save(o.session, after_sync.c_str(), err, sizeof err) == RENZA_OK);
+    CHECK(fake->finishes == 1 && !fake->request_open);
+    CHECK(history(o.session) == (std::vector<int>{1, 2, 3, 4}) && renza_session_checkpoint_valid(o.session));
+    // the save ended Strata's request: the first decode syncs the history again and reads its last token
+    CHECK(renza_session_decode(o.session, RENZA_TOKEN_NONE, &sampling, 8, out, 4, err, sizeof err) == 3);
+    CHECK((fake->syncs.back() == std::vector<int32_t>{1, 2, 3, 4}) && fake->decode_fed.back() == program::kNoToken);
+    CHECK(history(o.session) == (std::vector<int>{1, 2, 3, 4, 7, 8}));
+    const std::string after_decode = temp_path("after-decode");
+    CHECK(renza_session_save(o.session, after_decode.c_str(), err, sizeof err) == RENZA_OK);
+    CHECK(renza_session_decode(o.session, 9, &sampling, 8, out, 4, err, sizeof err) == 3);
+    CHECK((fake->syncs.back() == std::vector<int32_t>{1, 2, 3, 4, 7, 8, 9}));
+    CHECK(history(o.session) == (std::vector<int>{1, 2, 3, 4, 7, 8, 9, 7, 8}));
+
+    const std::vector<char> saved_after_sync = file_bytes(after_sync);
+    long end = 0;
+    CHECK(load(o.session, saved_after_sync, &end) == RENZA_OK);
+    CHECK(end == (long) (sizeof kStoreHead + saved_after_sync.size()));
+    CHECK((fake->live == std::vector<int32_t>{1, 2, 3}));
+    CHECK(history(o.session) == (std::vector<int>{1, 2, 3, 4}) && renza_session_checkpoint_valid(o.session));
+    CHECK(renza_session_decode(o.session, RENZA_TOKEN_NONE, &sampling, 8, out, 4, err, sizeof err) == 3);
+    CHECK((fake->syncs.back() == std::vector<int32_t>{1, 2, 3, 4}));
+
+    renza_session_invalidate(o.session);
+    CHECK(load(o.session, file_bytes(after_decode)) == RENZA_OK);
+    CHECK(history(o.session) == (std::vector<int>{1, 2, 3, 4, 7, 8}) && renza_session_checkpoint_valid(o.session));
+    CHECK(renza_session_decode(o.session, RENZA_TOKEN_NONE, &sampling, 8, out, 4, err, sizeof err) == RENZA_ERROR);
+    CHECK(renza_session_decode(o.session, 9, &sampling, 8, out, 4, err, sizeof err) == 3);
+    CHECK((fake->syncs.back() == std::vector<int32_t>{1, 2, 3, 4, 7, 8, 9}));
+    std::remove(after_sync.c_str());
+    std::remove(after_decode.c_str());
+    renza_tokens_free(&prompt);
+    close_engine(o);
+}
+
+void test_load_refused() {
+    Opened o = open_engine(nullptr, 0);
+    renza_tokens prompt = tokens_of({1, 2, 3, 4});
+    renza_sampling sampling = {};
+    int out[4];
+    char err[256];
+    CHECK(renza_session_sync(o.session, &prompt, err, sizeof err) == RENZA_OK);
+    const std::string path = temp_path("refused");
+    CHECK(renza_session_save(o.session, path.c_str(), err, sizeof err) == RENZA_OK);
+    const std::vector<char> saved = file_bytes(path);
+    std::remove(path.c_str());
+    CHECK(renza_session_decode(o.session, RENZA_TOKEN_NONE, &sampling, 8, out, 4, err, sizeof err) == 3);
+
+    fake->load_status = program::kRefused;
+    fake->message = "session file: saved with another model (model fingerprint differs)";
+    CHECK(load(o.session, saved) == RENZA_ERROR);
+    CHECK(history(o.session) == (std::vector<int>{1, 2, 3, 4, 7, 8}) && renza_session_checkpoint_valid(o.session));
+    CHECK(renza_session_decode(o.session, 9, &sampling, 8, out, 4, err, sizeof err) == 3);
+    CHECK((fake->syncs.back() == std::vector<int32_t>{1, 2, 3, 4, 7, 8, 9}));
+
+    // renza's part of the file is checked before Strata reads it
+    const int loads = fake->loads;
+    std::vector<char> corrupt = saved;
+    corrupt[corrupt.size() - sizeof(int32_t) * 2 - 1] ^= 1;
+    CHECK(load(o.session, corrupt) == RENZA_ERROR && fake->loads == loads);
+    CHECK(renza_session_checkpoint_valid(o.session));
+
+    // a transfer that failed after the state was touched: the session is emptied, the engine lives
+    fake->load_status = program::kInvalidated;
+    CHECK(load(o.session, saved) == RENZA_ERROR);
+    CHECK(renza_session_pos(o.session) == 0 && !renza_session_checkpoint_valid(o.session));
+    CHECK(renza_session_sync(o.session, &prompt, err, sizeof err) == RENZA_OK);
+    renza_tokens_free(&prompt);
+    close_engine(o);
+}
+
+// The save / load tests say their names (renza-adapter-tests: <name>: ok).
+void run(const char* name, void (*test)()) {
+    const int before = failures;
+    test();
+    std::printf("renza-adapter-tests: %s: %s\n", name, failures == before ? "ok" : "FAILED");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -548,6 +751,9 @@ int main(int argc, char** argv) {
     test_sync_decode();
     test_sync_results();
     test_images_rewind_dead();
+    run("save refused when not idle", test_save_unavailable);
+    run("save and load round trip", test_save_load_round_trip);
+    run("load refused (identity mismatch), session still usable", test_load_refused);
     if (failures) {
         std::fprintf(stderr, "renza-adapter-tests: %d failed\n", failures);
         return 1;

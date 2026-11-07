@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "ds4.h"
@@ -30,6 +31,19 @@ typedef char shim_log_values_match[
     (int)DS4_LOG_DEFAULT == (int)RENZA_LOG_DEFAULT && (int)DS4_LOG_ERROR == (int)RENZA_LOG_ERROR ? 1 : -1];
 
 static const char SHIM_DROPPED[] = "not supported by the renza engine";
+
+/* ds4's KV store files every entry under the engine's routed-expert quant
+ * bits and refuses any value but 2, 4, 5, 6 and 8.  renza's engine has no
+ * such single value (IQ3_S experts), and the payload carries the real
+ * identity (Strata's model and configuration fingerprints), so the store gets
+ * a fixed tag: 8, which ds4 never writes (it writes 2 or 4), so that
+ * --kv-cache-reject-different-quant keeps ds4's own entries apart. */
+enum { KV_QUANT_TAG = 8 };
+
+/* Where a payload is staged before the store copies it into its file (as in
+ * ds4). */
+static const char STAGED_PAYLOAD_TEMPLATE[] = "/tmp/renza-session-payload.XXXXXX";
+enum { PAYLOAD_COPY_BLOCK = 1 << 20 };
 
 static const char *const NULL_ENGINE_MODEL_NAME = "DeepSeek V4 Flash";
 enum {
@@ -327,8 +341,7 @@ uint32_t ds4_engine_prefill_chunk(ds4_engine *e) {
 }
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
-    (void)e;
-    return 0;
+    return e ? KV_QUANT_TAG : 0;
 }
 
 bool ds4_engine_has_vision(ds4_engine *e) {
@@ -768,20 +781,67 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
     return 1;
 }
 
+/* The payload is the file renza_session_save writes. */
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
-    (void)s;
-    if (out) memset(out, 0, sizeof(*out));
-    shim_set_err(err, errlen, SHIM_DROPPED);
-    return 1;
+    if (!out) {
+        shim_set_err(err, errlen, "invalid session payload staging request");
+        return 1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s) {
+        shim_set_err(err, errlen, "missing session");
+        return 1;
+    }
+    char path[sizeof(STAGED_PAYLOAD_TEMPLATE)];
+    memcpy(path, STAGED_PAYLOAD_TEMPLATE, sizeof(path));
+    const int fd = mkstemp(path);
+    if (fd < 0) {
+        shim_set_err(err, errlen, "failed to create staged session payload");
+        return 1;
+    }
+    close(fd);
+    if (renza_session_save(s->session, path, err, errlen) != RENZA_OK) {
+        unlink(path);
+        return 1;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        shim_set_err(err, errlen, "failed to measure staged session payload");
+        unlink(path);
+        return 1;
+    }
+    out->path = strdup(path);
+    if (!out->path) shim_die_oom();
+    out->bytes = (uint64_t)st.st_size;
+    return 0;
 }
 
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen) {
-    (void)payload;
-    (void)fp;
-    shim_set_err(err, errlen, SHIM_DROPPED);
-    return 1;
+    if (!payload || !payload->path || !fp) {
+        shim_set_err(err, errlen, "invalid staged session payload");
+        return 1;
+    }
+    FILE *src = fopen(payload->path, "rb");
+    if (!src) {
+        shim_set_err(err, errlen, "failed to open staged session payload");
+        return 1;
+    }
+    char *buf = shim_xcalloc(1, PAYLOAD_COPY_BLOCK);
+    uint64_t left = payload->bytes;
+    while (left > 0) {
+        const size_t n = left < PAYLOAD_COPY_BLOCK ? (size_t)left : PAYLOAD_COPY_BLOCK;
+        if (fread(buf, 1, n, src) != n || fwrite(buf, 1, n, fp) != n) break;
+        left -= n;
+    }
+    free(buf);
+    fclose(src);
+    if (left > 0) {
+        shim_set_err(err, errlen, "failed to copy staged session payload");
+        return 1;
+    }
+    return 0;
 }
 
 void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
@@ -794,11 +854,14 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
-    (void)s;
-    (void)fp;
-    (void)payload_bytes;
-    shim_set_err(err, errlen, SHIM_DROPPED);
-    return 1;
+    if (!s || !fp) {
+        shim_set_err(err, errlen, "invalid session payload load");
+        return 1;
+    }
+    s->has_held = false;
+    const int rc = renza_session_load(s->session, fp, payload_bytes, err, errlen);
+    refresh_tokens_view(s);
+    return rc == RENZA_OK ? 0 : 1;
 }
 
 int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,

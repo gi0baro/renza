@@ -200,3 +200,10 @@ target_link_options(renza-adapter-tests PRIVATE
     -Wl,--wrap=renza_engine_text_open -Wl,--wrap=renza_engine_text_close)
 add_test(NAME renza-adapter-tests COMMAND renza-adapter-tests "${RENZA_TOKENIZER_GGUF}")
 set_tests_properties(renza-adapter-tests PROPERTIES SKIP_RETURN_CODE 77)
+
+# ds4's KV store over the shim and the stub engine's saved sessions; it reads the tokenizer from the native GGUF.
+add_executable(renza-kvstore-tests engine/stub/kvstore_test.c)
+target_compile_options(renza-kvstore-tests PRIVATE ${RENZA_C_FLAGS})
+target_link_libraries(renza-kvstore-tests PRIVATE renza_server renza_engine)
+add_test(NAME renza-kvstore-tests COMMAND renza-kvstore-tests "${RENZA_TOKENIZER_GGUF}")
+set_tests_properties(renza-kvstore-tests PROPERTIES SKIP_RETURN_CODE 77)

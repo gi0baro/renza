@@ -10,6 +10,7 @@ usage() {
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 RENZA_MODELS=${RENZA_MODELS:-/data/ML/models-renza}
 RENZA_DATA=${RENZA_DATA:-$repo/data}
+RENZA_KV_DIR=${RENZA_KV_DIR:-$HOME/.cache/renza/kv}
 
 case $1 in
     qwen)
@@ -19,6 +20,7 @@ case $1 in
             --pack "$RENZA_DATA/qwen/pack"
             --mtp-model "$RENZA_DATA/qwen/mtp/rt"
             --vision "$RENZA_MODELS/mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf"
+            --kv-disk-dir "$RENZA_KV_DIR" --kv-disk-space-mb 4096
             --
             --ple-gguf "$native"
             --expert-profile "$RENZA_DATA/qwen/expert-profile.bin"

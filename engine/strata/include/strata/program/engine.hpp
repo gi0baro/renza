@@ -22,6 +22,7 @@ inline constexpr int kRefused = -1;       // a precondition failed: nothing chan
 inline constexpr int kInterrupted = -2;   // sync stopped by its cancel callback
 inline constexpr int kDead = -3;          // the engine cannot continue: every later call returns kDead
 inline constexpr int kInvalidated = -4;   // non-finite logits: the request ended and the next sync reads from 0
+inline constexpr int kUnavailable = -5;   // save: no complete conversation to save
 
 // decode's token: the first call after a sync passes it and reads the last prompt token.
 inline constexpr int32_t kNoToken = -1;
@@ -180,6 +181,17 @@ public:
     const RequestStats& stats() const;
     // Drops the live state and every checkpoint (after finishing an open request): the next sync reads from 0.
     void invalidate();
+    // Disk sessions (the serve program's SAVE / RESTORE), between requests only.  save writes the live conversation
+    // to a session file at `path` (conversation_file.hpp, format v1, bound to this model and configuration): its
+    // tokens, running state, deepest checkpoint and K/V.  kOk with `tokens` the history saved; kUnavailable while a
+    // request is open or when there is no live state (prompt cache off, nothing finished); kRefused (error() says
+    // why; nothing changed); kDead.
+    int save(const std::string& path, std::vector<int32_t>& tokens);
+    // Replaces the live conversation and the checkpoints with a session file's.  The whole file is checked (identity,
+    // format, this session's limits, no images) before any device write: kRefused changes nothing.  kOk with `tokens`
+    // the restored history; kInvalidated when the transfer failed after the device state was touched (the
+    // conversation is dropped: the next sync reads from 0); kRefused while a request is open; kDead.
+    int load(const std::string& path, std::vector<int32_t>& tokens);
     int64_t ctx() const;
     // Why the last call was refused, interrupted, invalidated or died.
     const std::string& error() const;
