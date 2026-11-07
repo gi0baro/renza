@@ -1134,7 +1134,9 @@ struct SmallTraits<IQ4NLBlock, 4> {
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
 bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
 // B6 STRATA_B6_MMVQ_ROWS (lab, default 0 = off): see native_mmvq_set_b6_rows
-int g_b6_rows = [] { const char* v = std::getenv("STRATA_B6_MMVQ_ROWS"); return v ? std::atoi(v) : 0; }();
+// read at first use (not at load): a per-architecture default set at start (nv_defaults.hpp) must be seen
+int g_b6_rows = -1;
+int b6_rows_mode() { if (g_b6_rows < 0) { const char* v = std::getenv("STRATA_B6_MMVQ_ROWS"); g_b6_rows = v ? std::atoi(v) : 0; } return g_b6_rows; }
 
 // PAIR: blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
@@ -1402,8 +1404,8 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
     if constexpr (!B6X<F>::ok) {
         return false;
     } else {
-        if (g_b6_rows <= 0 || !g_multi_exact || n_in / F::DIV < 1) return false;
-        const int rows = g_b6_rows == 1 ? 2 : g_b6_rows;
+        if (b6_rows_mode() <= 0 || !g_multi_exact || n_in / F::DIV < 1) return false;
+        const int rows = b6_rows_mode() == 1 ? 2 : b6_rows_mode();
         const dim3 threads(WARP, WARPS);
         if (rows == 2)
             b6_mmvq_rows_kernel<F, NCOLS, 2><<<unsigned((n_out + 1) / 2), threads, 0, s>>>(w, x, y, n_in, n_out);
@@ -1771,7 +1773,7 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
-int native_mmvq_b6_rows() { return g_b6_rows; }
+int native_mmvq_b6_rows() { return b6_rows_mode(); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);

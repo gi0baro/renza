@@ -34,7 +34,7 @@ set(strata_cpu_tests
     suffix_drafter_test controller_test draft_policy_test
     coupled_draft_test spec_prob_test conversation_cache_test
     conversation_memory_test conversation_file_test session_save_reclaim_test
-    conversation_split_failure_test)
+    conversation_split_failure_test nv_defaults_test)
 if(RENZA_BUILD_STRATA_TESTS)
     set_tests_properties(${strata_cpu_tests} DIRECTORY engine/strata
         PROPERTIES FIXTURES_REQUIRED strata_cpu_tests TIMEOUT 120)

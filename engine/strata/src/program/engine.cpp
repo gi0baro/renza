@@ -41,6 +41,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/core/nv_defaults.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -2176,6 +2177,22 @@ int EngineState::start_up(int argc, char** argv) {
                              "at every position\n",
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
+    }
+    {   // CUDA sm_86 / sm_60: the switches that are exact AND faster there are on by default (strata/core/nv_defaults.hpp), when every
+        // visible card has that one compute capability; before any engine code reads its switches, the user's own settings are kept
+        int nd = 0;
+        if (cudaGetDeviceCount(&nd) == cudaSuccess && nd > 0) {
+            int m0 = 0, n0 = 0;
+            bool same = cudaDeviceGetAttribute(&m0, cudaDevAttrComputeCapabilityMajor, 0) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&n0, cudaDevAttrComputeCapabilityMinor, 0) == cudaSuccess;
+            for (int d = 1; same && d < nd; ++d) {
+                int m = 0, n = 0;
+                same = cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
+                       cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && m == m0 && n == n0;
+            }
+            if (same) strata::core::apply_nv_defaults(m0, n0);
+        }
+        (void) cudaGetLastError();
     }
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 ||
