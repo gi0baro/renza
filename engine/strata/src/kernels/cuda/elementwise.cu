@@ -354,8 +354,10 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
     check_launch("doorbell_publish_res");
 }
 
-__global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+__global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
 }
 
 struct MappedCopies {
@@ -377,7 +379,19 @@ __global__ void copy_from_mapped_multi_kernel(MappedCopies a) {
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     if (n <= 0) return;
     if (n > 8) { std::fprintf(stderr, "copy_from_mapped_multi: at most 8 copies\n"); std::exit(1); }
-    MappedCopies a;
+    const char* e = std::getenv("STRATA_MTP_MULTI_COPY");
+    const bool multi_on = e == nullptr || e[0] != '0';
+    if (!multi_on) {
+        for (int i = 0; i < n; ++i) {
+            const MappedCopy& c = copies[i];
+            if (c.words > 1024 && (c.words & 3) == 0 && ((uintptr_t) c.dst & 15) == 0 && ((uintptr_t) c.src & 15) == 0)
+                copy_from_mapped((float*) c.dst, (const float*) c.src, c.words, stream);
+            else
+                copy_i32_from_mapped((int32_t*) c.dst, (const int32_t*) c.src, c.words, stream);
+        }
+        return;
+    }
+    MappedCopies a{};
     int64_t most = 0;
     for (int i = 0; i < n; ++i) {
         a.c[i] = copies[i];
@@ -391,7 +405,9 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
+    const unsigned bx = (unsigned) ((n + 127) / 128 < 64 ? (n + 127) / 128 : 64);
+    copy_i32_from_mapped_kernel<<<bx < 1 ? 1 : bx, 128, 0, (cudaStream_t) stream>>>(
+        dst, (const volatile int32_t*) src, n);
     check_launch("copy_i32_from_mapped");
 }
 

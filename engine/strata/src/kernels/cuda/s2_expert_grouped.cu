@@ -396,6 +396,34 @@ void launch_hit_gu(const uint8_t* blob_base, const int32_t* slot_index, long lon
         blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div);
 }
 
+bool swiglu_q8_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_S2_SWIGLU_Q8");
+        return e == nullptr || e[0] != '0';
+    }();
+    return on;
+}
+
+void launch_hit_swiglu_q8(float* gate_up, uint8_t* h_q8_0, float* h_scales, long long cap,
+                          const float* x_scales, void* stream) {
+    cudaStream_t cs = (cudaStream_t) stream;
+    const long long pairs = cap * (long long) FF;
+    if (x_scales != nullptr && swiglu_q8_on()) {
+        const long long n_blocks = pairs >> 5;
+        const int warps = THREADS / 32;
+        swiglu_quantize_q8_0_scaled_kernel<<<(unsigned) ((n_blocks + warps - 1) / warps), THREADS, 0, cs>>>(
+            gate_up, pairs, h_q8_0, h_scales);
+        check("moe_hit_grouped_s2/swiglu_q8", stream);
+    } else {
+        {
+            swiglu_kernel<<<(unsigned) ((pairs + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate_up, pairs);
+            check("moe_hit_grouped_s2/swiglu", stream);
+            if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, pairs, stream);
+            else quantize_q8_0(gate_up, h_q8_0, pairs, stream);
+        }
+    }
+}
+
 void launch_hit_down(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                      long long blob_bytes, const uint8_t* h_q8_0, const float* h_scales, float* out, long long cap,
                      const int32_t* d_count, cudaStream_t cs) {
@@ -436,20 +464,8 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
                       0, cs);
         check("moe_hit_grouped_s2/gu", stream);
     }
-    // 2. silu(gate) * up.
-    {
-        const long long pairs = n_hits * (long long) FF;
-        const unsigned blocks = (unsigned) ((pairs + THREADS - 1) / THREADS);
-        swiglu_kernel<<<blocks, THREADS, 0, cs>>>(gate_up, pairs);
-        check("moe_hit_grouped_s2/swiglu", stream);
-    }
-    // 3. the intermediate's own contract, which is `ggml_mul_mat`'s rule and NOT a choice: the down weight is
-    //    Q2_0, whose `vec_dot_type` is Q8_0.  `gate_up` holds the pairs; the product went into the first half.
-    //    **R4.2h: the CPU quantizes this intermediate into `a2` with fp32 scales too** (`expert.cpp:232`), so
-    //    when the caller supplies `x_scales` the intermediate gets the CPU's contract as well - otherwise the
-    //    down projection would keep the very disagreement the gate/up projection just had removed.
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, n_hits * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, n_hits * (int64_t) FF, stream);
+    // 2-3. silu(gate) * up and Q8_0 quantization of the intermediate (fused when fast && x_scales != nullptr).
+    launch_hit_swiglu_q8(gate_up, h_q8_0, h_scales, n_hits, x_scales, stream);
     // 4. down.
     {
         launch_hit_down(blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
@@ -536,13 +552,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                       cs);
         check("moe_hit_grouped_s2_dev/gu", stream);
     }
-    {
-        const long long pairs = cap * (long long) FF;
-        swiglu_kernel<<<(unsigned) ((pairs + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate_up, pairs);
-        check("moe_hit_grouped_s2_dev/swiglu", stream);
-    }
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
+    launch_hit_swiglu_q8(gate_up, h_q8_0, h_scales, cap, x_scales, stream);
     {
         launch_hit_down(blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
@@ -572,13 +582,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
                       k_per_token, cs);
         check("moe_hit_grouped_s2_multi/gu", stream);
     }
-    {
-        const long long pairs = cap * (long long) FF;
-        swiglu_kernel<<<(unsigned) ((pairs + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate_up, pairs);
-        check("moe_hit_grouped_s2_multi/swiglu", stream);
-    }
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
+    launch_hit_swiglu_q8(gate_up, h_q8_0, h_scales, cap, x_scales, stream);
     {
         launch_hit_down(blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
@@ -624,6 +628,7 @@ __device__ __forceinline__ void stage_chunk(const uint8_t* __restrict__ xb, floa
     xs_dh[i] = make_int2(__float_as_int(dx), hx);
 }
 
+template <int MAX_E = GMAX>
 __global__ void __launch_bounds__(256) gu_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                            const int32_t* __restrict__ grp_start,
                                                            const int32_t* __restrict__ n_groups,
@@ -632,64 +637,110 @@ __global__ void __launch_bounds__(256) gu_grouped_t_kernel(const unsigned long l
                                                            const float* __restrict__ x_scales,
                                                            float* __restrict__ gate_up, int cap_entries) {
     constexpr int NC = H / 32;
-    __shared__ int xs_w[8 * GMAX * NC];          // 20 KB: word j of entry k's chunk c at [j][k * NC + c]
-    __shared__ int2 xs_dh[GMAX * NC];            // 5 KB: (dx as bits, hx)
+    __shared__ int xs_w[8 * MAX_E * NC];
+    __shared__ int2 xs_dh[MAX_E * NC];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
+    if (ne <= 0) return;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    for (int i = t; i < ne * NC; i += blockDim.x) {
-        const int k = i / NC, c = i - k * NC;
-        const int tok = ent_tok[e0 + k];
-        const uint8_t* xb = x_q8_0 + (size_t) tok * (size_t) NC * 34 + (size_t) c * 34;
-        const float dx = x_scales ? x_scales[(size_t) tok * NC + c] : f16_ld(xb);
-        stage_chunk<GMAX * NC>(xb, dx, xs_w, xs_dh, i);
-    }
-    __syncthreads();
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const int row0 = blockIdx.x * GU_ROWS;                 // even: a pair is always (gate r, up r)
-    for (int pp = warp; pp < GU_ROWS / 2; pp += 8) {
-        const int i = row0 + 2 * pp;
-        const uint8_t* codes = blob + (size_t) i * ROW_GU;
-        const uint8_t* scales = blob + O_GU_SCALES + (size_t) i * SC_GU * 2;
-        int m0[GU_CHUNKS][8], m1[GU_CHUNKS][8];
-        float dw0[GU_CHUNKS], dw1[GU_CHUNKS];
+    if constexpr (MAX_E == 1) {
+        for (int k = 0; k < ne; ++k) {
+            if (k > 0) __syncthreads();
+            if (t < NC) {
+                const int tok = ent_tok[e0 + k];
+                const uint8_t* xb = x_q8_0 + (size_t) tok * (size_t) NC * 34 + (size_t) t * 34;
+                const float dx = x_scales ? x_scales[(size_t) tok * NC + t] : f16_ld(xb);
+                stage_chunk<NC>(xb, dx, xs_w, xs_dh, t);
+            }
+            __syncthreads();
+#pragma unroll 1
+            for (int pp = warp; pp < GU_ROWS / 2; pp += 8) {
+                const int i = row0 + 2 * pp;
+                const uint8_t* codes = blob + (size_t) i * ROW_GU;
+                const uint8_t* scales = blob + O_GU_SCALES + (size_t) i * SC_GU * 2;
+                float acc0 = 0.0f, acc1 = 0.0f;
 #pragma unroll
-        for (int q = 0; q < GU_CHUNKS; ++q) {
-            const int c = lane + 32 * q;
-            if (c < NC) {
-                expand_codes(*(const uint2*) (codes + (size_t) c * 8), m0[q]);
-                expand_codes(*(const uint2*) (codes + ROW_GU + (size_t) c * 8), m1[q]);
-                dw0[q] = f16_ld(scales + (size_t) (c >> 1) * 2);
-                dw1[q] = f16_ld(scales + SC_GU * 2 + (size_t) (c >> 1) * 2);
+                for (int q = 0; q < GU_CHUNKS; ++q) {
+                    const int c = lane + 32 * q;
+                    if (c < NC) {
+                        int m0[8], m1[8], X[8];
+                        expand_codes(*(const uint2*) (codes + (size_t) c * 8), m0);
+                        expand_codes(*(const uint2*) (codes + ROW_GU + (size_t) c * 8), m1);
+                        const float dw0 = f16_ld(scales + (size_t) (c >> 1) * 2);
+                        const float dw1 = f16_ld(scales + SC_GU * 2 + (size_t) (c >> 1) * 2);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) X[j] = xs_w[j * NC + c];
+                        const int2 dh = xs_dh[c];
+                        const float dx = __int_as_float(dh.x);
+                        acc0 += dw0 * dx * (float) (chunk_s(m0, X) - dh.y);
+                        acc1 += dw1 * dx * (float) (chunk_s(m1, X) - dh.y);
+                    }
+                }
+                const float s0 = warp_sum(acc0);
+                const float s1 = warp_sum(acc1);
+                if (lane == 0) {
+                    const int e = e0 + k, r = i >> 1;
+                    gate_up[(size_t) e * FF + (size_t) r] = s0;
+                    gate_up[(size_t) cap_entries * FF + (size_t) e * FF + (size_t) r] = s1;
+                }
             }
         }
-        for (int k = 0; k < ne; ++k) {
-            float acc0 = 0.0f, acc1 = 0.0f;
+    } else {
+        for (int i = t; i < ne * NC; i += blockDim.x) {
+            const int k = i / NC, c = i - k * NC;
+            const int tok = ent_tok[e0 + k];
+            const uint8_t* xb = x_q8_0 + (size_t) tok * (size_t) NC * 34 + (size_t) c * 34;
+            const float dx = x_scales ? x_scales[(size_t) tok * NC + c] : f16_ld(xb);
+            stage_chunk<MAX_E * NC>(xb, dx, xs_w, xs_dh, i);
+        }
+        __syncthreads();
+        for (int pp = warp; pp < GU_ROWS / 2; pp += 8) {
+            const int i = row0 + 2 * pp;
+            const uint8_t* codes = blob + (size_t) i * ROW_GU;
+            const uint8_t* scales = blob + O_GU_SCALES + (size_t) i * SC_GU * 2;
+            int m0[GU_CHUNKS][8], m1[GU_CHUNKS][8];
+            float dw0[GU_CHUNKS], dw1[GU_CHUNKS];
 #pragma unroll
             for (int q = 0; q < GU_CHUNKS; ++q) {
                 const int c = lane + 32 * q;
-                if (c >= NC) break;
-                const int at = k * NC + c;
-                int X[8];
-#pragma unroll
-                for (int j = 0; j < 8; ++j) X[j] = xs_w[j * (GMAX * NC) + at];
-                const int2 dh = xs_dh[at];
-                const float dx = __int_as_float(dh.x);
-                acc0 += dw0[q] * dx * (float) (chunk_s(m0[q], X) - dh.y);
-                acc1 += dw1[q] * dx * (float) (chunk_s(m1[q], X) - dh.y);
+                if (c < NC) {
+                    expand_codes(*(const uint2*) (codes + (size_t) c * 8), m0[q]);
+                    expand_codes(*(const uint2*) (codes + ROW_GU + (size_t) c * 8), m1[q]);
+                    dw0[q] = f16_ld(scales + (size_t) (c >> 1) * 2);
+                    dw1[q] = f16_ld(scales + SC_GU * 2 + (size_t) (c >> 1) * 2);
+                }
             }
-            const float s0 = warp_sum(acc0);
-            const float s1 = warp_sum(acc1);
-            if (lane == 0) {
-                const int e = e0 + k, r = i >> 1;
-                gate_up[(size_t) e * FF + (size_t) r] = s0;
-                gate_up[(size_t) cap_entries * FF + (size_t) e * FF + (size_t) r] = s1;
+            for (int k = 0; k < ne; ++k) {
+                float acc0 = 0.0f, acc1 = 0.0f;
+#pragma unroll
+                for (int q = 0; q < GU_CHUNKS; ++q) {
+                    const int c = lane + 32 * q;
+                    if (c >= NC) break;
+                    const int at = k * NC + c;
+                    int X[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) X[j] = xs_w[j * (MAX_E * NC) + at];
+                    const int2 dh = xs_dh[at];
+                    const float dx = __int_as_float(dh.x);
+                    acc0 += dw0[q] * dx * (float) (chunk_s(m0[q], X) - dh.y);
+                    acc1 += dw1[q] * dx * (float) (chunk_s(m1[q], X) - dh.y);
+                }
+                const float s0 = warp_sum(acc0);
+                const float s1 = warp_sum(acc1);
+                if (lane == 0) {
+                    const int e = e0 + k, r = i >> 1;
+                    gate_up[(size_t) e * FF + (size_t) r] = s0;
+                    gate_up[(size_t) cap_entries * FF + (size_t) e * FF + (size_t) r] = s1;
+                }
             }
         }
     }
 }
 
+template <int MAX_E = GMAX>
 __global__ void __launch_bounds__(256) down_grouped_t_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                              const int32_t* __restrict__ grp_start,
                                                              const int32_t* __restrict__ n_groups,
@@ -698,52 +749,92 @@ __global__ void __launch_bounds__(256) down_grouped_t_kernel(const unsigned long
                                                              const float* __restrict__ h_scales,
                                                              float* __restrict__ out) {
     constexpr int NC = FF / 32;
-    __shared__ int hs_w[8 * GMAX * NC];
-    __shared__ int2 hs_dh[GMAX * NC];
+    __shared__ int hs_w[8 * MAX_E * NC];
+    __shared__ int2 hs_dh[MAX_E * NC];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
+    if (ne <= 0) return;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    for (int i = t; i < ne * NC; i += blockDim.x) {
-        const int k = i / NC, c = i - k * NC;
-        const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) NC * 34 + (size_t) c * 34;
-        const float dx = h_scales ? h_scales[(size_t) (e0 + k) * NC + c] : f16_ld(xb);
-        stage_chunk<GMAX * NC>(xb, dx, hs_w, hs_dh, i);
-    }
-    __syncthreads();
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const int row0 = blockIdx.x * D_ROWS;
-    for (int pp = warp; pp < D_ROWS / 2; pp += 8) {
-        const int r = row0 + 2 * pp;
-        const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
-        const uint8_t* scales = blob + O_D_SCALES + (size_t) r * SC_D * 2;
-        const int c = lane;                                // lanes 0..19 hold one chunk each, as above
-        int m0[8], m1[8];
-        float dw0 = 0.0f, dw1 = 0.0f;
-        if (c < NC) {
-            expand_codes(*(const uint2*) (codes + (size_t) c * 8), m0);
-            expand_codes(*(const uint2*) (codes + ROW_D + (size_t) c * 8), m1);
-            dw0 = f16_ld(scales + (size_t) (c >> 1) * 2);
-            dw1 = f16_ld(scales + SC_D * 2 + (size_t) (c >> 1) * 2);
-        }
+    if constexpr (MAX_E == 1) {
         for (int k = 0; k < ne; ++k) {
-            float acc0 = 0.0f, acc1 = 0.0f;
-            if (c < NC) {
-                const int at = k * NC + c;
-                int X[8];
-#pragma unroll
-                for (int j = 0; j < 8; ++j) X[j] = hs_w[j * (GMAX * NC) + at];
-                const int2 dh = hs_dh[at];
-                const float dx = __int_as_float(dh.x);
-                acc0 += dw0 * dx * (float) (chunk_s(m0, X) - dh.y);
-                acc1 += dw1 * dx * (float) (chunk_s(m1, X) - dh.y);
+            if (k > 0) __syncthreads();
+            if (t < NC) {
+                const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) NC * 34 + (size_t) t * 34;
+                const float dx = h_scales ? h_scales[(size_t) (e0 + k) * NC + t] : f16_ld(xb);
+                stage_chunk<NC>(xb, dx, hs_w, hs_dh, t);
             }
-            const float s0 = warp_sum(acc0);
-            const float s1 = warp_sum(acc1);
-            if (lane == 0) {
-                const size_t o = (size_t) ent_dst[e0 + k] * H + (size_t) r;
-                out[o] = s0;
-                out[o + 1] = s1;
+            __syncthreads();
+            for (int pp = warp; pp < D_ROWS / 2; pp += 8) {
+                const int r = row0 + 2 * pp;
+                const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
+                const uint8_t* scales = blob + O_D_SCALES + (size_t) r * SC_D * 2;
+                const int c = lane;
+                float acc0 = 0.0f, acc1 = 0.0f;
+                if (c < NC) {
+                    int m0[8], m1[8], X[8];
+                    expand_codes(*(const uint2*) (codes + (size_t) c * 8), m0);
+                    expand_codes(*(const uint2*) (codes + ROW_D + (size_t) c * 8), m1);
+                    const float dw0 = f16_ld(scales + (size_t) (c >> 1) * 2);
+                    const float dw1 = f16_ld(scales + SC_D * 2 + (size_t) (c >> 1) * 2);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) X[j] = hs_w[j * NC + c];
+                    const int2 dh = hs_dh[c];
+                    const float dx = __int_as_float(dh.x);
+                    acc0 += dw0 * dx * (float) (chunk_s(m0, X) - dh.y);
+                    acc1 += dw1 * dx * (float) (chunk_s(m1, X) - dh.y);
+                }
+                const float s0 = warp_sum(acc0);
+                const float s1 = warp_sum(acc1);
+                if (lane == 0) {
+                    const size_t o = (size_t) ent_dst[e0 + k] * H + (size_t) r;
+                    out[o] = s0;
+                    out[o + 1] = s1;
+                }
+            }
+        }
+    } else {
+        for (int i = t; i < ne * NC; i += blockDim.x) {
+            const int k = i / NC, c = i - k * NC;
+            const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) NC * 34 + (size_t) c * 34;
+            const float dx = h_scales ? h_scales[(size_t) (e0 + k) * NC + c] : f16_ld(xb);
+            stage_chunk<MAX_E * NC>(xb, dx, hs_w, hs_dh, i);
+        }
+        __syncthreads();
+        for (int pp = warp; pp < D_ROWS / 2; pp += 8) {
+            const int r = row0 + 2 * pp;
+            const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
+            const uint8_t* scales = blob + O_D_SCALES + (size_t) r * SC_D * 2;
+            const int c = lane;                                // lanes 0..19 hold one chunk each, as above
+            int m0[8], m1[8];
+            float dw0 = 0.0f, dw1 = 0.0f;
+            if (c < NC) {
+                expand_codes(*(const uint2*) (codes + (size_t) c * 8), m0);
+                expand_codes(*(const uint2*) (codes + ROW_D + (size_t) c * 8), m1);
+                dw0 = f16_ld(scales + (size_t) (c >> 1) * 2);
+                dw1 = f16_ld(scales + SC_D * 2 + (size_t) (c >> 1) * 2);
+            }
+            for (int k = 0; k < ne; ++k) {
+                float acc0 = 0.0f, acc1 = 0.0f;
+                if (c < NC) {
+                    const int at = k * NC + c;
+                    int X[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) X[j] = hs_w[j * (MAX_E * NC) + at];
+                    const int2 dh = hs_dh[at];
+                    const float dx = __int_as_float(dh.x);
+                    acc0 += dw0 * dx * (float) (chunk_s(m0, X) - dh.y);
+                    acc1 += dw1 * dx * (float) (chunk_s(m1, X) - dh.y);
+                }
+                const float s0 = warp_sum(acc0);
+                const float s1 = warp_sum(acc1);
+                if (lane == 0) {
+                    const size_t o = (size_t) ent_dst[e0 + k] * H + (size_t) r;
+                    out[o] = s0;
+                    out[o + 1] = s1;
+                }
             }
         }
     }
@@ -815,20 +906,21 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
+    const bool single_entry = cap_entries <= 16;   // (second: a group of more than GMAX entries)
     {
         const dim3 grid((unsigned) (2 * FF / GU_ROWS), (unsigned) cap_groups);
-        gu_grouped_t_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
-                                                  gate_up, (int) cap_entries);
+        if (single_entry)   // #3264: one entry a group (the MTP draft's single token): 3 KB of shared memory instead of 25 KB
+            gu_grouped_t_kernel<1><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                                            gate_up, (int) cap_entries);
+        else
+            gu_grouped_t_kernel<><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales,
+                                                         gate_up, (int) cap_entries);
         check("moe_grouped_s2/gu", stream);
     }
     // #783 PR-k (stuchapin909): SwiGLU and the scaled Q8_0 quantize of its result in one kernel (gate_up still gets the
     // activation written back, so the parity checks read the same buffer); STRATA_S2_SWIGLU_Q8=0 keeps the two launches
-    static const bool swiglu_q8 = [] {
-        const char* e = std::getenv("STRATA_S2_SWIGLU_Q8");
-        return e == nullptr || e[0] != '0';
-    }();
     static_assert(FF % 32 == 0, "the fused SwiGLU + Q8_0 kernel works in whole 32-value blocks");
-    if (x_scales != nullptr && swiglu_q8) {
+    if (x_scales != nullptr && swiglu_q8_on()) {
         const long long pairs = cap_entries * (long long) FF;
         const long long n_blocks = pairs >> 5;
         const int warps = THREADS / 32;
@@ -845,7 +937,10 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     {
         const dim3 grid((unsigned) (H / D_ROWS), (unsigned) cap_groups);
         const float* hs = x_scales != nullptr ? h_scales : nullptr;
-        down_grouped_t_kernel<<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
+        if (single_entry)
+            down_grouped_t_kernel<1><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
+        else
+            down_grouped_t_kernel<><<<grid, 256, 0, cs>>>(grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, hs, out);
         check("moe_grouped_s2/down", stream);
     }
 }

@@ -265,6 +265,11 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(spec_prob_test src/core/spec_prob_test.cpp)
   target_include_directories(spec_prob_test PRIVATE include)
   add_test(NAME spec_prob_test COMMAND spec_prob_test)
+  # the --lookup-max-t default (12 on the 8-row CUDA serve, off on Metal, HIP and every other case; header-only, CPU)
+  add_executable(lookup_default_test tests/core/lookup_default_test.cpp)
+  target_include_directories(lookup_default_test PRIVATE include)
+  target_compile_features(lookup_default_test PRIVATE cxx_std_17)
+  add_test(NAME lookup_default_test COMMAND lookup_default_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

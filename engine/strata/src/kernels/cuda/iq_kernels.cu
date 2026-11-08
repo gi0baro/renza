@@ -1424,7 +1424,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                     const int n = min(GRP_NC, e1 - e);
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
                     const int words = n * (20 * 9);
-                    __syncthreads();
+                    if (g > (int) blockIdx.y || e > e0) __syncthreads();
                     for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
                     __syncthreads();
                     if (valid_r) {
@@ -1468,7 +1468,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                     const int n = min(GRP_NC, e1 - e);
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
                     const int words = n * (20 * 9);
-                    __syncthreads();
+                    if (g > (int) blockIdx.y || e > e0) __syncthreads();
                     for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
                     __syncthreads();
                     if (valid_r) {
@@ -1512,7 +1512,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                 const int n = min(GRP_NC, e1 - e);
                 const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
                 const int words = n * (20 * 9);
-                __syncthreads();
+                if (g > (int) blockIdx.y || e > e0) __syncthreads();
                 for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
                 __syncthreads();
                 if (valid_r) {

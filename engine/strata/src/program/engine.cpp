@@ -10,6 +10,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/lookup_default.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -437,6 +438,14 @@ struct Options {
     /// verify window (the window grows to at most 8).  Greedy verification keeps the output; its own counts are kept.
     int lookup_chain = 0;
     int lookup_chain_min = 3;   ///< --lookup-chain-min M: the shortest match (in tokens, drafts included) it extends on
+    /// --lookup-max-t N (-1 = not given: 12 on a build whose windows hold 8 rows, one GPU, no batch / DFlash2 / lookup chain, owner decision
+    /// 11-01 for #4040; 0 = off, the --spec + 2 rule): prompt-lookup windows up to N tokens (<= kVerifyLongT) while
+    /// the MTP keeps its --spec windows.  A copy-heavy turn (an edit that rewrites a file) accepts nearly every lookup
+    /// draft, so its decode is bound by the window length.  Each window size is a graph of its own (~20-35 MiB of
+    /// VRAM), so only --lookup-sizes get one past the MTP's sizes; a size whose graph finds no VRAM is dropped.
+    int lookup_max_t = -1;
+    /// --lookup-sizes A,B,.. : the lookup window sizes above the MTP's (default with --lookup-max-t N: MTP+1, MTP+2, N)
+    std::string lookup_sizes;
     /// --mtp-q4 (opt-in): the draft layer's projections and draft head from 4-bit copies (fewer bytes per draft step)
     std::string mtp_q4;   ///< "" (off), all, proj (the projections only) or head (the draft head only)
     /// --mtp-draft-vocab FILE (opt-in): the draft head's token subset from FILE instead of <mtp>/draft_vocab.bin
@@ -528,6 +537,9 @@ void usage() {
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+                 "  --lookup-max-t N     prompt-lookup windows up to N (<= 16) tokens (default 12 on one GPU in the 8-row CUDA build; 0 = off);\n"
+                 "                       copy-heavy edits gain, each extra window size costs a graph (~20-35 MiB of VRAM)\n"
+                 "  --lookup-sizes A,B   the lookup window sizes past the MTP's (default: MTP+1, MTP+2 and N)\n"
                  "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
                  "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
                  "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
@@ -608,6 +620,36 @@ void usage() {
 }
 
 // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
+// The window sizes the draft policy may give a lookup or chained window: every size up to --spec, unless
+// --lookup-max-t is on - then the MTP's own sizes and --lookup-sizes (default MTP+1, MTP+2 and --spec).
+unsigned lookup_size_mask(const Options& o) {
+    if (o.lookup_max_t <= 0) return ~0u;
+    const int s_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+    unsigned m = 0;
+    for (int t = 1; t <= s_mtp; ++t) m |= 1u << t;
+    if (o.lookup_sizes.empty()) {
+        for (int t : {s_mtp + 1, s_mtp + 2, o.spec})
+            if (t <= o.spec) m |= 1u << t;
+    } else {
+        size_t at = 0;
+        while (at < o.lookup_sizes.size()) {
+            const int t = std::atoi(o.lookup_sizes.c_str() + at);
+            if (t >= 2 && t <= o.spec) m |= 1u << t;
+            const size_t c = o.lookup_sizes.find(',', at);
+            if (c == std::string::npos) break;
+            at = c + 1;
+        }
+    }
+    return m;
+}
+
+std::string size_list(unsigned m, int max_t) {
+    std::string r;
+    for (int t = 1; t <= max_t; ++t)
+        if ((m >> t) & 1u) r += (r.empty() ? "" : ",") + std::to_string(t);
+    return r;
+}
+
 int chain_tail(const strata::spec::SuffixDrafter& sfx, const int32_t* pending, int n_pending, std::vector<int32_t>& tail) {
     const std::vector<int32_t>& h = sfx.history();
     const int keep = std::max(0, std::min((int) h.size(), 64 - n_pending));
@@ -1186,7 +1228,6 @@ std::string string_printf(const char* fmt, ...) {
 // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
 // neutral path (no upload, no buffer handed to the sampler).
 constexpr int kPenaltyWindowCap = 4096;
-constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
 constexpr size_t kResPatchCap = 16384;   // the residency entries res_sync patches in one kernel
 // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (the whole model) borrowing the
 // tail of CUDA0's cache.  A loan is sized by the exact `Prefill::bytes_needed` for the chunk, is laid out by
@@ -1509,6 +1550,7 @@ struct EngineState {
     int S_mtp = 0;   // the MTP's windows; suffixes go up to S
     std::optional<strata::spec::SuffixDrafter> sfx;
     std::optional<strata::spec::DraftPolicy> policy;   // MTP or lookup window, learned over the whole process
+    std::function<int(int)> graph_fits;
     // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images, one ImageSpan each;
     // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
     // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
@@ -1729,6 +1771,8 @@ int EngineState::parse_options(int argc, char** argv) {
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
+        else if (a == "--lookup-max-t") o.lookup_max_t = std::max(0, std::atoi(next("--lookup-max-t")));
+        else if (a == "--lookup-sizes") o.lookup_sizes = next("--lookup-sizes");
         else if (a == "--lookup-chain") o.lookup_chain = std::clamp(std::atoi(next("--lookup-chain")), 0, 7);
         else if (a == "--lookup-chain-min") o.lookup_chain_min = std::max(3, std::atoi(next("--lookup-chain-min")));
         else if (a == "--mtp-q4") {
@@ -1886,13 +1930,37 @@ int EngineState::start_up(int argc, char** argv) {
         o.mtp_max_t = o.spec;
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
+    // --lookup-max-t N: lookup windows up to N tokens, the MTP's stay at --spec.  Not given: 12 where the pr-nv2 runs measured it (serve, one GPU, the 8-row
+    // build: rewrites and agent edit turns +11..14%, prose and code within noise); --lookup-max-t 0 or STRATA_LOOKUP_MAX_T=0 turns it off.  The wide
+    // builds (HIP, 16 rows), a layer split, --batch, DFlash2 and --lookup-chain keep the old windows.
+    if (o.lookup_max_t < 0) {
+        const char* lme = std::getenv("STRATA_LOOKUP_MAX_T");
+        const bool env_off = lme != nullptr && lme[0] == '0';
+        const bool narrow = strata::kernels::kVerifyMaxT == strata::kernels::kVerifyNarrowT;
+        strata::core::LookupDefaultIn ld;
+        ld.env_off = env_off, ld.narrow_window = narrow, ld.serve = o.serve;
+        ld.lookup_chain = o.lookup_chain > 0, ld.suffix_draft = o.suffix_draft > 0, ld.spec_at_least_2 = o.spec >= 2;
+        o.lookup_max_t = strata::core::default_lookup_max_t(ld);
+    }
+    if (o.lookup_max_t > 0 && o.suffix_draft > 0 && o.spec >= 2) {
+        if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
+        o.spec = std::max(o.spec, std::min(o.lookup_max_t, strata::kernels::kVerifyLongT));
+    }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
     // from mtp_max_t left K=1 and K=2 with a window identical to not passing the flag at all.
     if (o.lookup_chain > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         const int chain_base = o.spec;
-        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));  // kVerifyMaxT
+        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));  // kVerifyNarrowT
+    }
+    // A speculative (solo) window holds at most kVerifyNarrowT rows: the hand-offs, the penalty history and the drafters'
+    // buffers are sized for that.  Only a plain --batch forms the wider windows of a build with kVerifyMaxT > 8.
+    // (--lookup-max-t: a prompt-lookup window may be longer, up to kVerifyLongT; the MTP drafts stay at mtp_max_t)
+    const int spec_cap = o.lookup_max_t > 0 && o.suffix_draft > 0 ? (int) strata::kernels::kVerifyLongT
+                                                                  : (int) strata::kernels::kVerifyNarrowT;
+    if (o.spec > spec_cap) {
+        return fail(1, "strata generate: --spec %d: a speculative window holds 2..%d tokens\n", o.spec, spec_cap);
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -2647,7 +2715,10 @@ int EngineState::start_up(int argc, char** argv) {
         if (!o.mtp_draft_vocab.empty()) mtp.set_draft_vocab(o.mtp_draft_vocab);
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, ss, o.spec, err, o.mtp_window)) { return fail(1, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); }
+        // (--lookup-max-t past kVerifyNarrowT: the drafter keeps kVerifyNarrowT rows, MtpDrafter::draft_long catches a
+        // longer window up in parts)
+        const int mtp_t = std::min(o.spec, (int) strata::kernels::kVerifyNarrowT);
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, ss, mtp_t, err, o.mtp_window)) { return fail(1, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); }
         mtp.set_ple_session(&ss);
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
@@ -4299,6 +4370,11 @@ int EngineState::serve_setup() {
     }
     mem_mark("the head and the prompt path");
     kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
+    // (the widest window the run can have: a batch of more than kVerifyNarrowT slots is one way to a wider one, a
+    // prompt-lookup window longer than that (--lookup-max-t) the other)
+    const size_t kHistSlots = (size_t) kPenaltyWindowCap *
+        (size_t) (o.lookup_max_t > (int) strata::kernels::kVerifyNarrowT ? strata::kernels::kVerifyLongT
+                                                                           : strata::kernels::kVerifyNarrowT);
     hist_stage = std::vector<int32_t>(kHistSlots, -1);
     if (cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess)
         return fail(1, "strata serve: the penalty-history allocation failed\n");
@@ -5076,6 +5152,26 @@ int EngineState::serve_setup() {
     else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
     sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
     policy.emplace(S);
+    policy->set_sizes(lookup_size_mask(o));
+    if (o.lookup_max_t > 0)
+        std::fprintf(stderr, "strata serve: --lookup-max-t %d: MTP windows up to %d tokens, window sizes %s\n",
+                     o.lookup_max_t, S_mtp, size_list(policy->sizes(), S).c_str());
+    // --lookup-max-t: a lookup window's graph is captured before its round; a size whose graph finds no VRAM is
+    // dropped for good (the policy never picks it again) and the round takes the next smaller allowed size.
+    // -1: a capture failed for another reason (err says why).
+    graph_fits = [this](int t) -> int {
+        while (t > 1) {
+            bool no_vram = false;
+            if (ver.prepare(t, no_vram, err)) return t;
+            if (!no_vram) return -1;
+            policy->disable(t);
+            std::fprintf(stderr, "strata serve: no VRAM for the %d-token window graph: that size is dropped, "
+                                 "sizes left %s (a larger --vram-reserve-mib keeps it)\n", t,
+                         size_list(policy->sizes(), S).c_str());
+            t = policy->fit(t - 1);
+        }
+        return 1;
+    };
     ready = true;
     return 0;
 }
@@ -5496,7 +5592,13 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
         for (int64_t q = a; q < b;) {
             if (stop_requested()) { e = "cancelled"; return false; }
             pp_exact = false;   // until this window and the drafter's rows are in
-            const int T = (int) std::min<int64_t>(S, b - q);
+            int T = (int) std::min<int64_t>(S, b - q);
+            // --lookup-max-t: the prompt's windows take the allowed sizes too (each size is a graph of its own);
+            // one whose graph finds no VRAM is dropped as in decode
+            if (o.lookup_max_t > 0) {
+                T = graph_fits(policy->fit(T));
+                if (T < 0) { e = err; return false; }
+            }
             for (int t = 0; t < T; ++t) {
                 win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                 nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
@@ -5901,6 +6003,11 @@ int EngineState::decode_window(int32_t token, const Sampling& sampling, int budg
         if (k > 0 && (!use_mtp || sfx_out[0] == drafts[0])) {
             const strata::spec::DraftPolicy::Pick pk = policy->choose(T, k, sfx_match);
             if (pk.lookup) { T = pk.t; from_sfx = true; }
+            if (pk.lookup && o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
+                const int t = graph_fits(T);
+                if (t < 0) return die(err);
+                T = t;
+            }
         }
     }
     // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
@@ -5916,6 +6023,11 @@ int EngineState::decode_window(int32_t token, const Sampling& sampling, int budg
             double p_mtp = 1.0;
             for (int i = 0; i < T - 1; ++i) p_mtp *= dprob[(size_t) i];
             chain_n = policy->chain(T, p_mtp, chain_n, cm);
+        }
+        if (chain_n > 0 && o.lookup_max_t > 0) {
+            const int t = graph_fits(T + chain_n);
+            if (t < 0) return die(err);
+            chain_n = std::max(0, t - T);
         }
     }
     const int T_mtp = T;
@@ -6067,8 +6179,8 @@ int EngineState::decode_window(int32_t token, const Sampling& sampling, int budg
     if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && keep < budget)
         mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) keep - 1]);
     const bool drafted = !use_mtp || eos || keep >= budget ||
-                         mtp.draft(T, outv.data(), p, keep - 1, drafts.data(), err, dprob.data(),
-                                   (float) req_spec_min_p);
+                         mtp.draft_long(T, outv.data(), p, keep - 1, drafts.data(), err, dprob.data(),
+                                        (float) req_spec_min_p);
     {
         const Clock::time_point tw3 = Clock::now();
         auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };

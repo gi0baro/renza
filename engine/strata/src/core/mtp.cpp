@@ -701,6 +701,13 @@ struct MtpProf {
 };
 MtpProf g_mp;
 
+bool mtp_head_mix_multi_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 }  // namespace
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
@@ -895,10 +902,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         nsw.q8_1 = xq_;   // the routed experts read hit_xq_
         const SForm none{};
         const bool need_bf16_x = !shared_expert_native_bf16_enabled();
-        static const bool head_mix_multi_on = [] {
-            const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        const bool head_mix_multi_on = mtp_head_mix_multi_on();
         // the shared expert only reads mixed_ / xq_ and writes shared_: a branch beside the router and the routed
         // experts, joined before the combine (STRATA_MTP_SHARED_BRANCH=0 keeps one stream)
         static const bool branch_on = [] {
@@ -973,7 +977,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         g_mp.stamp(12, cs);
         // ---- the final mixer and the main model's head
         if (head_mix_multi_on) {
-            // the window's rows in one read: bitwise the same sums
+            // the window's rows in one read (STRATA_HEAD_MIX_MULTI=0 keeps gr_read per row): bitwise the same sums
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
@@ -1075,6 +1079,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     // one graph per step (`capture_step`) so the host can stop it when a draft is unlikely
     const int ra = 2 * max_t_ - 1;
     const int64_t N = g_->n_embd, NH = g_->n_head;
+    // the draft round's seven inputs in one launch (STRATA_MTP_MULTI_COPY=0 keeps the separate copies)
     const MappedCopy in[7] = {{tok_, m_tok_, T}, {step_, m_step_, (int64_t) 2 * T * 4}, {pos_, m_pos_, 2 * T * NH},
                               {row_, m_row_, 2}, {Rin_, window_R_, T * HCN}, {step_ + ra * 4, m_step_ + ra * 4, 4},
                               {pos_ + ra * NH, m_pos_ + ra * NH, NH}};
@@ -1306,6 +1311,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!stage_source_R(T, err)) return false;
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
@@ -1438,6 +1444,37 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (n_drafts) *n_drafts = n;
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+bool MtpDrafter::draft_long(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                            float* probs, float min_p, int* n_drafts) {
+    if (T < 1 || T > strata::kernels::kVerifyLongT || a < 0 || a >= T) {
+        err = "mtp: draft arguments out of range";
+        return false;
+    }
+    if (a < max_t_) return draft(std::min(T, max_t_), tokens, p, a, drafts, err, probs, min_p, n_drafts);
+    // the window's rows: the bound buffer, or the rows draft() would stage from
+    const float* rows = (src_R_ != nullptr && src_R_ != window_R_) ? src_R_ : window_R_;
+    if (rows == nullptr) { err = "mtp: no window rows bound"; return false; }
+    // rows 0..a-1 at cells p..p+a-1 (what the round's catch-up writes), queued on the drafter's stream
+    if (!prefill(rows, tokens, a, p, err, false)) return false;
+    // row a as a one-row round: stage_source_R copies its residual row into the bound buffer's row 0 (row a >= max_t
+    // of the same buffer: the two never overlap), after the catch-up above has read row 0 on the same stream
+    const float* saved = src_R_;
+    src_R_ = rows + (size_t) a * (size_t) (g_->hc * g_->n_embd);
+    const bool ok = draft(1, tokens + a, p + a, 0, drafts, err, probs, min_p, n_drafts);
+    src_R_ = saved;
+    return ok;
+}
+
+bool MtpDrafter::stage_source_R(int T, std::string& err) {
+    if (src_R_ == nullptr || src_R_ == window_R_) return true;
+    if (cudaMemcpyAsync((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = "mtp: staging the window's residual rows failed";
+        return false;
+    }
     return true;
 }
 
