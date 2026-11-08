@@ -6,7 +6,7 @@
 #
 # CUDA targets arrive in Phase 2.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.45 LANGUAGES CXX)
+project(strata VERSION 0.1.57 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
