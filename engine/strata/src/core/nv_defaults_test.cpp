@@ -1,4 +1,5 @@
 // src/core/nv_defaults_test.cpp - the NVIDIA sm_86 default table (no GPU needed).
+#include "strata/core/nv_chunk.hpp"
 #include "strata/core/nv_defaults.hpp"
 
 #include <cstdio>
@@ -66,6 +67,15 @@ int main() {
     CHECK(apply_nv_defaults(8, 6).empty());
     for (const auto& kv : expected) CHECK(std::getenv(kv.first) == nullptr);
     unset("STRATA_SM86_PERF");
+    // round 0212: the NVIDIA prompt-chunk ceiling of a bare `--prefill auto` (nv_chunk.hpp)
+    CHECK(nv_chunk_ceiling(nullptr, false) == 32768);
+    CHECK(nv_chunk_ceiling("1", false) == 32768);
+    CHECK(nv_chunk_ceiling("16", false) == 16384);
+    CHECK(nv_chunk_ceiling("0", false) == 0);          // STRATA_NV_CHUNK=0 keeps 8192
+    CHECK(nv_chunk_ceiling(nullptr, true) == 0);       // STRATA_DEFAULTS=026 keeps 8192
+    CHECK(nv_chunk_ceiling("16", true) == 0);
+    CHECK(!nv_chunk_card_ok(7) && !nv_chunk_card_ok(6) && nv_chunk_card_ok(8) && nv_chunk_card_ok(12));   // Volta / Turing / Pascal keep 8192
+    CHECK(nv_chunk_step_down(32768) == 16384 && nv_chunk_step_down(16384) == 8192 && nv_chunk_step_down(8192) == 8192);
     if (fails == 0) std::printf("nv_defaults_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
