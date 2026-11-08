@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/window_evict.hpp"
 #include "strata/core/host_graph_launch.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -1400,13 +1401,19 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const bool made = instantiate_evicting(exec_t, graph, "verify: instantiate: ", err);
+    const bool made = instantiate_evicting(exec_t, graph, "verify: instantiate: ", err, T);
     cudaGraphDestroy(graph);
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
+    // The upload only warms the graph; the first launch does it otherwise. A failed one (out of memory on a full card)
+    // must not stay pending: the next kernel wrapper's cudaGetLastError would read it and end the engine (#3702).
+    if (ue != cudaSuccess || us != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "strata verify: the %d-token window's upload was skipped (the first launch does it)\n", T);
+    }
     return true;
 }
 
@@ -1526,13 +1533,16 @@ bool Verifier::capture_commit(std::string& err) {
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    // (through the same path as the window graphs: on a full card it frees older batch layouts and retries, and the error
+    // it reports is the instantiate's own)
+    const bool made = instantiate_evicting(commit_exec_, graph, "verify: commit instantiate: ", err, 0);
     cudaGraphDestroy(graph);
-    return true;
+    return made;
 }
 
 void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
@@ -2027,13 +2037,51 @@ bool Verifier::wait_commit(std::string& err) {
     return true;
 }
 
-bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const char* what, std::string& err) {
-    const cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
-    if (ie == cudaErrorMemoryAllocation) (void) cudaGetLastError();
+bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
+    evicted = false;
+    if (keep_t < 1) return true;
+    bool have[strata::kernels::kVerifyMaxT + 1] = {};
+    const int top = std::min<int>(max_t_, strata::kernels::kVerifyMaxT);
+    for (int t = 1; t <= top; ++t) have[t] = (ar_off_ ? exec_nr_[t] : exec_[t]) != nullptr;
+    const int victim = strata::core::pick_window_victim(have, top, keep_t, 0);
+    if (victim == 0) return true;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: synchronizing before window graph eviction failed";
+        return false;
+    }
+    cudaGraphExec_t& e = ar_off_ ? exec_nr_[victim] : exec_[victim];
+    cudaGraphExecDestroy(e);
+    e = nullptr;
+    evicted = true;
+    return true;
+}
+
+bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const char* what, std::string& err, int keep_t) {
+    // (into a local: what a failed instantiate leaves in the output is not specified, and `ex` is a member that
+    // capture() reads as "captured" when it is not null)
+    cudaGraphExec_t got = nullptr;
+    cudaError_t ie = cudaGraphInstantiate(&got, graph, 0);
+    // #3702: a single-request window with nothing of a batch left to free: free the graphs of other window sizes
+    int freed_sizes = 0;
+    for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted && keep_t > 0;) {
+        (void) cudaGetLastError();
+        if (!evict_window_graph(keep_t, evicted, err)) return false;
+        if (evicted) {
+            ++freed_sizes;
+            ie = cudaGraphInstantiate(&got, graph, 0);
+        }
+    }
+    if (freed_sizes > 0)
+        std::fprintf(stderr, "strata verify: no VRAM for the %d-token window graph: freed the graphs of %d other window "
+                             "sizes (they are captured again when used; a larger --vram-reserve-mib keeps them)\n",
+                     keep_t, freed_sizes);
     if (ie != cudaSuccess) {
+        if (ie == cudaErrorMemoryAllocation) (void) cudaGetLastError();
+        got = nullptr;
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
     }
+    ex = got;
     return true;
 }
 

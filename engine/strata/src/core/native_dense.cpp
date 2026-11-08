@@ -40,6 +40,54 @@ bool in_range(const std::string& name) {
     const int l = std::atoi(name.c_str() + 4);
     return l >= g_layer_lb && l < g_layer_le;
 }
+// S25: the GGUF keeps the inject rows as F32 - quantized here to Q8_0 (ggml's reference rounding) so the Q8_0 read
+// covers every hc projection
+uint16_t half_bits(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t e = (int32_t) ((x >> 23) & 0xff) - 127 + 15;
+    uint32_t m = x & 0x7fffffu;
+    if (e <= 0) {                                   // subnormal or zero
+        if (e < -10) return (uint16_t) sign;
+        m |= 0x800000u;
+        const uint32_t shift = (uint32_t) (14 - e);
+        uint32_t h = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rem > half || (rem == half && (h & 1u))) ++h;
+        return (uint16_t) (sign | h);
+    }
+    if (e >= 31) return (uint16_t) (sign | 0x7c00u);
+    uint32_t h = ((uint32_t) e << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
+    return (uint16_t) (sign | h);
+}
+// A bf16 matrix (the pack file's values) as Q8_0, ggml's reference rounding; the blocks are independent, so a few threads
+std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
+    std::vector<uint8_t> out((size_t) (n / 32 * 34));
+    const uint64_t nb = n / 32;
+    auto work = [&](uint64_t b0, uint64_t b1) {
+        for (uint64_t b = b0; b < b1; ++b) {
+            float v[32], amax = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                const uint32_t u = (uint32_t) x[b * 32 + j] << 16;
+                std::memcpy(&v[j], &u, 4);
+                amax = (std::max)(amax, std::fabs(v[j]));
+            }
+            const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+            uint8_t* o = out.data() + b * 34;
+            const uint16_t hb = half_bits(d);
+            std::memcpy(o, &hb, 2);
+            for (int j = 0; j < 32; ++j) o[2 + j] = (uint8_t) (int8_t) std::lround(v[j] * id);
+        }
+    };
+    const unsigned nt = (std::min)(8u, (std::max)(1u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned i = 0; i < nt; ++i) pool.emplace_back(work, nb * i / nt, nb * (i + 1) / nt);
+    for (auto& th : pool) th.join();
+    return out;
+}
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -52,6 +100,15 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
+}
+// #4741: a native-eligible projection a pack keeps unquantized (BF16, GGUF type 30; Heretic v2 IQ4_NL has its layer-0 attn_gate so)
+// has no native kernel.  Its siblings are Q8_0, so it is served as Q8_0 made from the file's BF16 values (ggml's rounding), and
+// the dispatchers that need a native projection find one.  The pack's BF16 copy stays where it is.
+bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
+    return tensor.type == 30 && tensor.name != "blk.1.ple_key.weight" && tensor.shape.size() == 2 &&
+           !ref.quantized() && ref.kind == WeightKind::Bf16InF32 &&
+           ref.ne0 > 0 && ref.ne0 <= INT_MAX && ref.ne1 > 0 && ref.ne1 <= INT_MAX && ref.ne0 % 32 == 0 &&
+           tensor.shape[0] == (uint64_t) ref.ne0 && tensor.shape[1] == (uint64_t) ref.ne1;
 }
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
@@ -104,6 +161,10 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     return false;
                 }
                 const auto& ref = found->second;
+                if (bf16_as_q8_0(tensor, ref)) {   // #4741
+                    total += alloc_bytes((uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1);
+                    continue;
+                }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
@@ -228,6 +289,24 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
+                if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0
+                    const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1;
+                    const std::vector<uint8_t> q8 = q8_0_of_bf16((const uint16_t*) gguf.tensor_data(tensor), n);
+                    void* allocation = nullptr;
+                    auto status = cudaMalloc(&allocation, q8.size());
+                    DevicePtr data(allocation);
+                    if (status == cudaSuccess) status = cudaMemcpy(data.get(), q8.data(), q8.size(), cudaMemcpyHostToDevice);
+                    if (status != cudaSuccess) {
+                        err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
+                    }
+                    max_in = (std::max)(max_in, (int) ref.ne0);
+                    total += q8.size();
+                    allocated += alloc_bytes(q8.size());
+                    std::fprintf(stderr, "native dense: %s is BF16 in the file: served as Q8_0 like its siblings (#4741)\n",
+                                 tensor.name.c_str());
+                    pending.push_back(Pending{&ref, 8, std::move(data)});
+                    continue;
+                }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 // #326: the pack keeps an unquantized key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;

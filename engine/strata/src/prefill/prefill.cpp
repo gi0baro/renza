@@ -406,6 +406,10 @@ struct Stager {
 #else
                         while (issued.load(std::memory_order_acquire) <= i - kRing) std::this_thread::yield();
 #endif
+                        // ...and its own copy into the buffer is done: `issued` is a watermark, so a job nobody waits for
+                        // (the layer-major prefetch reads experts the routing may skip) can be passed while its thread still
+                        // writes the buffer this job is about to fill
+                        while (!ready[(size_t) (i - kRing)].load(std::memory_order_acquire)) std::this_thread::yield();
                     }
                     // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                     // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
@@ -996,6 +1000,9 @@ bool Prefill::carve(size_t T, void* alloc) {
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
                                                                            m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
+        // No region: the sub-allocators below would each cudaMalloc their share (hundreds of MiB) on a card that has just
+        // shown it has no room, and leave those buffers in `owned`. The failure is reported by the caller.
+        if (base == nullptr) return false;
         m.region = base;
         m.region_bytes = region;
         Alloc a;

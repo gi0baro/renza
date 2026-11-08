@@ -218,7 +218,12 @@ public:
 
 private:
     bool capture(int T, std::string& err);
-    bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const char* what, std::string& err);
+    /// cudaGraphInstantiate; out of VRAM, the graphs of the other window sizes, largest first (#3702): a window size
+    /// whose graph does not fit used to end the engine ("verify: instantiate: out of memory"); a freed size is captured
+    /// again when it is next used.
+    bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const char* what, std::string& err, int keep_t = -1);
+    /// Free the graph of the largest window size other than `keep_t`; `evicted`: there was one.
+    bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
     bool adapt_gate_wait(int32_t layer, std::string& err);

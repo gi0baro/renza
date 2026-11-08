@@ -49,6 +49,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 #include "strata/core/native_dense.hpp"
+#include "strata/program/adapt_decay.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/program/split_ring.hpp"
@@ -837,6 +838,15 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
     return false;
 }
 
+/// #3350: a conversation checkpoint is an optimization, like parking.  After a failed save: true when the failure was
+/// only the copy's memory (a host or driver allocation, which does not stick), so the caller goes on without that
+/// checkpoint; false when the GPU itself is unwell (a sticky error comes back from the synchronize), which still ends
+/// the request as before.
+bool checkpoint_failure_is_survivable() {
+    (void) cudaGetLastError();   // clears a failed allocation; a sticky error is not cleared and is returned again below
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     std::string error;
@@ -1376,6 +1386,10 @@ struct EngineState {
     bool live_ok = false;
     // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
     bool nan_flush = false;
+    // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
+    // the verify windows after the batched part).  The retry reads that tail batched (--short-read 0 for one request):
+    // a reporter's prompts failed there every time and passed with --short-read 0.
+    bool nf_prompt_windows = false, short_read_off_once = false;
     std::vector<ConvCheckpoint> checks;
     uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
     std::optional<uint64_t> model_fp, config_fp;   // session_identity's, computed once
@@ -1655,7 +1669,7 @@ int EngineState::parse_options(int argc, char** argv) {
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
-        else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
+        else if (a == "--adapt-decay") o.adapt_decay = strata::program::adapt_decay_checked(std::atof(next("--adapt-decay")));   // #1284: outside 0..1 -> 0.7, said
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
@@ -4068,6 +4082,7 @@ int EngineState::serve_setup() {
         std::fflush(stderr);
         nf_hit = true;
         nan_flush = true;
+        if (std::strcmp(what, "prompt") == 0) nf_prompt_windows = true;
         return true;
     };
     imgs_below = [](const std::vector<ImgKey>& all, int64_t L) {
@@ -4180,7 +4195,15 @@ int EngineState::serve_setup() {
             pp_total - done <= T;   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
         if (periodic_checkpoint || tail_checkpoint) {
             const bool saved = checkpoint_at(done, tail_checkpoint && !periodic_checkpoint);
-            if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+            if (!saved) {
+                // #3350: only a GPU that is unwell ends the request; a copy that ran out of memory skips this checkpoint
+                if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {
+                    e = "saving a conversation checkpoint failed" + ckpt_why;
+                    return false;
+                }
+                std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
+                                     "above); the request goes on without it\n", (long long) done);
+            }
             if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
             if (tail_checkpoint) pp_tail_saved = true;
         }
@@ -5067,6 +5090,10 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
     // prompt is read from token 0 (resume == 0 below)
     if (nan_flush) {
         nan_flush = false;
+        if (nf_prompt_windows) {
+            nf_prompt_windows = false;
+            short_read_off_once = o.short_read > 0;
+        }
         const size_t n_checks = checks.size();
         live_ok = false;
         checks.clear();
@@ -5167,8 +5194,15 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
     // not in VRAM over PCIe), and it borrows slots it must refill after (~180 ms); a window costs ~16 ms a
     // token, with the misses on the CPU.  Each part below is decided on its own, so a long first message is
     // read batched and its header still goes through the windows.  Picture rows need the batched path.
+    int64_t req_short_read = o.short_read;
+    if (short_read_off_once) {   // #3465: the request after non-finite logits in a prompt window
+        short_read_off_once = false;
+        req_short_read = 0;
+        std::fprintf(stderr, "strata serve: after non-finite logits in a prompt window (#3465): this request reads its "
+                             "whole prompt through the batched path, none of it through the verify windows\n");
+    }
     auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-        if (b - a > o.short_read) return false;
+        if (b - a > req_short_read) return false;
         if (sp->embd_rows != nullptr)
             for (int64_t i = a; i < b; ++i)
                 if (sp->embd_rows[i] != nullptr) return false;
@@ -5457,8 +5491,13 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
             break;
         }
         at = to;
-        if ((to == turn_at || to == root_at) && !checkpoint_at(to, false))
-            return die("saving a conversation checkpoint failed" + ckpt_why);
+        if ((to == turn_at || to == root_at) && !checkpoint_at(to, false)) {
+            if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
+                return die("saving a conversation checkpoint failed" + ckpt_why);
+            }
+            std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
+                                 "above); the request goes on without it\n", (long long) to);
+        }
     }
     if (!refill(err)) return die("refilling a lent slot failed: " + err);
     if (o.prefill_head_alias) {
