@@ -60,7 +60,7 @@ fetch() {
 
 # The repo keeps every file at its root; locally the shards go in swift-IQ3_S/.
 models_url=https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d
-data_url=https://raw.githubusercontent.com/Niko1221/Strata/v0.2.11/data
+data_url=https://raw.githubusercontent.com/Niko1221/Strata/v0.2.13/data
 shard=Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S
 mmproj=mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf
 

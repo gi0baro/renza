@@ -6,7 +6,7 @@
 #
 # CUDA targets arrive in Phase 2.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.57 LANGUAGES CXX)
+project(strata VERSION 0.1.59 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -241,6 +241,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(nv_defaults_test src/core/nv_defaults_test.cpp src/core/nv_defaults.cpp)
   target_include_directories(nv_defaults_test PRIVATE include)
   add_test(NAME nv_defaults_test COMMAND nv_defaults_test)
+  # PR #5108: the MMQ row table's over-read margin follows the backend tile bound; every fixup read stays inside (header-only, no GPU)
+  add_executable(mmq_ids_margin_test tests/prefill/mmq_ids_margin_test.cpp)
+  target_include_directories(mmq_ids_margin_test PRIVATE include)
+  add_test(NAME mmq_ids_margin_test COMMAND mmq_ids_margin_test)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE strata_spec)
   add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)

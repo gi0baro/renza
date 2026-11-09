@@ -1,6 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
@@ -753,6 +754,16 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// The MMQ row table (`ids_identity`, T*K rows) is read past its end by llama.cpp's stream-k fixup, which loads a whole
+// J-column tile of ids before it compares the tile with the expert's rows (see mmq_ids_margin.hpp: the margin follows the
+// backend's tile bound).  An expert takes at most one row per token, so max_rows <= T.  Without the slack the table is an
+// exact-sized cudaMalloc that can end a 2 MiB page, and the over-read faults at the next one (Xid 31 FAULT_PDE, "prefill
+// copy_i32: an illegal memory access" on a long prompt).  The one size used by carve, bytes_needed_impl and the three
+// places that write the identity (bind_stage_helper, run_impl, lm_run).  0: the size overflows (carve fails).
+size_t mmq_ids_rows(size_t T) {
+    if (T > (size_t) INT64_MAX / (size_t) K) return 0;
+    return (size_t) mmq::mmq_ids_table_rows((uint64_t) (T * (size_t) K), (uint64_t) T);
+}
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -1044,7 +1055,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        m.ids_identity = o.take<int32_t>(T * K, ok);
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        m.ids_identity = o.take<int32_t>(ids_rows, ok);   // (its over-read slack: mmq_ids_rows)
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -1343,7 +1356,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        o.take<int32_t>(T * K, ok);
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        o.take<int32_t>(ids_rows, ok);   // ids_identity
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -1487,7 +1502,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
-    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, (int64_t) mmq_ids_rows((size_t) m.T), m.cs);
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.

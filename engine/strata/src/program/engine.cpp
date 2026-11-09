@@ -1154,7 +1154,10 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     if (n < 4096) return -1.0;
     constexpr size_t kTok = 4;   // 64 rows a batch
     std::vector<uint32_t> rows(kTok * 16);
-    std::vector<float> out(kTok * 2560);
+    // one token's PLE rows are PLE_N_HEADS x PLE_HEAD_DIM floats = the compiled hidden size (2560 for Flash-Next, 4096 for q4_big): a
+    // buffer of 2560 floats a token was a heap overflow of 24 KB at hidden 4096 (found by an ASan run; on Metal it landed in Apple's
+    // shader-cache objects and the first pipeline of the first window died in MTLCompilerFSCache::getElementImpl)
+    std::vector<float> out(kTok * (size_t) strata::kernels::PLE_N_HEADS * (size_t) strata::kernels::PLE_HEAD_DIM);
     uint64_t x = 0x9E3779B97F4A7C15ull ^ n;
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t done = 0;
@@ -2910,13 +2913,23 @@ int EngineState::start_up(int argc, char** argv) {
                 return held;
             };
         arena_src.fall_back_when_ram_short = ram_fallback_ok && !ram_fallback_failed;
+        arena_src.notices_on_stdout = o.serve;   // #5327: the RAM notices also on stdout in --serve mode only
         arena_src.hard_limit_headroom_bytes = ram_fallback_headroom;
         const bool arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit);
         if (!arena_ok && arena_src.ram_short()) {
-            // one plain line, one next step; the numbers are in err
+            // one plain line, one next step; the numbers are in err.  With --serve STDOUT TOO, not only stderr: a service
+            // setup (llama-swap and its like) keeps the engine's stdout in its log and never shows the stderr this line
+            // lived on, so the 2.4x decode loss this fallback costs was invisible until it was measured (#5327).  A plain
+            // generate run keeps its stdout (the token stream) clean: stderr only, as before.
             std::fprintf(stderr, "strata generate: not enough RAM for the expert arena (%s): this run reads the experts from the "
                                  "file, like --mmap-experts (slower; the answers are the same). To get the arena back, free that RAM "
                                  "and start again\n", err.c_str());
+            if (o.serve) {
+                std::printf("strata generate: not enough RAM for the expert arena (%s): this run reads the experts from the "
+                            "file, like --mmap-experts (slower; the answers are the same). To get the arena back, free that RAM "
+                            "and start again\n", err.c_str());
+                std::fflush(stdout);
+            }
             o.mmap_experts = true;
             ram_fallback_taken = true;
             // R5070: the plain file source has no RAM copy at all, and on the owner's 5070 PC (63.1 GB, 44.6 GiB available for a
