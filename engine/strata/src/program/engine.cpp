@@ -3084,7 +3084,8 @@ int EngineState::start_up(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache: it needs at least %lld slots "
                                  "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
-                                 "--kv q4_0, the English draft subset (setup --draft-vocab en; the draft head takes "
+                                 "--kv q4_0, the English draft subset (--mtp-draft-vocab FILE with Strata's "
+                                 "data/draft_vocab_en.bin; the draft head takes "
                                  "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU\n",
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
                          (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),

@@ -1397,6 +1397,7 @@ void Verifier::refresh_ar() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
+    const auto cap_t0 = std::chrono::steady_clock::now();
     cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
     if (exec_t != nullptr) return true;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
@@ -1428,8 +1429,9 @@ bool Verifier::capture(int T, std::string& err) {
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
-    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s) in %.1f ms\n", T,
+                 cudaGetErrorString(ue), cudaGetErrorString(us),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cap_t0).count());
     // The upload only warms the graph; the first launch does it otherwise. A failed one (out of memory on a full card)
     // must not stay pending: the next kernel wrapper's cudaGetLastError would read it and end the engine (#3702).
     if (ue != cudaSuccess || us != cudaSuccess) {
