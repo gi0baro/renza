@@ -15,6 +15,7 @@ RENZA_KV_DIR=${RENZA_KV_DIR:-$HOME/.cache/renza/kv}
 case $1 in
     qwen)
         native=$RENZA_MODELS/swift-IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
+        export STRATA_ADAPT_FETCH=1 STRATA_SELECT_TWO_PASS=1 STRATA_IQ4_W4A8=1
         args=(
             -m "$native"
             --pack "$RENZA_DATA/qwen/pack"
