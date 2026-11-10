@@ -21,6 +21,11 @@ bool supported(int ggml_type);
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process
 /// ("J_best=0") when nothing fits.  false (said once per type) keeps that product on the non-MMQ path.
 bool fits(int ggml_type, int64_t w_rows);
+/// Whether `Context::run` on the current device would split a product's K across blocks with llama.cpp's stream-k
+/// decomposition (its fixup adds the partial sums in another order), for `n_experts` experts of [w_rows, *] weights of
+/// `ggml_type` and at most `max_rows` rows an expert: the tile width mul_mat_q_switch_J picks, the config's stream_k
+/// flag, and launch_mul_mat_q's tile-efficiency test.  False for a type MMQ does not cover.  (STRATA_IQ4_W4A8.)
+bool launch_splits_k(int ggml_type, int64_t w_rows, int64_t max_rows, int n_experts);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).

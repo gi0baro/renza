@@ -35,6 +35,8 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsa_two_pass.hpp"
+#include "strata/kernels/qsa_two_pass_status.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -1997,6 +1999,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                          strata::kernels::rope_scaling(), m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     pt.mark(kPfQsaSel, cs);
+                    // STRATA_SELECT_TWO_PASS=1 (qsa_two_pass.hpp): the tensor-core scorer's calls whose last query has
+                    // STRATA_SELECT_TWO_PASS_MIN blocks or more score every block in single-pass TF32 and again in 3xTF32
+                    // only where the error bound reaches the cut-off; qsa_block_topk below returns the same cells.  Its
+                    // scratch is m.attn, which the attention below writes and nothing reads before; the key norms are
+                    // this layer's and chunk's (the indexer appends above are complete)
+                    static const bool tp_on = strata::kernels::qsa_two_pass_on();
+                    static const bool tp_check = tp_on && strata::kernels::qsa_two_pass_check_on();
+                    static const int64_t tp_min = strata::kernels::qsa_two_pass_min_blocks();
+                    const uint64_t tp_bytes = (uint64_t) m.T * ZV * sizeof(float);
+                    const int64_t tp_nbid = T > 0 ? (int64_t) m.steps_host[(size_t) ((T - 1) * strata::kernels::kStepCount +
+                                                                                    strata::kernels::kStepNBid)] : 0;
+                    const bool tp_ok = tp_on && tp_nbid + 1 >= tp_min &&
+                                       strata::kernels::qsa_two_pass_keys(st.idx_pooled, tp_nbid, m.sel_batch, m.max_blocks,
+                                                                          m.attn, tp_bytes, m.cs);
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
@@ -2004,12 +2020,62 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise)
-                        if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
-                                                                  m.max_blocks, s, m.sel_scores, m.cs, active))
+                        bool tp_call = false;
+                        tp_call = tp_ok && active >= tp_min &&
+                                  strata::kernels::qsa_block_scores_two_pass(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                             steps0, nb, m.sel_batch, m.max_blocks, s,
+                                                                             m.sel_scores, m.attn, tp_bytes, m.cs, active);
+                        if (!tp_call && !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                              steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                              m.cs, active))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs, active);
+                        // STRATA_SELECT_TWO_PASS_CHECK=1 (diagnostic, one GPU): today's scores and ids for the same
+                        // queries, compared with the two-pass ones (counts at the prompt's end).  Their buffers are the
+                        // rest of m.attn past the two-pass scratch when it is large enough (the attention below writes
+                        // m.attn after the comparison), else buffers of their own
+                        if (tp_call && tp_check) {
+                            static float* own_sc = nullptr;
+                            static int32_t* own_ids = nullptr;
+                            static size_t own_sc_n = 0, own_ids_n = 0;
+                            const size_t want_sc = (size_t) m.sel_batch * (size_t) m.max_blocks, want_ids = (size_t) m.sel_batch * (size_t) m.cap;
+                            const uint64_t at = (strata::kernels::qsa_two_pass_scratch_bytes(m.sel_batch, m.max_blocks) + 255u) & ~uint64_t(255u);
+                            const uint64_t at_ids = at + (((uint64_t) want_sc * 4u + 255u) & ~uint64_t(255u));
+                            float* ref_sc = nullptr;
+                            int32_t* ref_ids = nullptr;
+                            if (at_ids + (uint64_t) want_ids * 4u <= tp_bytes) {
+                                ref_sc = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(m.attn) + at);
+                                ref_ids = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(m.attn) + at_ids);
+                            } else {
+                                if (want_sc > own_sc_n || want_ids > own_ids_n) {
+                                    cudaStreamSynchronize(m.cs);
+                                    cudaFree(own_sc);
+                                    cudaFree(own_ids);
+                                    own_sc = nullptr;
+                                    own_ids = nullptr;
+                                    own_sc_n = own_ids_n = 0;
+                                    if (cudaMalloc((void**) &own_sc, want_sc * 4) != cudaSuccess ||
+                                        cudaMalloc((void**) &own_ids, want_ids * 4) != cudaSuccess) {
+                                        err = "STRATA_SELECT_TWO_PASS_CHECK: no room for its buffers";
+                                        return false;
+                                    }
+                                    own_sc_n = want_sc;
+                                    own_ids_n = want_ids;
+                                }
+                                ref_sc = own_sc;
+                                ref_ids = own_ids;
+                            }
+                            if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                                      m.max_blocks, s, ref_sc, m.cs, active)) {
+                                err = "STRATA_SELECT_TWO_PASS_CHECK: the tensor-core scorer did not run";
+                                return false;
+                            }
+                            strata::kernels::qsa_block_topk(ref_sc, steps0, nb, m.max_blocks, m.cap, s, ref_ids, m.cs, active);
+                            strata::kernels::qsa_two_pass_check(m.sel_scores, m.sel_ids + t0 * m.cap, ref_sc, ref_ids, steps0, nb,
+                                                                m.sel_batch, m.max_blocks, m.cap, m.attn, m.cs);
+                        }
                     }
                     const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
@@ -2772,6 +2838,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         return false;
     }
     stats_.ms_total += ms_since(t_start);
+    if (strata::kernels::qsa_two_pass_on()) {   // STRATA_SELECT_TWO_PASS: what the two-pass scorer did in this prompt
+        namespace tp = strata::kernels::two_pass;
+        unsigned long long c[tp::kStatCount] = {};
+        if (strata::kernels::qsa_two_pass_stats(c, true, m.cs) && c[tp::kStCalls] > 0) {
+            const unsigned long long sparse = c[tp::kStQueries], kept = sparse - c[tp::kStFull];
+            std::fprintf(stderr, "strata prefill: two-pass QSA select: %llu calls, %llu queries (%llu blocks) in single-pass TF32, "
+                                 "%llu blocks again in 3xTF32 (%.1f per query, max %llu), %llu queries flagged (%llu "
+                                 "16-query tiles in full), %llu selecting every cell; candidates %.0f per query (max %llu)\n",
+                         c[tp::kStCalls], sparse, c[tp::kStBlocks], c[tp::kStBand], kept ? (double) c[tp::kStBand] / kept : 0.0,
+                         c[tp::kStBandMax], c[tp::kStFull], c[tp::kStFullTiles], c[tp::kStIdentity],
+                         kept ? (double) c[tp::kStCand] / kept : 0.0, c[tp::kStCandMax]);
+            if (c[tp::kChkQueries] > 0) {
+                const uint32_t rb = (uint32_t) c[tp::kChkRatioMax];
+                float ratio = 0.0f;
+                std::memcpy(&ratio, &rb, 4);
+                std::fprintf(stderr, "strata prefill: two-pass check: %llu queries, %llu with ids not the 3xTF32 scorer's (%llu ids); "
+                                     "scored again: %llu of %llu blocks not the 3xTF32 score bit for bit; kept: %llu of %llu "
+                                     "single-pass scores outside the bound, the largest |S1 - S3| / bound %.4g\n",
+                             c[tp::kChkQueries], c[tp::kChkIdQueries], c[tp::kChkIdEntries], c[tp::kChkRescoredDiff],
+                             c[tp::kChkRescored], c[tp::kChkKeptOut], c[tp::kChkKept], (double) ratio);
+            }
+        }
+    }
     if (pt.on) {
         pt.fold();
         double total = 0.0;
