@@ -25,7 +25,7 @@ case $1 in
             --ple-gguf "$native"
             --expert-profile "$RENZA_DATA/qwen/expert-profile.bin"
             --expert-cache auto --prefill auto --spec 4 --kv int8
-            --kv-resident 32768 --vram-reserve-mib 700 --spec-min-p 0.8
+            --kv-resident 32768 --vram-reserve-mib 420 --spec-min-p 0.8
             --adapt-every 2 --adapt-swaps 96 --adapt-decay 0.837 --pool-workers 6
         )
         ;;

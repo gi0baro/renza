@@ -714,10 +714,6 @@ bool launch_blocking() {
     return v != nullptr && std::atoi(v) != 0;
 }
 
-/// #2065: below this much VRAM free at a request's start the driver can page GPU memory and a window may never finish
-constexpr int64_t kVramSafeMib =
-    512;
-
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
     static const char* const env = std::getenv("STRATA_TRACE");
@@ -769,6 +765,14 @@ bool adapt_overlap() {
         // tokens from one build, the slowest of the fast run above the fastest of the slow one.
         return e && e[0] == '1';
     }();
+    return v;
+}
+
+/// STRATA_ADAPT_FETCH (opt-in): 1 = the PCIe share also admits into the VRAM tier (ExpertDispatch::fetch_admit), beside
+/// the tier's own copies from RAM; 2 = instead of them (the tier's counts still decay).  STRATA_ADAPT_FETCH_MIN and
+/// STRATA_ADAPT_FETCH_MARGIN: the admission's thresholds (default 1 and 0.5).
+int adapt_fetch() {
+    static const int v = [] { const char* e = std::getenv("STRATA_ADAPT_FETCH"); return e ? std::max(0, std::min(2, std::atoi(e))) : 0; }();
     return v;
 }
 
@@ -2184,9 +2188,8 @@ int EngineState::start_up(int argc, char** argv) {
         }
         strata::kernels::cpu::cpu_require_expert_support();
     } else if (!strata::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
-                             "(multi-token for the i-quant gate/up rows)\n",
-                     std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+        std::fprintf(stderr, "strata generate: CPU expert kernels: %s\n",
+                     std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu (STRATA_NO_IQ256 set)");
     // the compiled shape; a native model's file replaces it below with its own metadata (read_geometry), which a
     // pruned variant (GSQ-RCO Coder, fewer than 512 experts) differs from
     K = g.n_expert_used;
@@ -4639,6 +4642,29 @@ int EngineState::serve_setup() {
         const auto num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         drive.d.pcie_num = num_of(nf);
     };
+    // the serial windows of one GPU, where the pool can admit (expert_pool_dispatch_multi's fetch_on)
+    const char* fetch_off = d_res == nullptr ? "no residency table" : o.adapt_async ? "--adapt-async"
+                          : adapt_overlap() ? "STRATA_ADAPT_OVERLAP=1" : nullptr;
+    if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
+        const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
+                        : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
+                        : drive.d.plan == nullptr ? "no GPU plan"
+                        : drive.d.pcie_num <= 0 ? "no PCIe share"
+                        : src.complement_ready() ? "the resident RAM mode" : nullptr;
+        if (off != nullptr) std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH is off (%s)\n", off);
+        else {
+            drive.d.fetch_admit = adapt_fetch();
+            drive.d.res_mut = host_res.data();
+            drive.d.in_flight.assign(host_res.size(), 0);
+            drive.d.fetch_avail.assign((size_t) g.n_layers, 0);
+            if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MIN")) drive.d.fetch_min = (float) std::atof(v);
+            if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MARGIN")) drive.d.fetch_margin = (float) std::atof(v);
+            std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH=%d: the PCIe share takes each layer's most-routed "
+                                 "misses and admits those routed >= %.2f and %.2f more than a resident one%s\n",
+                         drive.d.fetch_admit, drive.d.fetch_min, drive.d.fetch_margin,
+                         drive.d.fetch_admit == 2 ? "; the tier's own copies are off" : "");
+        }
+    }
     if (!o.expert_profile_save.empty() && !all_experts_resident) {
         if (drive.d.usage.empty() || host_res.empty())
             std::fprintf(stderr, "strata serve: --expert-profile-save needs the adaptive tier (--adapt-every and "
@@ -4715,8 +4741,9 @@ int EngineState::serve_setup() {
         for (const auto& [i, slot] : pending) {
             host_res[(size_t) i] = slot;
             srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
+            if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
         }
-        if (drive.d.evict_sync) {   // a failed upload leaves them to the pre-launch hook
+        if (drive.d.evict_sync || drive.d.fetch_admit > 0) {   // a failed upload leaves them to the pre-launch hook
             for (const auto& pr : pending) drive.d.res_dirty_idx.push_back(pr.first);
             drive.d.res_dirty = true;
         }
@@ -4733,15 +4760,17 @@ int EngineState::serve_setup() {
     // the device's tables before the next window: adapt() marks them non-resident at once, apply_pending uploads
     // only when the round's copies land - a window or more later, and until then doorbell_publish_res skips the
     // activation of a layer whose routed experts all look resident, while the pool computes an evicted one from the
-    // activation published before.  The hook runs at each verifier's launch.  --adapt-async uploads at each of its
-    // steps.
+    // activation published before.  The hook runs at each verifier's launch.  STRATA_ADAPT_FETCH's
+    // admissions (the pool writes host_res during a window) go up the same way, whether the tier waits or not.
+    // --adapt-async uploads at each of its steps.
     const bool tier_lags = !drive.d.usage.empty() && (adapt_nowait() || adapt_lag() > 1);
-    drive.d.evict_sync = tier_lags && adapt_evict_sync();
+    drive.d.evict_sync = tier_lags && (adapt_evict_sync() || drive.d.fetch_admit > 0);
     // The changed entries go up by a kernel on each card's verifier stream, reading them from mapped memory: a
     // synchronous upload waits for the copy engine, which the tier's swaps of the round before still hold (~4 ms
     // on 33 swaps; measured +0.9 ms a chat round).  Too many changes, or no mapped memory: the whole table.
     std::vector<int> res_devs{-1};
-    res_pairs = drive.d.evict_sync ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
+    res_pairs = (drive.d.fetch_admit > 0 || drive.d.evict_sync)
+                    ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
     res_sync = [this](std::string& e) -> bool {
         if (drive.d.res_dirty) {
             const int64_t n = res_patch_pairs(drive.d.res_dirty_idx, host_res, res_pairs, kResPatchCap);
@@ -4766,9 +4795,9 @@ int EngineState::serve_setup() {
     pre_launch_off.v = &ver;
     pre_launch_off.d = &drive.d;
     pre_launch_off.pairs = res_pairs;
-    if (drive.d.evict_sync) {
+    if (drive.d.fetch_admit > 0 || drive.d.evict_sync) {
         ver.set_pre_launch([this](cudaStream_t, std::string& e) { return res_sync(e); });
-        if (drive.d.evict_sync)
+        if (drive.d.evict_sync && adapt_evict_sync())
             std::fprintf(stderr, "strata serve: the adaptive tier's evictions reach the device's table before the next "
                                  "window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)\n");
     }
@@ -4779,12 +4808,16 @@ int EngineState::serve_setup() {
         std::vector<Swap> swaps;
         std::vector<std::pair<float, int32_t>> cand, vict;
         for (int64_t l = 0; l < g.n_layers; ++l) {
+            // STRATA_ADAPT_FETCH=2: where the PCIe share fetched since the last round, its fetchable experts are
+            // the admission's; the tier keeps the rest (no share there, or not pinned)
+            const bool fetched = drive.d.fetch_admit == 2 && !drive.d.fetch_avail.empty() && drive.d.fetch_avail[(size_t) l];
+            if (!drive.d.fetch_avail.empty()) drive.d.fetch_avail[(size_t) l] = 0;
             cand.clear();
             vict.clear();
             const float* u = drive.d.usage.data() + l * g.n_expert;
             const int32_t* r = host_res.data() + l * g.n_expert;
             for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+                if (r[e] < 0) { if (u[e] >= 2.0f && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
                 else vict.emplace_back(u[e], e);
             }
             if (cand.empty() || vict.empty()) continue;
@@ -4829,6 +4862,7 @@ int EngineState::serve_setup() {
                 host_res[out] = strata::core::kNotResident;
                 srcp->prefetch(s.layer, s.out);
                 pending.emplace_back((int32_t) in, slot);
+                if (!drive.d.in_flight.empty()) drive.d.in_flight[in] = 1;   // STRATA_ADAPT_FETCH leaves it alone
                 continue;
             }
             if (slot < 0 || b == nullptr ||
@@ -4855,6 +4889,7 @@ int EngineState::serve_setup() {
                 cudaStreamSynchronize(adapt_stream);   // no callback: wait here, the gate opens at once
                 agate.landed.store((int32_t) g.n_layers, std::memory_order_release);
             }
+            if (!drive.d.in_flight.empty()) drive.d.in_flight[in] = 1;   // STRATA_ADAPT_FETCH leaves it alone
         }
         if (drive.d.evict_sync && !swaps.empty()) {   // the evicted ones are misses now (see the pre-launch hook)
             for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (s.layer * g.n_expert + s.out));
@@ -5416,23 +5451,6 @@ int EngineState::sync_request(const int32_t* tokens, int64_t n, const ImageSpan*
         Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
         save_profile("periodic");
     busy_scope.emplace();
-    {   // #2065: said, never changed - the free VRAM now (the verify windows' captures and the batch layouts
-        // eat into what startup reported), once per 128 MiB lower it gets
-        size_t vf_b = 0, vt_b = 0;
-        if (cudaMemGetInfo(&vf_b, &vt_b) == cudaSuccess) {
-            const int64_t vf = (int64_t) (vf_b >> 20);
-            static int64_t low_said_at = INT64_MAX;
-            if (vf < kVramSafeMib && vf + 128 <= low_said_at) {
-                low_said_at = vf;
-                std::fprintf(stderr, "strata serve: WARNING: only %lld MiB of VRAM free at the start of this request "
-                                     "(below %lld MiB): when the card is this full the driver can page GPU memory "
-                                     "to system RAM, decode falls to a few tok/s and a window may never finish "
-                                     "(#2065). Add --vram-reserve-mib %lld to the config's args, or lower "
-                                     "--max-context\n", (long long) vf, (long long) kVramSafeMib,
-                             (long long) ((o.vram_reserve_mib + (kVramSafeMib - vf) + 63) / 64 * 64));
-            }
-        }
-    }
     err.clear();
     // the request keys a session has no field for (ckpt, pcie_frac, spec_min_p, aux_cpus): the start-up values
     req_ckpt = 1;
