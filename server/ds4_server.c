@@ -831,6 +831,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    int thinking_budget_tokens;
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -994,6 +995,11 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
 #define RENZA_CHAT_TOP_P 0.8f
 #define RENZA_THINK_TEMPERATURE 1.0f
 #define RENZA_THINK_TOP_P 0.95f
+
+/* Fed in place of sampled tokens when the thinking reaches the request's
+ * budget (Strata's wrap-up), so the model goes on to answer. */
+#define RENZA_THINKING_WRAP_UP \
+    "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
@@ -4141,6 +4147,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool got_reasoning_budget = false;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -4258,6 +4265,23 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
                 free(key);
                 goto bad;
+            }
+        } else if (!strcmp(key, "reasoning_budget_tokens") ||
+                   !strcmp(key, "thinking_budget_tokens")) {
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                double v = 0.0;
+                if (!json_number(&p, &v) || !isfinite(v) || floor(v) != v) {
+                    free(key);
+                    goto bad;
+                }
+                int budget = v <= 0 ? 0 : v >= INT_MAX ? INT_MAX : (int)v;
+                if (!strcmp(key, "reasoning_budget_tokens")) {
+                    r->thinking_budget_tokens = budget;
+                    got_reasoning_budget = true;
+                } else if (!got_reasoning_budget) {
+                    r->thinking_budget_tokens = budget;
+                }
             }
         } else if (!strcmp(key, "chat_template_kwargs")) {
             if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking, &reasoning_effort)) {
@@ -12737,6 +12761,27 @@ static int server_decode_budget(int requested, int generated, int room) {
     return remaining < room ? remaining : room;
 }
 
+typedef enum {
+    THINKING_BUDGET_WAIT,
+    THINKING_BUDGET_CLOSE,
+    THINKING_BUDGET_LENGTH
+} thinking_budget_action;
+
+/* The close waits for a token that ends a whole UTF-8 character, so the
+ * wrap-up never follows half of one. */
+static thinking_budget_action thinking_budget_decide(int count, int budget,
+                                                      int output_room, int context_room,
+                                                      int closing_tokens,
+                                                      bool fired, bool thinking_open,
+                                                      bool char_complete) {
+    if (budget <= 0 || count < budget || fired || !thinking_open || !char_complete)
+        return THINKING_BUDGET_WAIT;
+    if (closing_tokens <= 0 || output_room <= closing_tokens ||
+        context_room <= closing_tokens)
+        return THINKING_BUDGET_LENGTH;
+    return THINKING_BUDGET_CLOSE;
+}
+
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
@@ -14006,6 +14051,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     bool dsml_recovery_attempted = false;
     int recovery_completion = 0;
+    int thinking_tokens = 0;
+    const int thinking_budget = ds4_think_mode_enabled(j->req.think_mode) ?
+        j->req.thinking_budget_tokens : 0;
+    bool thinking_budget_fired = false;
+    ds4_tokens thinking_close = {0};
+    int thinking_close_pos = -1;
+    if (thinking_budget > 0) {
+        ds4_tokenize_rendered_chat(s->engine, RENZA_THINKING_WRAP_UP, &thinking_close);
+    }
     uint64_t rng = j->req.seed;
     if (!rng && !random_bytes(&rng, sizeof(rng))) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
@@ -14073,11 +14127,18 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
-            ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
-            ds4_session_sample(slot->session, temperature, top_k,
-                               top_p, min_p, &rng);
+        const bool forcing_thinking_close = thinking_close_pos >= 0 &&
+            thinking_close_pos < thinking_close.len;
+        int token;
+        if (forcing_thinking_close) {
+            token = thinking_close.v[thinking_close_pos++];
+        } else if (j->req.ignore_eos) {
+            token = ds4_session_argmax_ignoring_eos(slot->session,
+                                                    j->req.think_mode);
+        } else {
+            token = ds4_session_sample(slot->session, temperature, top_k,
+                                       top_p, min_p, &rng);
+        }
         if (token < 0) {
             finish = "error";
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
@@ -14095,7 +14156,7 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        if (!forcing_thinking_close && !s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -14116,7 +14177,7 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+        } else if (!forcing_thinking_close && s->batched_mode && s->qwen4_batch_mtp &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -14168,6 +14229,7 @@ decode_again:
             const bool was_thinking = thinking.inside;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
+            if (thinking_budget > 0 && thinking.inside) thinking_tokens++;
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking.inside) {
                     dsml_decode_tracker_init(&dsml_tracker);
@@ -14347,6 +14409,25 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+            /* Drafts past this token are not kept; the boundary rewind below
+             * discards them before the forced single-token decode calls. */
+            thinking_budget_action budget_action = thinking_budget_decide(
+                thinking_tokens, thinking_budget, max_tokens - completion,
+                ds4_session_ctx(slot->session) - (block_start + kept),
+                thinking_close.len, thinking_budget_fired, thinking.inside,
+                utf8_stream_safe_len(text.ptr, 0, text.len, false) == text.len);
+            if (budget_action == THINKING_BUDGET_LENGTH) {
+                stop_decode = true;
+                break;
+            }
+            if (budget_action == THINKING_BUDGET_CLOSE) {
+                thinking_budget_fired = true;
+                thinking_close_pos = 0;
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s thinking budget reached (%d tokens)",
+                           ctx_span, thinking_tokens);
+                break;
+            }
             const bool next_greedy = !thinking.inside &&
                 dsml_decode_state_is_tool(dsml_tracker.decode) &&
                 !dsml_decode_state_uses_payload_sampling(dsml_tracker.decode);
@@ -14380,6 +14461,7 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
+        ds4_tokens_free(&thinking_close);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -14506,6 +14588,7 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled while flushing generation");
+        ds4_tokens_free(&thinking_close);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -14615,6 +14698,7 @@ decode_again:
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during response parsing");
+            ds4_tokens_free(&thinking_close);
             free(parsed_content);
             free(parsed_reasoning);
             tool_calls_free(&parsed_calls);
@@ -14639,6 +14723,7 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled before publishing response state");
+        ds4_tokens_free(&thinking_close);
         free(parsed_content);
         free(parsed_reasoning);
         tool_calls_free(&parsed_calls);
@@ -14855,6 +14940,7 @@ decode_again:
     responses_stream_free(&responses_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
+    ds4_tokens_free(&thinking_close);
 }
 
 /* Keep cancellation installed for the entire request, including every early
@@ -18648,6 +18734,94 @@ static void test_chat_ignore_eos_contract(void) {
         128, 32768, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+}
+
+static void test_chat_thinking_budget_parse(void) {
+    const struct {
+        const char *fields;
+        bool valid;
+        int budget;
+    } cases[] = {
+        {"\"max_tokens\":100", true, 0},
+        {"\"reasoning_budget_tokens\":null", true, 0},
+        {"\"thinking_budget_tokens\":32", true, 32},
+        {"\"reasoning_budget_tokens\":64", true, 64},
+        {"\"thinking_budget_tokens\":32,\"reasoning_budget_tokens\":64", true, 64},
+        {"\"reasoning_budget_tokens\":64,\"thinking_budget_tokens\":32", true, 64},
+        {"\"reasoning_budget_tokens\":null,\"thinking_budget_tokens\":32", true, 32},
+        {"\"thinking_budget_tokens\":32,\"reasoning_budget_tokens\":null", true, 32},
+        {"\"thinking_budget_tokens\":null,\"reasoning_budget_tokens\":64", true, 64},
+        {"\"reasoning_budget_tokens\":null,\"thinking_budget_tokens\":null", true, 0},
+        {"\"thinking_budget_tokens\":0", true, 0},
+        {"\"reasoning_budget_tokens\":-10", true, 0},
+        {"\"thinking_budget_tokens\":32,\"reasoning_budget_tokens\":0", true, 0},
+        {"\"reasoning_budget_tokens\":64.0", true, 64},
+        {"\"thinking_budget_tokens\":2147483648", true, INT_MAX},
+        {"\"thinking_budget_tokens\":32,\"thinking\":false", true, 32},
+        {"\"thinking_budget_tokens\":1.5", false, 0},
+        {"\"reasoning_budget_tokens\":-0.5", false, 0},
+        {"\"reasoning_budget_tokens\":\"64\"", false, 0},
+        {"\"thinking_budget_tokens\":true", false, 0},
+        {"\"thinking_budget_tokens\":{}", false, 0},
+        {"\"thinking_budget_tokens\":NaN", false, 0},
+        {"\"reasoning_budget_tokens\":Infinity", false, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        buf body = {0};
+        buf_printf(&body, "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],%s}",
+                   cases[i].fields);
+        request r;
+        char err[128] = {0};
+        bool ok = parse_chat_request(NULL, NULL, body.ptr, 128, 32768,
+                                     &r, err, sizeof(err));
+        TEST_ASSERT(ok == cases[i].valid);
+        if (ok) {
+            TEST_ASSERT(r.thinking_budget_tokens == cases[i].budget);
+            if (strstr(cases[i].fields, "\"thinking\":false"))
+                TEST_ASSERT(!ds4_think_mode_enabled(r.think_mode));
+            request_free(&r);
+        } else {
+            TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+        }
+        buf_free(&body);
+    }
+}
+
+static void test_thinking_budget_decision(void) {
+    const struct {
+        int count;
+        int budget;
+        int output_room;
+        int context_room;
+        int closing_tokens;
+        bool fired;
+        bool thinking_open;
+        bool char_complete;
+        thinking_budget_action action;
+    } cases[] = {
+        {7, 8, 24, 24, 23, false, true, true, THINKING_BUDGET_WAIT},
+        {8, 8, 24, 24, 23, false, true, true, THINKING_BUDGET_CLOSE},
+        {9, 8, 24, 24, 23, false, true, true, THINKING_BUDGET_CLOSE},
+        {8, 8, 23, 24, 23, false, true, true, THINKING_BUDGET_LENGTH},
+        {8, 8, 24, 23, 23, false, true, true, THINKING_BUDGET_LENGTH},
+        {8, 8, 24, 24, 0, false, true, true, THINKING_BUDGET_LENGTH},
+        {8, 8, 24, 24, 23, true, true, true, THINKING_BUDGET_WAIT},
+        {8, 8, 24, 24, 23, false, false, true, THINKING_BUDGET_WAIT},
+        {8, 8, 24, 24, 23, false, true, false, THINKING_BUDGET_WAIT},
+        {8, 0, 24, 24, 23, false, true, true, THINKING_BUDGET_WAIT},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST_ASSERT(thinking_budget_decide(
+            cases[i].count, cases[i].budget, cases[i].output_room,
+            cases[i].context_room, cases[i].closing_tokens, cases[i].fired,
+            cases[i].thinking_open, cases[i].char_complete) == cases[i].action);
+    }
+    /* A budget token that ends inside a character: the close waits for the
+     * token that completes it. */
+    const char *split = "caf\xc3";
+    TEST_ASSERT(utf8_stream_safe_len(split, 0, strlen(split), false) < strlen(split));
+    const char *whole = "caf\xc3\xa8";
+    TEST_ASSERT(utf8_stream_safe_len(whole, 0, strlen(whole), false) == strlen(whole));
 }
 
 static void test_reasoning_effort_mapping(void) {
@@ -23502,6 +23676,8 @@ static void ds4_server_unit_tests_run(void) {
     test_dispatch_routes_alien_request_to_empty_slot();
     test_request_defaults_are_the_model_card_chat_sampling();
     test_chat_ignore_eos_contract();
+    test_chat_thinking_budget_parse();
+    test_thinking_budget_decision();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
