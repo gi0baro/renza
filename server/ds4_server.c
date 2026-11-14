@@ -7215,6 +7215,8 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool qwen;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -7248,6 +7250,8 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     free(ts->ids);
     ts->ids = NULL;
     ts->ids_cap = 0;
+    free(ts->tool_name);
+    ts->tool_name = NULL;
 }
 
 static void openai_stream_free(openai_stream *st) {
@@ -7860,14 +7864,23 @@ static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *
     return ok;
 }
 
-static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
-                                    size_t raw_len, size_t pos) {
+static bool openai_tool_stream_init(openai_tool_stream *ts, const request *r,
+                                    const char *raw, size_t raw_len, size_t pos) {
     openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
-    if (raw_full_lit(raw, raw_len, pos, DS41_TOOL_CALLS_START)) {
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        raw_full_lit(raw, raw_len, pos, qwen_tool_syntax.tool_calls_start)) {
+        ts->qwen = true;
+        ts->parse_pos += strlen(qwen_tool_syntax.tool_calls_start);
+        ts->tool_calls_end = qwen_tool_syntax.tool_calls_end;
+        ts->invoke_start = qwen_tool_syntax.invoke_start;
+        ts->invoke_end = qwen_tool_syntax.invoke_end;
+        ts->param_start = qwen_tool_syntax.param_start;
+        ts->param_end = qwen_tool_syntax.param_end;
+    } else if (raw_full_lit(raw, raw_len, pos, DS41_TOOL_CALLS_START)) {
         ts->parse_pos += strlen(DS41_TOOL_CALLS_START);
         ts->tool_calls_end = DS41_TOOL_CALLS_END;
         ts->invoke_start = DS41_INVOKE_START;
@@ -7909,20 +7922,54 @@ static bool openai_tool_stream_fail(openai_tool_stream *ts) {
     return true;
 }
 
+static char *openai_tool_qwen_tag_name(const char *start, const char *end) {
+    if (memchr(start, '<', (size_t)(end - start))) return NULL;
+    trim_const_span(&start, &end);
+    return xstrndup(start, (size_t)(end - start));
+}
+
+/* Qwen parameter tags carry no type. As in the final parser, a value is a
+ * string when the tool schema declares it so or when it is not JSON, so an
+ * undeclared value is held until its closing tag. One leading newline is
+ * dropped from the value. Returns false while more text is needed. */
+static bool openai_tool_qwen_param_type(const request *r, const openai_tool_stream *ts,
+                                        const char *key, const char *raw,
+                                        size_t raw_len, size_t *value_start,
+                                        bool *is_string) {
+    size_t start = *value_start;
+    if (start == raw_len) return false;
+    *is_string = qwen_param_declared_string(&r->tool_orders, ts->tool_name, key);
+    if (!*is_string) {
+        const char *end = find_lit_bounded(raw + start, raw_len - start, ts->param_end);
+        if (!end) return false;
+        char *value = qwen_strip_value_newlines(raw + start, end);
+        *is_string = !qwen_param_value_is_json(value);
+        free(value);
+    }
+    if (raw[start] == '\n') *value_start = start + 1;
+    return true;
+}
+
 static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t raw_len) {
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
+    char *name = ts->qwen ?
+        openai_tool_qwen_tag_name(raw + ts->parse_pos + strlen(ts->invoke_start), tag_end) :
+        dsml_attr(tag, "name");
     free(tag);
-    if (!name) return openai_tool_stream_fail(ts);
+    if (!name || (ts->qwen && !name[0])) {
+        free(name);
+        return openai_tool_stream_fail(ts);
+    }
+    free(ts->tool_name);
+    ts->tool_name = name;
 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
-    free(name);
     if (!ok) return false;
 
     ts->emitted_any = true;
@@ -7939,22 +7986,30 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
+    char *name = ts->qwen ?
+        openai_tool_qwen_tag_name(raw + ts->parse_pos + strlen(ts->param_start), tag_end) :
+        dsml_attr(tag, "name");
+    char *is_string = ts->qwen ? NULL : dsml_attr(tag, "string");
     free(tag);
-    if (!name || !is_string) {
+    if (!name || (!ts->qwen && !is_string)) {
         free(name);
         free(is_string);
         return openai_tool_stream_fail(ts);
     }
-    bool string_value = !strcmp(is_string, "true");
+    bool string_value = is_string && !strcmp(is_string, "true");
+    size_t value_start = (size_t)(tag_end - raw) + 1;
+    if (ts->qwen && !openai_tool_qwen_param_type(r, ts, name, raw, raw_len,
+                                                 &value_start, &string_value)) {
+        free(name);
+        return true;
+    }
     bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
     free(name);
     free(is_string);
     if (!ok) return false;
 
     ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->parse_pos = value_start;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
 }
@@ -7962,12 +8017,23 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
 static bool openai_tool_finish_param(int fd, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t value_end) {
-    if (value_end > ts->parse_pos) {
+    size_t limit = value_end;
+    if (ts->qwen && limit > ts->parse_pos && raw[limit - 1] == '\n') limit--;
+    if (ts->qwen && !ts->param_is_string) {
+        /* The JSON check takes any isspace() as whitespace, which JSON does
+         * not; minify the value as the final parser does. */
+        char *value = xstrndup(raw + ts->parse_pos, limit - ts->parse_pos);
+        char *min = json_minify_raw_value(value);
+        bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, min, strlen(min));
+        free(min);
+        free(value);
+        if (!ok) return false;
+    } else if (limit > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
-                                          value_end - ts->parse_pos) :
+                                          limit - ts->parse_pos) :
             openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
-                                           value_end - ts->parse_pos);
+                                           limit - ts->parse_pos);
         if (!ok) return false;
     }
     if (ts->param_is_string &&
@@ -8036,6 +8102,7 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len, ts->param_end,
                                                             ts->param_is_string);
+            if (ts->qwen && limit > ts->parse_pos && raw[limit - 1] == '\n') limit--;
             if (limit > ts->parse_pos) {
                 bool ok = ts->param_is_string ?
                     openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
@@ -8154,7 +8221,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+            if (openai_tool_stream_init(&st->tool, r, raw, raw_len, st->emit_pos)) {
                 st->mode = OPENAI_STREAM_TOOL;
             } else {
                 st->mode = OPENAI_STREAM_SUPPRESS;
@@ -17996,6 +18063,221 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     close(sv[1]);
 }
 
+typedef struct {
+    bool parsed;
+    tool_calls calls;
+    char *wire;
+    char *name;
+    char *arguments;
+    char *live_arguments;
+} qwen_tool_stream_run;
+
+/* Feeds raw to the OpenAI chat stream chunk bytes at a time, then finishes it
+ * with the final parser's calls as the generation loop does. live_arguments
+ * are the argument fragments sent before the first </parameter> was fed. */
+static qwen_tool_stream_run qwen_tool_stream_collect(const char *raw, bool thinking,
+                                                     size_t chunk) {
+    qwen_tool_stream_run run = {0};
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return run;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.stream = r.has_tools = true;
+    r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+    r.tool_orders = make_bash_order();
+
+    char *content = NULL, *reasoning = NULL;
+    run.parsed = parse_qwen_generated_message_ex(raw, thinking, &content, &reasoning,
+                                                 &run.calls, &r.tool_orders);
+    free(content);
+    free(reasoning);
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    buf partial = {0}, wire = {0};
+    size_t raw_len = strlen(raw), live_len = 0;
+    const char *param_end = strstr(raw, "</parameter>");
+    for (size_t n = 0; n < raw_len;) {
+        size_t count = raw_len - n < chunk ? raw_len - n : chunk;
+        buf_append(&partial, raw + n, count);
+        n += count;
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_tool",
+                                             &st, partial.ptr, partial.len, false));
+        char tmp[4096];
+        ssize_t got;
+        while ((got = recv(sv[1], tmp, sizeof(tmp), MSG_DONTWAIT)) > 0)
+            buf_append(&wire, tmp, (size_t)got);
+        if (param_end && n <= (size_t)(param_end - raw)) live_len = wire.len;
+    }
+    if (run.calls.len) apply_openai_stream_tool_ids(&run.calls, &st);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                       raw, raw_len, &run.calls,
+                                       run.calls.len ? "tool_calls" : "stop", 10, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *rest = read_socket_text(sv[1]);
+    buf_puts(&wire, rest);
+    free(rest);
+    run.wire = buf_take(&wire);
+
+    buf arguments = {0}, live_arguments = {0};
+    const char *p = run.wire;
+    while ((p = strstr(p, "\"arguments\":")) != NULL) {
+        bool live = (size_t)(p - run.wire) < live_len;
+        p += strlen("\"arguments\":");
+        char *delta = NULL;
+        if (!json_string(&p, &delta)) break;
+        buf_puts(&arguments, delta);
+        if (live) buf_puts(&live_arguments, delta);
+        free(delta);
+    }
+    run.arguments = buf_take(&arguments);
+    run.live_arguments = buf_take(&live_arguments);
+    p = strstr(run.wire, "\"name\":");
+    if (p) {
+        p += strlen("\"name\":");
+        TEST_ASSERT(json_string(&p, &run.name));
+    }
+
+    buf_free(&partial);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+    return run;
+}
+
+static void qwen_tool_stream_run_free(qwen_tool_stream_run *run) {
+    tool_calls_free(&run->calls);
+    free(run->wire);
+    free(run->name);
+    free(run->arguments);
+    free(run->live_arguments);
+}
+
+/* The streamed arguments differ from the parser's only in whitespace. */
+static bool qwen_tool_stream_matches_call(const qwen_tool_stream_run *run) {
+    if (run->calls.len != 1 || !run->name || !run->arguments) return false;
+    char *streamed = json_minify_raw_value(run->arguments);
+    char *parsed = json_minify_raw_value(run->calls.v[0].arguments);
+    bool same = !strcmp(run->name, run->calls.v[0].name) && !strcmp(streamed, parsed);
+    if (!same) fprintf(stderr, "Qwen SSE: streamed %s %s, parsed %s %s\n",
+                       run->name, streamed, run->calls.v[0].name, parsed);
+    free(streamed);
+    free(parsed);
+    return same;
+}
+
+static size_t count_substr(const char *s, const char *needle) {
+    size_t n = 0;
+    for (const char *p = s; p && (p = strstr(p, needle)) != NULL; p += strlen(needle)) n++;
+    return n;
+}
+
+static void test_openai_qwen_tool_stream_matches_parser(void) {
+    const struct {
+        const char *call;
+        bool live;
+    } cases[] = {
+        {"<function= bash >\n<parameter= command >\nline one\nline two\n</parameter>"
+         "<parameter=description>\n\nlast\n\n</parameter>", true},
+        {"<function=bash>\n<parameter=timeout>\n { \"items\": [ 1, true, null ] } \n</parameter>"
+         "<parameter=enabled>false</parameter><parameter=count>-2.5</parameter>", false},
+        {"<function=bash>\n<parameter=other>\"quoted\"</parameter>"
+         "<parameter=text>\n\"quoted\" \\ \t\r\ntext\n</parameter>", false},
+        {"<function=bash>\n<parameter=command>\n{ \"looks\": \"json\" }\n</parameter>", true},
+        {"<function=bash>\n<parameter=command>\nquote \" slash \\ tab\t caf\xc3\xa8 \xf0\x9f\x9a\xa9\n"
+         "literal </tool_call> <function=other> &lt;/parameter> &amp;lt;/parameter> &amp;\n"
+         "</parameter>", true},
+        {"<function=bash>\n<parameter=>\n\n\n</parameter><parameter=command>\n</parameter>"
+         "<parameter=description></parameter>", false},
+        {"<function=bash>\n", false},
+        {"<function=lookup>\n<parameter=command>\nls -la\n</parameter>"
+         "<parameter=count>\n3\n</parameter><parameter=note>\n</parameter>", false},
+    };
+    /* A tool-call literal in the reasoning stops live streaming when it
+     * arrives in one piece, so there only the result is checked. */
+    const struct {
+        bool thinking;
+        const char *reasoning;
+        bool check_live;
+    } modes[] = {
+        {false, "", true},
+        {true, "<think>plan <function=draft></think>", true},
+        {true, "<think>plan <tool_call>\n<function=draft>\n</tool_call></think>", false},
+    };
+    const size_t chunks[] = {1, 3, 5, 7};
+    const char *prefix = "{\"command\":\"";
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
+            bool thinking = modes[m].thinking;
+            buf raw = {0};
+            buf_puts(&raw, modes[m].reasoning);
+            buf_puts(&raw, "Before <function=example>.\n\n<tool_call>\n");
+            buf_puts(&raw, cases[i].call);
+            buf_puts(&raw, "\n</function>\n</tool_call>");
+            for (size_t c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
+                qwen_tool_stream_run run = qwen_tool_stream_collect(raw.ptr, thinking, chunks[c]);
+                TEST_ASSERT(run.parsed);
+                TEST_ASSERT(qwen_tool_stream_matches_call(&run));
+                bool has_params = strstr(cases[i].call, "</parameter>") != NULL;
+                if (modes[m].check_live && cases[i].live)
+                    TEST_ASSERT(run.live_arguments &&
+                                !strncmp(run.live_arguments, prefix, strlen(prefix)) &&
+                                strlen(run.live_arguments) > strlen(prefix));
+                else if (modes[m].check_live && has_params)
+                    TEST_ASSERT(run.live_arguments && !strcmp(run.live_arguments, "{"));
+                TEST_ASSERT(run.wire && strstr(run.wire, "<parameter=") == NULL);
+                TEST_ASSERT(run.wire && strstr(run.wire, "[DONE]") != NULL);
+                qwen_tool_stream_run_free(&run);
+            }
+            buf_free(&raw);
+        }
+    }
+}
+
+static void test_openai_qwen_tool_stream_falls_back_to_one_chunk(void) {
+    const char *call =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+        "</function>\n</tool_call>";
+    const char *malformed =
+        "<tool_call>\n<function=ba<sh>\n<parameter=command>\nls\n</parameter>\n"
+        "</function>\n</tool_call>";
+    const struct {
+        bool thinking;
+        const char *before;
+        const char *call;
+        bool parses;
+    } cases[] = {
+        {false, "See <tool_calls> below.\n\n", call, true},
+        {true, "<think>plan</think>See <tool_calls> below.\n\n", call, true},
+        {false, "Before.\n\n", malformed, false},
+        {true, "<think>plan</think>Before.\n\n", malformed, false},
+    };
+    const size_t chunks[] = {1, 4};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        buf raw = {0};
+        buf_puts(&raw, cases[i].before);
+        buf_puts(&raw, cases[i].call);
+        bool parses = cases[i].parses;
+        for (size_t c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
+            qwen_tool_stream_run run =
+                qwen_tool_stream_collect(raw.ptr, cases[i].thinking, chunks[c]);
+            TEST_ASSERT(run.parsed == parses);
+            TEST_ASSERT(run.live_arguments && !run.live_arguments[0]);
+            TEST_ASSERT(count_substr(run.wire, "\"tool_calls\":") == (parses ? 1 : 0));
+            if (parses) TEST_ASSERT(qwen_tool_stream_matches_call(&run));
+            TEST_ASSERT(run.wire && strstr(run.wire, "<function=") == NULL);
+            TEST_ASSERT(run.wire && strstr(run.wire, "[DONE]") != NULL);
+            qwen_tool_stream_run_free(&run);
+        }
+        buf_free(&raw);
+    }
+}
+
 static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -23277,6 +23559,8 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
+    test_openai_qwen_tool_stream_matches_parser();
+    test_openai_qwen_tool_stream_falls_back_to_one_chunk();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
